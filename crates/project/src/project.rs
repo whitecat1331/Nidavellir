@@ -522,7 +522,7 @@ impl InlayId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InlayHint {
     pub position: language::Anchor,
     pub label: InlayHintLabel,
@@ -856,17 +856,18 @@ impl InlayHint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InlayHintLabel {
     String(String),
     LabelParts(Vec<InlayHintLabelPart>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InlayHintLabelPart {
     pub value: String,
     pub tooltip: Option<InlayHintLabelPartTooltip>,
     pub location: Option<(LanguageServerId, lsp::Location)>,
+    pub command: Option<(LanguageServerId, lsp::Command)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
