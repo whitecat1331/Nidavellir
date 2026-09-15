@@ -1413,6 +1413,124 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn cloud_google_completion_emits_stop(cx: &mut gpui::TestAppContext) {
+        for (finish_reason, expected_stop) in [
+            ("STOP", StopReason::EndTurn),
+            ("MAX_TOKENS", StopReason::MaxTokens),
+            ("SAFETY", StopReason::Refusal),
+        ] {
+            let model = cloud_google_test_model(vec![
+                json!({"event": {"candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Hello"}]}
+                }]}}),
+                json!({"event": {
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": " world"}]},
+                        "finishReason": finish_reason
+                    }],
+                    "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2}
+                }}),
+                json!({"status": "stream_ended"}),
+            ]);
+            let mut stream = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::Text(text))) if text == "Hello"
+            ));
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::UsageUpdate(usage)))
+                    if usage.input_tokens == 10 && usage.output_tokens == 2
+            ));
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::Text(text))) if text == " world"
+            ));
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::Stop(reason))) if reason == expected_stop
+            ));
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[gpui::test]
+    async fn cloud_google_tool_completion_preserves_transport_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for stream_ended in [false, true] {
+            let mut events = vec![json!({"event": {"candidates": [{
+                "content": {"role": "model", "parts": [{
+                    "functionCall": {"name": "list_directory", "args": {"path": "."}}
+                }]},
+                "finishReason": "STOP"
+            }]}})];
+            if stream_ended {
+                events.push(json!({"status": "stream_ended"}));
+            }
+            let model = cloud_google_test_model(events);
+            let mut stream = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::ToolUse(tool)))
+                    if tool.name.as_ref() == "list_directory"
+            ));
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)))
+            ));
+            if !stream_ended {
+                assert!(matches!(
+                    stream.next().await,
+                    Some(Err(
+                        LanguageModelCompletionError::StreamEndedUnexpectedly { .. }
+                    ))
+                ));
+            }
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[gpui::test]
+    async fn cloud_google_incomplete_completion_does_not_emit_stop(cx: &mut gpui::TestAppContext) {
+        for stream_ended in [false, true] {
+            let mut events = vec![json!({"event": {"candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Partial answer"}]}
+            }]}})];
+            if stream_ended {
+                events.push(json!({"status": "stream_ended"}));
+            }
+            let model = cloud_google_test_model(events);
+            let mut stream = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(LanguageModelCompletionEvent::Text(text))) if text == "Partial answer"
+            ));
+            if !stream_ended {
+                assert!(matches!(
+                    stream.next().await,
+                    Some(Err(
+                        LanguageModelCompletionError::StreamEndedUnexpectedly { .. }
+                    ))
+                ));
+            }
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[gpui::test]
     async fn cloud_explicit_compaction_forwards_supported_request_fields(
         cx: &mut gpui::TestAppContext,
     ) {
