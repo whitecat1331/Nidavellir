@@ -2410,48 +2410,35 @@ mod test {
     fn test_list_in_flex_row_with_wrapper_fills_row_height(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
-        let wrapper_height = Rc::new(Cell::new(px(-1.0)));
-        let canvas_height = wrapper_height.clone();
+        let state = ListState::new(120, crate::ListAlignment::Top, px(24.0)).measure_all();
 
-        struct MeasureView {
-            wrapper_height: Rc<Cell<Pixels>>,
-        }
-        impl Render for MeasureView {
+        struct TestView(ListState);
+        impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let wrapper_height = self.wrapper_height.clone();
                 div().flex().flex_col().size_full().child(
                     div().flex_1().min_h_0().flex().flex_row().children(vec![
-                        // A plain div wrapper in the row's left slot.
-                        div().w_1_2()
-                            .flex_none()
-                            .flex_col()
-                            .child(
-                                canvas(
-                                    move |bounds, _, _| {
-                                        wrapper_height.set(bounds.size.height);
-                                    },
-                                    |_, _, _, _| {},
-                                )
-                                .size_full(),
-                            )
-                            .into_any_element(),
+                        list(self.0.clone(), |_, _, _| {
+                            div().h(px(24.)).w_full().into_any()
+                        })
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+                        .w_1_2()
+                        .flex_none()
+                        .into_any_element(),
                         div().flex_1().flex_col().into_any_element(),
                     ]),
                 )
             }
         }
 
-        let view = cx.update(|_, cx| {
-            cx.new(|_| MeasureView {
-                wrapper_height: canvas_height.clone(),
-            })
-        });
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
 
         cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
             view.clone().into_any_element()
         });
 
-        eprintln!("row left wrapper height = {:?}", canvas_height.get());
+        let scroll_top = state.logical_scroll_top();
+        eprintln!("Infer+measure_all ROW scroll_top.item_ix={}", scroll_top.item_ix);
     }
 
     #[gpui::test]
