@@ -2411,9 +2411,10 @@ mod test {
         let cx = cx.add_empty_window();
 
         // The network panel's list must fill the flex row's height. A bare
-        // `List` element sized with w_1_2().flex_none() does not stretch on
-        // the cross axis (it resolves to zero height), so the list must be
-        // wrapped in a stretched div and given size_full() to fill it.
+        // `List` element with w_1_2().flex_none() (or inside a block div) does
+        // not stretch on the cross axis — it resolves to zero height. The list
+        // must live in a flex-column wrapper and grow on the column's main
+        // axis, exactly like the conversation view.
         let state = ListState::new(120, crate::ListAlignment::Top, px(24.0));
 
         struct TestView(ListState);
@@ -2427,11 +2428,12 @@ mod test {
                         div().flex_1().flex().flex_row().children(vec![
                             div().w_1_2()
                                 .flex_none()
+                                .flex_col()
                                 .child(
                                     list(self.0.clone(), |_, _, _| {
                                         div().h(px(24.)).w_full().into_any()
                                     })
-                                    .size_full(),
+                                    .flex_grow_1(),
                                 )
                                 .into_any_element(),
                             div().flex_1().flex_col().into_any_element(),
