@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
-use async_tungstenite::tungstenite::{Error as TungsteniteError, Message};
 use async_tungstenite::client_async;
+use async_tungstenite::tungstenite::{Error as TungsteniteError, Message};
 use futures::channel::oneshot;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use gpui::BackgroundExecutor;
@@ -54,6 +54,11 @@ impl EventBuffer {
             events.extend(queue.iter().cloned());
         }
         events
+    }
+
+    fn clear(&mut self) {
+        self.browser.clear();
+        self.by_session.clear();
     }
 }
 
@@ -139,6 +144,12 @@ impl CdpClient {
     /// Borrow the most recent buffered events without draining them.
     pub fn recent_events(&self) -> Vec<Value> {
         self.events.lock().unwrap().recent_events()
+    }
+
+    /// Drop all buffered events so a cleared capture is not re-ingested on the
+    /// next store sync.
+    pub fn clear_events(&self) {
+        self.events.lock().unwrap().clear();
     }
 }
 

@@ -129,6 +129,14 @@ impl NetworkStore {
         request
     }
 
+    /// Borrow an already-known request without creating one. Response-side
+    /// events only enrich a request whose `requestWillBeSent` we captured;
+    /// otherwise (buffer eviction or a cleared store) they would reconstruct a
+    /// degraded entry missing method/url/headers.
+    fn existing(&mut self, request_id: &str) -> Option<&mut NetworkRequest> {
+        self.requests.get_mut(request_id)
+    }
+
     pub(crate) fn insert(&mut self, request: NetworkRequest) {
         let request_id = request.request_id.clone();
         if !self.requests.contains_key(&request_id) {
@@ -172,7 +180,9 @@ impl NetworkStore {
         let Some(request_id) = string_field(params, "requestId") else {
             return;
         };
-        let request = self.entry(&request_id);
+        let Some(request) = self.existing(&request_id) else {
+            return;
+        };
         let response = params.get("response");
         if let Some(status) = response.and_then(|data| u32_field(data, "status")) {
             request.status = Some(status);
@@ -200,7 +210,9 @@ impl NetworkStore {
         let Some(request_id) = string_field(params, "requestId") else {
             return;
         };
-        let request = self.entry(&request_id);
+        let Some(request) = self.existing(&request_id) else {
+            return;
+        };
         request.encoded_data_length = f64_field(params, "encodedDataLength");
         request.completed = true;
     }
@@ -209,7 +221,9 @@ impl NetworkStore {
         let Some(request_id) = string_field(params, "requestId") else {
             return;
         };
-        let request = self.entry(&request_id);
+        let Some(request) = self.existing(&request_id) else {
+            return;
+        };
         if let Some(error_text) = string_field(params, "errorText") {
             request.failure_reason = Some(error_text);
         }
@@ -230,7 +244,9 @@ impl NetworkStore {
         let Some(request_id) = string_field(params, "requestId") else {
             return;
         };
-        let request = self.entry(&request_id);
+        let Some(request) = self.existing(&request_id) else {
+            return;
+        };
         if let Some(headers) = params.get("headers") {
             request.request_headers = headers_object(headers);
         }
@@ -240,7 +256,9 @@ impl NetworkStore {
         let Some(request_id) = string_field(params, "requestId") else {
             return;
         };
-        let request = self.entry(&request_id);
+        let Some(request) = self.existing(&request_id) else {
+            return;
+        };
         if let Some(headers) = params.get("headers") {
             request.response_headers = headers_object(headers);
         }
@@ -253,7 +271,9 @@ impl NetworkStore {
         let Some(request_id) = string_field(params, "requestId") else {
             return;
         };
-        let request = self.entry(&request_id);
+        let Some(request) = self.existing(&request_id) else {
+            return;
+        };
         request.from_cache = true;
         request.completed = true;
     }
@@ -316,8 +336,7 @@ impl RequestFilter {
             }
         }
         if let Some(failed) = self.failed {
-            let is_failed =
-                request.failure_reason.is_some() || request.blocked_reason.is_some();
+            let is_failed = request.failure_reason.is_some() || request.blocked_reason.is_some();
             if is_failed != failed {
                 return false;
             }
@@ -519,9 +538,18 @@ mod control_tests {
 
     #[test]
     fn throttle_preset_parsing_and_conditions() {
-        assert_eq!(ThrottlePreset::parse("slow-3g"), Some(ThrottlePreset::Slow3G));
-        assert_eq!(ThrottlePreset::parse("SLOW_3G"), Some(ThrottlePreset::Slow3G));
-        assert_eq!(ThrottlePreset::parse("offline"), Some(ThrottlePreset::Offline));
+        assert_eq!(
+            ThrottlePreset::parse("slow-3g"),
+            Some(ThrottlePreset::Slow3G)
+        );
+        assert_eq!(
+            ThrottlePreset::parse("SLOW_3G"),
+            Some(ThrottlePreset::Slow3G)
+        );
+        assert_eq!(
+            ThrottlePreset::parse("offline"),
+            Some(ThrottlePreset::Offline)
+        );
         assert_eq!(ThrottlePreset::parse("bogus"), None);
         assert!(ThrottlePreset::Offline.conditions().offline);
         assert_eq!(ThrottlePreset::Slow3G.conditions().latency_ms, 2_000);
@@ -544,7 +572,10 @@ mod control_tests {
             request_stage: Some("Response".to_string()),
         };
         let params = scoped.to_cdp_params();
-        assert_eq!(params["urlPattern"].as_str(), Some("https://api.example.com/*"));
+        assert_eq!(
+            params["urlPattern"].as_str(),
+            Some("https://api.example.com/*")
+        );
         assert_eq!(params["requestStage"].as_str(), Some("Response"));
 
         let stage_optional = InterceptionPattern {
@@ -713,7 +744,13 @@ mod filter_tests {
             resource_type: Some("xhr".to_string()),
             ..Default::default()
         };
-        assert_eq!(store.requests().filter(|r| resource_type.matches(r)).count(), 1);
+        assert_eq!(
+            store
+                .requests()
+                .filter(|r| resource_type.matches(r))
+                .count(),
+            1
+        );
 
         let failed = RequestFilter {
             failed: Some(true),

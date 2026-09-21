@@ -1050,6 +1050,7 @@ impl AgentBrowserApi {
             .get_mut(&session_id)
             .context("unknown browser session")?;
         session.network_store = NetworkStore::new();
+        session.client.clear_events();
         Ok(json!({ "cleared": true }))
     }
 
