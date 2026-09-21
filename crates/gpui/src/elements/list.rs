@@ -2410,10 +2410,6 @@ mod test {
     fn test_list_in_flex_row_with_wrapper_fills_row_height(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
-        // The network panel puts the waterfall list and the detail pane side by
-        // side in a flex row. The list must get its height by growing on the
-        // main axis of a flex-column wrapper; a bare List element does not
-        // stretch on the row's cross axis.
         let state = ListState::new(120, crate::ListAlignment::Top, px(24.0));
 
         struct TestView(ListState);
@@ -2428,6 +2424,7 @@ mod test {
                         div().flex_1().min_h_0().flex().flex_row().children(vec![
                             div().w_1_2()
                                 .flex_none()
+                                .h_full()
                                 .flex_col()
                                 .child(
                                     list(self.0.clone(), |_, _, _| {
@@ -2445,8 +2442,6 @@ mod test {
         let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
         state.set_follow_mode(FollowMode::Tail);
 
-        // 440px panel - 40px toolbar = 400px row. 120 items x 24px = 2880px.
-        // Follow-tail should anchor near item 120 - ceil(400/24) = ~103.
         cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
             view.clone().into_any_element()
         });
