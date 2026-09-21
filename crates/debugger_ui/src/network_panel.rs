@@ -6,11 +6,11 @@ use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, sh
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    ListAlignment, ListState, Task, WeakEntity, Window, actions, div, list, px,
+    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
 use settings::Settings;
-use ui::{Button, IconName, Label, Tab, prelude::*};
+use ui::{Button, IconName, Label, StatefulInteractiveElement, Tab, WithScrollbar, prelude::*};
 use ui_input::InputField;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -181,6 +181,7 @@ pub struct NetworkPanel {
     response_body: Option<String>,
     detail_tab: DetailTab,
     list_state: ListState,
+    detail_scroll_handle: ScrollHandle,
     _refresh_task: Task<()>,
 }
 
@@ -214,6 +215,7 @@ impl NetworkPanel {
                 response_body: None,
                 detail_tab: DetailTab::Headers,
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
+                detail_scroll_handle: ScrollHandle::new(),
                 _refresh_task: Task::ready(()),
             };
             this.list_state.set_follow_mode(FollowMode::Tail);
@@ -395,6 +397,7 @@ impl NetworkPanel {
     fn select_request(&mut self, request_id: &str, cx: &mut Context<Self>) {
         self.selected_request_id = Some(request_id.to_string());
         self.response_body = None;
+        self.detail_scroll_handle = ScrollHandle::new();
         let Some(session_id) = self.session_id else {
             return;
         };
@@ -544,7 +547,7 @@ impl NetworkPanel {
         .into_any_element()
     }
 
-    fn render_detail(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(request) = self.selected_request() else {
             return div()
                 .p_2()
@@ -555,10 +558,13 @@ impl NetworkPanel {
         };
         let body = self.detail_body(request);
         v_flex()
+            .id("network-detail-body")
             .size_full()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.detail_scroll_handle)
             .p_2()
             .child(Label::new(body))
+            .vertical_scrollbar_for(&self.detail_scroll_handle, window, cx)
             .into_any_element()
     }
 
@@ -625,6 +631,7 @@ impl NetworkPanel {
                         let tab = *tab;
                         cx.listener(move |this, _, _, cx| {
                             this.detail_tab = tab;
+                            this.detail_scroll_handle = ScrollHandle::new();
                             cx.notify();
                         })
                     })
@@ -706,7 +713,7 @@ impl gpui::Render for NetworkPanel {
                         .flex_col()
                         .overflow_hidden()
                         .child(self.render_detail_tabs(cx))
-                        .child(self.render_detail(cx))
+                        .child(self.render_detail(window, cx))
                         .into_any_element(),
                 ]))
     }
