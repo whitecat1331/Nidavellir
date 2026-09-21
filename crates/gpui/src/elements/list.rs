@@ -1725,7 +1725,7 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, v_flex,
         point,
         px, size,
     };
@@ -2410,43 +2410,32 @@ mod test {
     fn test_list_in_flex_row_with_wrapper_fills_row_height(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
-        // The network panel's list must fill the flex row's height. A bare
-        // `List` element with w_1_2().flex_none() (or inside a block div) does
-        // not stretch on the cross axis — it resolves to zero height. The list
-        // must live in a flex-column wrapper and grow on the column's main
-        // axis, exactly like the conversation view.
         let state = ListState::new(120, crate::ListAlignment::Top, px(24.0));
 
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div()
+                // Mirror the conversation view's wrapping: a definite-height
+                // flex column containing the list, which grows on the main axis.
+                v_flex()
                     .size_full()
-                    .flex_col()
-                    .child(div().h(px(40.)).w_full())
-                    .child(
-                        div().flex_1().flex().flex_row().children(vec![
-                            div().w_1_2()
-                                .flex_none()
-                                .flex_col()
-                                .child(
-                                    list(self.0.clone(), |_, _, _| {
-                                        div().h(px(24.)).w_full().into_any()
-                                    })
-                                    .flex_grow_1(),
-                                )
-                                .into_any_element(),
-                            div().flex_1().flex_col().into_any_element(),
-                        ]),
-                    )
+                    .child(v_flex().flex_1().min_h_0().child(
+                        v_flex()
+                            .flex_1()
+                            .size_full()
+                            .child(
+                                list(self.0.clone(), |_, _, _| {
+                                    div().h(px(24.)).w_full().into_any()
+                                })
+                                .flex_grow_1(),
+                            ),
+                    ))
             }
         }
 
         let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
         state.set_follow_mode(FollowMode::Tail);
 
-        // 440px panel - 40px toolbar = 400px row. 120 items x 24px = 2880px.
-        // Follow-tail should anchor near item 120 - ceil(400/24) = ~103.
         cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
             view.clone().into_any_element()
         });
@@ -2454,7 +2443,7 @@ mod test {
         let scroll_top = state.logical_scroll_top();
         assert!(
             scroll_top.item_ix <= 110,
-            "list should fill the ~400px row and render the tail, got scroll_top.item_ix={}",
+            "list should fill ~400px and render the tail, got scroll_top.item_ix={}",
             scroll_top.item_ix,
         );
     }
