@@ -1725,7 +1725,7 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, v_flex,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list,
         point,
         px, size,
     };
@@ -2417,10 +2417,10 @@ mod test {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 // Mirror the conversation view's wrapping: a definite-height
                 // flex column containing the list, which grows on the main axis.
-                v_flex()
+                div().flex().flex_col()
                     .size_full()
-                    .child(v_flex().flex_1().min_h_0().child(
-                        v_flex()
+                    .child(div().flex().flex_col().flex_1().min_h_0().child(
+                        div().flex().flex_col()
                             .flex_1()
                             .size_full()
                             .child(
