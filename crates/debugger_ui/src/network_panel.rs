@@ -5,8 +5,8 @@ use agent_settings::AgentSettings;
 use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, shared_browser_api};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Task, WeakEntity, Window, actions, div, list, px,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    ListAlignment, ListState, Task, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -216,6 +216,7 @@ impl NetworkPanel {
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 _refresh_task: Task::ready(()),
             };
+            this.list_state.set_follow_mode(FollowMode::Tail);
             this.schedule_refresh(cx);
             this
         })
@@ -262,7 +263,9 @@ impl NetworkPanel {
         self.control = snapshot.control;
         self.requests = snapshot.requests;
         let visible = self.visible_requests(cx).len();
-        self.list_state.reset(visible);
+        if visible != self.list_state.item_count() {
+            self.list_state.reset(visible);
+        }
         log::info!(
             "[network-panel] apply: session={} driven_by={} requests={} visible={} list_items={}",
             session_id,

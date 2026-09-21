@@ -66,7 +66,14 @@ impl AgentBrowserApi {
             self.chromium_path.as_deref(),
         )
         .await?;
-        let profile_dir = std::env::temp_dir().join(format!("zed-browser-{}", std::process::id()));
+        let profile_dir = std::env::temp_dir().join(format!(
+            "zed-browser-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
 
         let mut command = Command::new(&chromium);
         command
