@@ -2406,6 +2406,83 @@ mod test {
     }
 
     #[gpui::test]
+    fn test_follow_tail_with_reset_driven_growth_renders_tail(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // Reproduce the network panel's growth pattern: start empty, follow the
+        // tail, and reset the list to the new count on every refresh.
+        let state = ListState::new(0, crate::ListAlignment::Top, px(24.0));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                    .w_full()
+                    .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
+        // Grow 0 -> 120 one item at a time, drawing after each reset like the
+        // panel's 2s refresh loop does.
+        for count in 1..=120 {
+            state.reset(count);
+            cx.draw(point(px(0.), px(0.)), size(px(300.), px(400.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+
+        // With a 400px viewport and 24px items, follow-tail should anchor near
+        // the tail (120 - ceil(400/24) = ~103). If only a couple of rows were
+        // laid out, the anchor would sit at ~118 instead.
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix <= 110,
+            "follow-tail should render the tail after reset-driven growth, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
+        assert!(state.is_following_tail());
+    }
+
+    #[gpui::test]
+    fn test_follow_tail_with_splice_driven_growth_renders_tail(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(0, crate::ListAlignment::Top, px(24.0));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                    .w_full()
+                    .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
+        let mut old_count = 0usize;
+        for count in 1..=120 {
+            state.splice(old_count..old_count, count - old_count);
+            old_count = count;
+            cx.draw(point(px(0.), px(0.)), size(px(300.), px(400.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix <= 110,
+            "follow-tail should render the tail after splice-driven growth, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
+        assert!(state.is_following_tail());
+    }
+
+    #[gpui::test]
     fn test_pause_following_tail_reengages_when_still_at_bottom(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
