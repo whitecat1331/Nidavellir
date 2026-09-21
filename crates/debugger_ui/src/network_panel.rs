@@ -6,7 +6,7 @@ use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, sh
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
+    ListAlignment, ListSizingBehavior, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -214,7 +214,7 @@ impl NetworkPanel {
                 selected_request_id: None,
                 response_body: None,
                 detail_tab: DetailTab::Headers,
-                list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
+                list_state: ListState::new(0, ListAlignment::Top, px(24.0)).measure_all(),
                 detail_scroll_handle: ScrollHandle::new(),
                 _refresh_task: Task::ready(()),
             };
@@ -542,6 +542,7 @@ impl NetworkPanel {
             self.list_state.clone(),
             cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
         )
+        .with_sizing_behavior(ListSizingBehavior::Infer)
         .w_1_2()
         .flex_none()
         .into_any_element()

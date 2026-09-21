@@ -1725,8 +1725,7 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, ParentElement, Pixels, Render, Styled, TestAppContext, Window, canvas, div, list,
-        point,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, point,
         px, size,
     };
 
@@ -2407,9 +2406,13 @@ mod test {
     }
 
     #[gpui::test]
-    fn test_list_in_flex_row_with_wrapper_fills_row_height(cx: &mut TestAppContext) {
+    fn test_list_with_infer_sizing_fills_flex_row_height(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
+        // A bare `List` element in a flex row does not consume the row's
+        // cross-axis height (it resolves to zero). With `Infer` sizing and
+        // `measure_all`, the list computes its own height from its content and
+        // fills the row, so the waterfall renders its tail.
         let state = ListState::new(120, crate::ListAlignment::Top, px(24.0)).measure_all();
 
         struct TestView(ListState);
@@ -2417,13 +2420,11 @@ mod test {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 div().flex().flex_col().size_full().child(
                     div().flex_1().min_h_0().flex().flex_row().children(vec![
-                        list(self.0.clone(), |_, _, _| {
-                            div().h(px(24.)).w_full().into_any()
-                        })
-                        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
-                        .w_1_2()
-                        .flex_none()
-                        .into_any_element(),
+                        list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                            .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+                            .w_1_2()
+                            .flex_none()
+                            .into_any_element(),
                         div().flex_1().flex_col().into_any_element(),
                     ]),
                 )
@@ -2438,7 +2439,11 @@ mod test {
         });
 
         let scroll_top = state.logical_scroll_top();
-        eprintln!("Infer+measure_all ROW scroll_top.item_ix={}", scroll_top.item_ix);
+        assert!(
+            scroll_top.item_ix <= 110,
+            "list should fill the row and render its tail, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
     }
 
     #[gpui::test]
