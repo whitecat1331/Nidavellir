@@ -2406,6 +2406,54 @@ mod test {
     }
 
     #[gpui::test]
+    fn test_list_in_flex_row_stretches_to_row_height(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // Reproduce the network panel's exact flex structure: the list is a
+        // direct child of a flex row, sized with w_1_2().flex_none() and no
+        // explicit height, relying on align-items stretch for its cross size.
+        let state = ListState::new(120, crate::ListAlignment::Top, px(24.0));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex_col()
+                    .child(div().h(px(40.)).w_full())
+                    .child(
+                        div().flex_1().flex().flex_row().children(vec![
+                            list(self.0.clone(), |_, _, _| {
+                                div().h(px(24.)).w_full().into_any()
+                            })
+                            .w_1_2()
+                            .flex_none()
+                            .into_any_element(),
+                            div().flex_1().flex_col().into_any_element(),
+                        ]),
+                    )
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
+        // 440px panel - 40px toolbar = 400px row. 120 items x 24px = 2880px.
+        // Follow-tail should anchor near item 120 - ceil(400/24) = ~103. If the
+        // list collapsed to a couple of rows (e.g. 48px), it would anchor ~118.
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix <= 110,
+            "list should stretch to ~400px and render the tail, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
+    }
+
+    #[gpui::test]
     fn test_follow_tail_with_reset_driven_growth_renders_tail(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
