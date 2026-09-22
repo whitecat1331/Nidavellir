@@ -400,6 +400,8 @@ impl NetworkPanel {
         self.selected_request_id = Some(request_id.to_string());
         self.response_body = None;
         self.detail_scroll_handle = ScrollHandle::new();
+        // Temporary diagnostic for ISSUE-0034: note handle replacement (H2).
+        log::info!("[NETWORK-PANEL-PROBE] detail scroll handle replaced by select_request");
         let Some(session_id) = self.session_id else {
             return;
         };
@@ -560,6 +562,18 @@ impl NetworkPanel {
                 .into_any_element();
         };
         let body = self.detail_body(request);
+        // Temporary diagnostic for ISSUE-0034 (inverted detail-pane scrollbar).
+        // Logs the tracked handle's own numbers whenever the pane is scrolled or
+        // scrollable, so one scroll in the running build yields an offset trace:
+        // `offset.y` should go 0 -> -max_offset.y as the content scrolls down.
+        // Remove before shipping.
+        let probe_offset = self.detail_scroll_handle.offset();
+        let probe_max = self.detail_scroll_handle.max_offset();
+        if probe_offset.y != px(0.) || probe_max.y != px(0.) {
+            log::info!(
+                "[NETWORK-PANEL-PROBE] detail offset={probe_offset:?} max={probe_max:?}"
+            );
+        }
         v_flex()
             .id("network-detail-body")
             .size_full()
@@ -635,6 +649,10 @@ impl NetworkPanel {
                         cx.listener(move |this, _, _, cx| {
                             this.detail_tab = tab;
                             this.detail_scroll_handle = ScrollHandle::new();
+                            // Temporary diagnostic for ISSUE-0034: note handle replacement (H2).
+                            log::info!(
+                                "[NETWORK-PANEL-PROBE] detail scroll handle replaced by tab change"
+                            );
                             cx.notify();
                         })
                     })
