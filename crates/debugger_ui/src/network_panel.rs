@@ -5,7 +5,7 @@ use agent_settings::AgentSettings;
 use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, shared_browser_api};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
     ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
@@ -700,22 +700,37 @@ impl Panel for NetworkPanel {
 
 impl gpui::Render for NetworkPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let toolbar = self.render_toolbar(cx).into_any_element();
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .grid()
+            .grid_cols(2)
+            .grid_rows(1)
+            .children(vec![
+                self.render_list(window, cx).into_any_element(),
+                div()
+                    .size_full()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(self.render_detail_tabs(cx))
+                    .child(self.render_detail(window, cx))
+                    .into_any_element(),
+            ])
+            .into_any_element();
+        panel_root()
             .track_focus(&self.focus_handle)
-            .size_full()
-            .flex_col()
-            .child(self.render_toolbar(cx))
-            .child(div().flex_1().min_h_0().grid().grid_cols(2).grid_rows(1).children(vec![
-                    self.render_list(window, cx).into_any_element(),
-                    div()
-                        .size_full()
-                        .flex_col()
-                        .overflow_hidden()
-                        .child(self.render_detail_tabs(cx))
-                        .child(self.render_detail(window, cx))
-                        .into_any_element(),
-                ]))
+            .child(toolbar)
+            .child(content)
     }
+}
+
+/// The panel's root container: a flex column that fills its parent. It must
+/// be `flex().flex_col()` - `flex_col()` alone only sets flex-direction, not
+/// `display: flex`, so a bare `flex_col()` root is a block and the `flex_1`
+/// waterfall grid row never grows to fill the panel.
+fn panel_root() -> Div {
+    div().flex().flex_col().size_full()
 }
 
 fn next_throttle_preset(control: &Value) -> ThrottlePreset {
@@ -766,4 +781,60 @@ fn headers_text(value: Option<&Value>) -> String {
         .map(|(name, value)| format!("{name}: {}", value.as_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::panel_root;
+    use gpui::{IntoElement, ParentElement, Pixels, Styled, TestAppContext, div, point, px, size};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[gpui::test]
+    fn panel_root_grows_waterfall_grid_row(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let grid_row_heights = Rc::new(RefCell::new(Vec::<Pixels>::new()));
+
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .grid()
+            .grid_cols(2)
+            .grid_rows(1)
+            .on_children_prepainted({
+                let heights = grid_row_heights.clone();
+                move |bounds, _, _| {
+                    heights.replace(bounds.iter().map(|b| b.size.height).collect());
+                }
+            })
+            .children(vec![
+                div().size_full().into_any_element(),
+                div()
+                    .size_full()
+                    .flex_col()
+                    .child(div().h(px(24.)).w_full())
+                    .child(div().h(px(60.)).w_full())
+                    .into_any_element(),
+            ]);
+
+        cx.draw(point(px(0.), px(0.)), size(px(1024.), px(420.)), |_, _| {
+            panel_root()
+                .child(div().h(px(40.)).w_full())
+                .child(content)
+                .into_any_element()
+        });
+
+        // 420px panel - 40px toolbar = 380px grid row. A block root (flex_col()
+        // without flex()) leaves the grid row content-sized (~84px).
+        let heights = grid_row_heights.borrow();
+        assert_eq!(heights.len(), 2, "grid row should have two cells");
+        for (i, height) in heights.iter().enumerate() {
+            assert!(
+                *height >= px(300.),
+                "waterfall grid cell {i} should fill the panel (>=300px), got {heights:?}"
+            );
+        }
+    }
 }
