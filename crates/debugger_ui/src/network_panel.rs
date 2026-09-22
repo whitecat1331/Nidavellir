@@ -6,7 +6,7 @@ use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, sh
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    ListAlignment, ListSizingBehavior, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
+    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -214,7 +214,7 @@ impl NetworkPanel {
                 selected_request_id: None,
                 response_body: None,
                 detail_tab: DetailTab::Headers,
-                list_state: ListState::new(0, ListAlignment::Top, px(24.0)).measure_all(),
+                list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 detail_scroll_handle: ScrollHandle::new(),
                 _refresh_task: Task::ready(()),
             };
@@ -542,9 +542,7 @@ impl NetworkPanel {
             self.list_state.clone(),
             cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
         )
-        .with_sizing_behavior(ListSizingBehavior::Infer)
-        .w_1_2()
-        .flex_none()
+        .size_full()
         .into_any_element()
     }
 
@@ -707,10 +705,10 @@ impl gpui::Render for NetworkPanel {
             .size_full()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(div().flex_1().flex().flex_row().children(vec![
+            .child(div().flex_1().min_h_0().grid().grid_cols(2).children(vec![
                     self.render_list(window, cx).into_any_element(),
                     div()
-                        .flex_1()
+                        .size_full()
                         .flex_col()
                         .overflow_hidden()
                         .child(self.render_detail_tabs(cx))

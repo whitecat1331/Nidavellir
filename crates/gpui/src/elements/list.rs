@@ -2406,19 +2406,20 @@ mod test {
     }
 
     #[gpui::test]
-    fn test_list_with_infer_sizing_fills_flex_row_height(cx: &mut TestAppContext) {
+    fn test_list_in_grid_cell_fills_height(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
+        // A `List` element does not consume a flex row's cross-axis height (the
+        // network panel's empty-waterfall regression). A grid cell has a
+        // definite height, so the list fills it with size_full() and renders
+        // its tail.
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                // Grid gives the list's cell a definite height (unlike a flex
-                // row's cross-axis), so the list can fill it without relying on
-                // self-measured Infer sizing.
                 div().flex().flex_col().size_full().child(
                     div().flex_1().min_h_0().grid().grid_cols(2).children(vec![
                         list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
-                            .h_full()
+                            .size_full()
                             .into_any_element(),
                         div().flex_col().into_any_element(),
                     ]),
@@ -2426,17 +2427,21 @@ mod test {
             }
         }
 
-        // Auto sizing (default) in a grid cell.
-        let state_a = ListState::new(120, crate::ListAlignment::Top, px(24.0));
-        let view_a = cx.update(|_, cx| cx.new(|_| TestView(state_a.clone())));
-        state_a.set_follow_mode(FollowMode::Tail);
+        let state = ListState::new(120, crate::ListAlignment::Top, px(24.0));
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
         cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
-            view_a.clone().into_any_element()
+            view.clone().into_any_element()
         });
 
-        eprintln!(
-            "GRID cell list scroll_top.item_ix={}",
-            state_a.logical_scroll_top().item_ix,
+        // 440px panel, 120 items x 24px: follow-tail should anchor near the
+        // tail (120 - ceil(440/24) = ~101), not stay at 120 (zero height).
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix <= 110,
+            "list should fill the grid cell and render its tail, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
         );
     }
 
