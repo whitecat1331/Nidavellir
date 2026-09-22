@@ -2412,45 +2412,31 @@ mod test {
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // Grid gives the list's cell a definite height (unlike a flex
+                // row's cross-axis), so the list can fill it without relying on
+                // self-measured Infer sizing.
                 div().flex().flex_col().size_full().child(
-                    div().flex_1().min_h_0().flex().flex_row().children(vec![
+                    div().flex_1().min_h_0().grid().grid_cols(2).children(vec![
                         list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
-                            .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
-                            .w_1_2()
-                            .flex_none()
+                            .h_full()
                             .into_any_element(),
-                        div().flex_1().flex_col().into_any_element(),
+                        div().flex_col().into_any_element(),
                     ]),
                 )
             }
         }
 
-        // Variant A: measure_all + reset-driven growth (the current panel fix).
-        let state_a = ListState::new(0, crate::ListAlignment::Top, px(24.0)).measure_all();
+        // Auto sizing (default) in a grid cell.
+        let state_a = ListState::new(120, crate::ListAlignment::Top, px(24.0));
         let view_a = cx.update(|_, cx| cx.new(|_| TestView(state_a.clone())));
         state_a.set_follow_mode(FollowMode::Tail);
-        for count in 1..=120 {
-            state_a.reset(count);
-            cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
-                view_a.clone().into_any_element()
-            });
-        }
-
-        // Variant B: no measure_all, large overdraw, reset-driven growth.
-        let state_b = ListState::new(0, crate::ListAlignment::Top, px(2048.0));
-        let view_b = cx.update(|_, cx| cx.new(|_| TestView(state_b.clone())));
-        state_b.set_follow_mode(FollowMode::Tail);
-        for count in 1..=120 {
-            state_b.reset(count);
-            cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
-                view_b.clone().into_any_element()
-            });
-        }
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
+            view_a.clone().into_any_element()
+        });
 
         eprintln!(
-            "GROWTH measure_all+24px overdraw scroll_top.item_ix={} | large-overdraw scroll_top.item_ix={}",
+            "GRID cell list scroll_top.item_ix={}",
             state_a.logical_scroll_top().item_ix,
-            state_b.logical_scroll_top().item_ix,
         );
     }
 
