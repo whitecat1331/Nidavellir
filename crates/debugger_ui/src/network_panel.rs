@@ -470,7 +470,7 @@ impl NetworkPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_throttle(cx))),
             )
             .child(
-                Button::new("offline", if offline { "Online" } else { "Offline" })
+                Button::new("offline", offline_label(offline))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_offline(cx))),
             )
             .child(self.filter_editor.clone())
@@ -772,6 +772,19 @@ fn throttle_label(control: &Value) -> &'static str {
     }
 }
 
+/// Label for the offline toggle.
+///
+/// State-based, matching `throttle_label`'s condition display: an offline
+/// session must not show one control reading "Offline" and the adjacent toggle
+/// reading "Online" (ISSUE-0031).
+fn offline_label(offline: bool) -> &'static str {
+    if offline {
+        "Offline"
+    } else {
+        "Online"
+    }
+}
+
 fn headers_text(value: Option<&Value>) -> String {
     let Some(object) = value.and_then(Value::as_object) else {
         return "(none)".to_string();
@@ -791,7 +804,7 @@ fn headers_text(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{headers_text, panel_root};
+    use super::{headers_text, offline_label, panel_root};
     use gpui::{IntoElement, ParentElement, Pixels, Styled, TestAppContext, div, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -852,5 +865,13 @@ mod tests {
         });
         let text = headers_text(Some(&headers));
         assert_eq!(text, "a-first: alpha\nm-middle: mike\nz-last: zebra");
+    }
+
+    #[test]
+    fn offline_label_matches_offline_state() {
+        // ISSUE-0031: the toggle used to read "Online" while offline was on,
+        // contradicting the throttle label's "Offline" for the same state.
+        assert_eq!(offline_label(true), "Offline");
+        assert_eq!(offline_label(false), "Online");
     }
 }
