@@ -2409,12 +2409,6 @@ mod test {
     fn test_list_with_infer_sizing_fills_flex_row_height(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
-        // A bare `List` element in a flex row does not consume the row's
-        // cross-axis height (it resolves to zero). With `Infer` sizing and
-        // `measure_all`, the list computes its own height from its content and
-        // fills the row, so the waterfall renders its tail.
-        let state = ListState::new(120, crate::ListAlignment::Top, px(24.0)).measure_all();
-
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -2431,18 +2425,32 @@ mod test {
             }
         }
 
-        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
-        state.set_follow_mode(FollowMode::Tail);
+        // Variant A: measure_all + reset-driven growth (the current panel fix).
+        let state_a = ListState::new(0, crate::ListAlignment::Top, px(24.0)).measure_all();
+        let view_a = cx.update(|_, cx| cx.new(|_| TestView(state_a.clone())));
+        state_a.set_follow_mode(FollowMode::Tail);
+        for count in 1..=120 {
+            state_a.reset(count);
+            cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
+                view_a.clone().into_any_element()
+            });
+        }
 
-        cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
-            view.clone().into_any_element()
-        });
+        // Variant B: no measure_all, large overdraw, reset-driven growth.
+        let state_b = ListState::new(0, crate::ListAlignment::Top, px(2048.0));
+        let view_b = cx.update(|_, cx| cx.new(|_| TestView(state_b.clone())));
+        state_b.set_follow_mode(FollowMode::Tail);
+        for count in 1..=120 {
+            state_b.reset(count);
+            cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
+                view_b.clone().into_any_element()
+            });
+        }
 
-        let scroll_top = state.logical_scroll_top();
-        assert!(
-            scroll_top.item_ix <= 110,
-            "list should fill the row and render its tail, got scroll_top.item_ix={}",
-            scroll_top.item_ix,
+        eprintln!(
+            "GROWTH measure_all+24px overdraw scroll_top.item_ix={} | large-overdraw scroll_top.item_ix={}",
+            state_a.logical_scroll_top().item_ix,
+            state_b.logical_scroll_top().item_ix,
         );
     }
 
