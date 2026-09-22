@@ -6,7 +6,7 @@ use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, sh
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, px,
+    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, point, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -399,9 +399,7 @@ impl NetworkPanel {
     fn select_request(&mut self, request_id: &str, cx: &mut Context<Self>) {
         self.selected_request_id = Some(request_id.to_string());
         self.response_body = None;
-        self.detail_scroll_handle = ScrollHandle::new();
-        // Temporary diagnostic for ISSUE-0034: note handle replacement (H2).
-        log::info!("[NETWORK-PANEL-PROBE] detail scroll handle replaced by select_request");
+        reset_detail_scroll(&self.detail_scroll_handle);
         let Some(session_id) = self.session_id else {
             return;
         };
@@ -562,18 +560,6 @@ impl NetworkPanel {
                 .into_any_element();
         };
         let body = self.detail_body(request);
-        // Temporary diagnostic for ISSUE-0034 (inverted detail-pane scrollbar).
-        // Logs the tracked handle's own numbers whenever the pane is scrolled or
-        // scrollable, so one scroll in the running build yields an offset trace:
-        // `offset.y` should go 0 -> -max_offset.y as the content scrolls down.
-        // Remove before shipping.
-        let probe_offset = self.detail_scroll_handle.offset();
-        let probe_max = self.detail_scroll_handle.max_offset();
-        if probe_offset.y != px(0.) || probe_max.y != px(0.) {
-            log::info!(
-                "[NETWORK-PANEL-PROBE] detail offset={probe_offset:?} max={probe_max:?}"
-            );
-        }
         v_flex()
             .id("network-detail-body")
             .size_full()
@@ -648,11 +634,7 @@ impl NetworkPanel {
                         let tab = *tab;
                         cx.listener(move |this, _, _, cx| {
                             this.detail_tab = tab;
-                            this.detail_scroll_handle = ScrollHandle::new();
-                            // Temporary diagnostic for ISSUE-0034: note handle replacement (H2).
-                            log::info!(
-                                "[NETWORK-PANEL-PROBE] detail scroll handle replaced by tab change"
-                            );
+                            reset_detail_scroll(&this.detail_scroll_handle);
                             cx.notify();
                         })
                     })
@@ -755,6 +737,14 @@ fn panel_root() -> Div {
     div().flex().flex_col().size_full()
 }
 
+/// Reset the detail pane's scroll position to the top, reusing the same
+/// [`ScrollHandle`]. The handle must never be replaced: `vertical_scrollbar_for`
+/// caches the first handle it is given, so a fresh handle desyncs the thumb from
+/// the content (ISSUE-0034).
+fn reset_detail_scroll(handle: &ScrollHandle) {
+    handle.set_offset(point(px(0.), px(0.)));
+}
+
 fn next_throttle_preset(control: &Value) -> ThrottlePreset {
     let offline = control
         .get("offline")
@@ -830,8 +820,8 @@ fn headers_text(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{headers_text, offline_label, panel_root, throttle_label};
-    use gpui::{IntoElement, ParentElement, Pixels, Styled, TestAppContext, div, point, px, size};
+    use super::{headers_text, offline_label, panel_root, reset_detail_scroll, throttle_label};
+    use gpui::{IntoElement, ParentElement, Pixels, ScrollHandle, Styled, TestAppContext, div, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -926,5 +916,16 @@ mod tests {
         );
         assert_eq!(throttle_label(&serde_json::json!({ "offline": true })), "Offline");
         assert_eq!(throttle_label(&serde_json::json!({})), "Online");
+    }
+
+    #[test]
+    fn reset_detail_scroll_resets_offset_without_replacing_handle() {
+        // The detail pane's scrollbar (vertical_scrollbar_for) caches the first
+        // handle it is given, so selection/tab changes must reuse the handle
+        // (reset) rather than replace it (ISSUE-0034).
+        let handle = ScrollHandle::new();
+        handle.set_offset(point(px(0.), px(-100.)));
+        reset_detail_scroll(&handle);
+        assert_eq!(handle.offset(), point(px(0.), px(0.)));
     }
 }
