@@ -776,9 +776,14 @@ fn headers_text(value: Option<&Value>) -> String {
     let Some(object) = value.and_then(Value::as_object) else {
         return "(none)".to_string();
     };
-    object
+    let mut entries: Vec<(&str, &str)> = object
         .iter()
-        .map(|(name, value)| format!("{name}: {}", value.as_str().unwrap_or("")))
+        .map(|(name, value)| (name.as_str(), value.as_str().unwrap_or("")))
+        .collect();
+    entries.sort_unstable();
+    entries
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -786,7 +791,7 @@ fn headers_text(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::panel_root;
+    use super::{headers_text, panel_root};
     use gpui::{IntoElement, ParentElement, Pixels, Styled, TestAppContext, div, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -836,5 +841,16 @@ mod tests {
                 "waterfall grid cell {i} should fill the panel (>=300px), got {heights:?}"
             );
         }
+    }
+
+    #[test]
+    fn headers_text_sorts_header_names() {
+        let headers = serde_json::json!({
+            "z-last": "zebra",
+            "a-first": "alpha",
+            "m-middle": "mike",
+        });
+        let text = headers_text(Some(&headers));
+        assert_eq!(text, "a-first: alpha\nm-middle: mike\nz-last: zebra");
     }
 }
