@@ -10,7 +10,9 @@ use gpui::{
 };
 use serde_json::Value;
 use settings::Settings;
-use ui::{Button, IconName, Label, StatefulInteractiveElement, Tab, WithScrollbar, prelude::*};
+use ui::{
+    Button, IconName, Label, StatefulInteractiveElement, Tab, TintColor, WithScrollbar, prelude::*,
+};
 use ui_input::InputField;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -471,6 +473,8 @@ impl NetworkPanel {
             )
             .child(
                 Button::new("offline", offline_label(offline))
+                    .toggle_state(offline)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_offline(cx))),
             )
             .child(self.filter_editor.clone())
