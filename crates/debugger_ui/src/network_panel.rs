@@ -771,6 +771,10 @@ fn throttle_label(control: &Value) -> &'static str {
         (true, _) => "Offline",
         (_, Some(2_000)) => "Slow 3G",
         (_, Some(563)) => "Fast 3G",
+        // Toggling offline off materialises an explicit `latency_ms: 0` even
+        // though nothing is throttled, so zero means "no throttling" — not a
+        // custom preset (ISSUE-0033).
+        (_, Some(0)) => "Online",
         (_, Some(_)) => "Custom",
         _ => "Online",
     }
@@ -808,7 +812,7 @@ fn headers_text(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{headers_text, offline_label, panel_root};
+    use super::{headers_text, offline_label, panel_root, throttle_label};
     use gpui::{IntoElement, ParentElement, Pixels, Styled, TestAppContext, div, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -877,5 +881,32 @@ mod tests {
         // contradicting the throttle label's "Offline" for the same state.
         assert_eq!(offline_label(true), "Offline");
         assert_eq!(offline_label(false), "Online");
+    }
+
+    #[test]
+    fn throttle_label_treats_zero_latency_as_online() {
+        // ISSUE-0033: toggling offline off materialises `latency_ms: 0`, which
+        // used to be labelled "Custom".
+        let unthrottled = serde_json::json!({
+            "offline": false,
+            "throttle": { "latency_ms": 0 },
+        });
+        assert_eq!(throttle_label(&unthrottled), "Online");
+
+        // Presets, custom throttling and the offline state are unchanged.
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 2_000 } })),
+            "Slow 3G"
+        );
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 563 } })),
+            "Fast 3G"
+        );
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 5_000 } })),
+            "Custom"
+        );
+        assert_eq!(throttle_label(&serde_json::json!({ "offline": true })), "Offline");
+        assert_eq!(throttle_label(&serde_json::json!({})), "Online");
     }
 }
