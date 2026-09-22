@@ -705,7 +705,7 @@ impl gpui::Render for NetworkPanel {
             .size_full()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(div().flex_1().min_h_0().grid().grid_cols(2).children(vec![
+            .child(div().flex_1().min_h_0().grid().grid_cols(2).grid_rows(1).children(vec![
                     self.render_list(window, cx).into_any_element(),
                     div()
                         .size_full()

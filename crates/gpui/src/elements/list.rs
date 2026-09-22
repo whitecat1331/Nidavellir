@@ -2412,18 +2412,22 @@ mod test {
         // A `List` element does not consume a flex row's cross-axis height (the
         // network panel's empty-waterfall regression). A grid cell has a
         // definite height, so the list fills it with size_full() and renders
-        // its tail.
+        // its tail. The grid must declare grid_rows(1): without it the row is
+        // implicit/auto (content-sized), the list grows to its full content
+        // height, and nothing is left to scroll.
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().flex().flex_col().size_full().child(
-                    div().flex_1().min_h_0().grid().grid_cols(2).children(vec![
-                        list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
-                            .size_full()
-                            .into_any_element(),
-                        div().flex_col().into_any_element(),
-                    ]),
-                )
+                div().flex().flex_col().size_full()
+                    .child(div().h(px(40.)).w_full())
+                    .child(
+                        div().flex_1().min_h_0().grid().grid_cols(2).grid_rows(1).children(vec![
+                            list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                                .size_full()
+                                .into_any_element(),
+                            div().size_full().flex_col().child(div().h(px(24.)).w_full()).into_any_element(),
+                        ]),
+                    )
             }
         }
 
@@ -2435,12 +2439,14 @@ mod test {
             view.clone().into_any_element()
         });
 
-        // 440px panel, 120 items x 24px: follow-tail should anchor near the
-        // tail (120 - ceil(440/24) = ~101), not stay at 120 (zero height).
+        // 440px panel - 40px toolbar = 400px row. 120 items x 24px = 2880px.
+        // A bounded cell anchors follow-tail near item 120 - ceil(400/24) = ~103.
+        // A content-sized cell anchors at 0 (everything fits); a zero-height
+        // cell anchors at 120. Assert the bounded middle.
         let scroll_top = state.logical_scroll_top();
         assert!(
-            scroll_top.item_ix <= 110,
-            "list should fill the grid cell and render its tail, got scroll_top.item_ix={}",
+            scroll_top.item_ix >= 90 && scroll_top.item_ix <= 110,
+            "list cell should be bounded and render the tail, got scroll_top.item_ix={}",
             scroll_top.item_ix,
         );
     }
