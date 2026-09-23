@@ -409,14 +409,10 @@ impl NetworkPanel {
             let body = browser_api
                 .get_response_body(session_id, None, &request_id, 0, 65_536)
                 .await
-                .ok();
+                .map_err(|error| error.to_string());
             if this
                 .update(cx, |panel, cx| {
-                    panel.response_body = body
-                        .as_ref()
-                        .and_then(|value| value.get("body"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    panel.response_body = Some(response_body_label(&body));
                     cx.notify();
                 })
                 .is_err()
@@ -598,6 +594,16 @@ impl NetworkPanel {
                     .unwrap_or(Value::Null)
             ),
             DetailTab::Cookies => {
+                let request_cookie = request
+                    .get("request_headers")
+                    .and_then(|headers| headers.get("cookie"))
+                    .or_else(|| {
+                        request
+                            .get("request_headers")
+                            .and_then(|headers| headers.get("Cookie"))
+                    })
+                    .and_then(Value::as_str)
+                    .unwrap_or("(none)");
                 let set_cookie = request
                     .get("response_headers")
                     .and_then(|headers| headers.get("set-cookie"))
@@ -608,7 +614,7 @@ impl NetworkPanel {
                     })
                     .and_then(Value::as_str)
                     .unwrap_or("(none)");
-                format!("Set-Cookie: {set_cookie}")
+                format!("Request Cookie: {request_cookie}\nSet-Cookie: {set_cookie}")
             }
         }
     }
@@ -763,6 +769,31 @@ fn detail_scroll_body(
         .into_any_element()
 }
 
+/// Map a `get_response_body` result to the text shown in the Response tab, so
+/// a failed or binary body renders a concrete state instead of a permanent
+/// "Loading response body…" spinner (ISSUE-0036).
+fn response_body_label(result: &Result<Value, String>) -> String {
+    match result {
+        Ok(value) => {
+            if value.get("binary").and_then(Value::as_bool) == Some(true) {
+                let size = value
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("(binary body: {size} bytes)")
+            } else {
+                value
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(empty body)")
+                    .to_string()
+            }
+        }
+        Err(error) => format!("Failed to load response body: {error}"),
+    }
+}
+
 fn next_throttle_preset(control: &Value) -> ThrottlePreset {
     let offline = control
         .get("offline")
@@ -838,7 +869,10 @@ fn headers_text(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{headers_text, offline_label, panel_root, reset_detail_scroll, throttle_label};
+    use super::{
+        headers_text, offline_label, panel_root, reset_detail_scroll, response_body_label,
+        throttle_label,
+    };
     use gpui::{IntoElement, ParentElement, Pixels, ScrollHandle, Styled, TestAppContext, div, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -942,5 +976,24 @@ mod tests {
         handle.set_offset(point(px(0.), px(-100.)));
         reset_detail_scroll(&handle);
         assert_eq!(handle.offset(), point(px(0.), px(0.)));
+    }
+
+    #[test]
+    fn response_body_label_surfaces_failure_and_binary_states() {
+        // ISSUE-0036: a failed or binary body used to render as a permanent
+        // "Loading response body…" spinner because the error was discarded.
+        assert_eq!(
+            response_body_label(&Err("boom".to_string())),
+            "Failed to load response body: boom"
+        );
+
+        let binary = serde_json::json!({ "binary": true, "size": 4096 });
+        assert_eq!(
+            response_body_label(&Ok(binary)),
+            "(binary body: 4096 bytes)"
+        );
+
+        let text = serde_json::json!({ "binary": false, "body": "hello world" });
+        assert_eq!(response_body_label(&Ok(text)), "hello world");
     }
 }

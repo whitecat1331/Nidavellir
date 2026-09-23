@@ -194,7 +194,7 @@ impl NetworkStore {
             request.mime_type = Some(mime_type);
         }
         if let Some(headers) = response.and_then(|data| data.get("headers")) {
-            request.response_headers = headers_object(headers);
+            request.response_headers.extend(headers_object(headers));
         }
         if let Some(timing) = response.and_then(|data| data.get("timing")) {
             request.timing = Some(timing_from_value(timing));
@@ -260,7 +260,7 @@ impl NetworkStore {
             return;
         };
         if let Some(headers) = params.get("headers") {
-            request.response_headers = headers_object(headers);
+            request.response_headers.extend(headers_object(headers));
         }
         if let Some(status) = u32_field(params, "statusCode") {
             request.status = Some(status);
@@ -669,6 +669,45 @@ mod tests {
             .map(|request| request.request_id.as_str())
             .collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn preserves_set_cookie_from_response_extra_info() {
+        let mut store = NetworkStore::new();
+        store.ingest(&json!({
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "1",
+                "request": { "url": "https://example.com/", "method": "GET" }
+            }
+        }));
+        // responseReceivedExtraInfo carries Set-Cookie; responseReceived redacts
+        // it. Both events must merge so Set-Cookie survives (ISSUE-0037).
+        store.ingest(&json!({
+            "method": "Network.responseReceivedExtraInfo",
+            "params": {
+                "requestId": "1",
+                "statusCode": 200,
+                "headers": { "set-cookie": "session=abc; Path=/" }
+            }
+        }));
+        store.ingest(&json!({
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "1",
+                "response": { "status": 200, "headers": { "Content-Type": "text/html" } }
+            }
+        }));
+
+        let request = store.request("1").expect("request should be tracked");
+        assert_eq!(
+            request.response_headers.get("set-cookie").map(String::as_str),
+            Some("session=abc; Path=/")
+        );
+        assert_eq!(
+            request.response_headers.get("Content-Type").map(String::as_str),
+            Some("text/html")
+        );
     }
 }
 
