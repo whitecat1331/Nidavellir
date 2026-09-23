@@ -560,15 +560,7 @@ impl NetworkPanel {
                 .into_any_element();
         };
         let body = self.detail_body(request);
-        v_flex()
-            .id("network-detail-body")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.detail_scroll_handle)
-            .p_2()
-            .child(Label::new(body))
-            .vertical_scrollbar_for(&self.detail_scroll_handle, window, cx)
-            .into_any_element()
+        detail_scroll_body(body, &self.detail_scroll_handle, window, cx)
     }
 
     fn detail_body(&self, request: &Value) -> String {
@@ -737,12 +729,38 @@ fn panel_root() -> Div {
     div().flex().flex_col().size_full()
 }
 
-/// Reset the detail pane's scroll position to the top, reusing the same
-/// [`ScrollHandle`]. The handle must never be replaced: `vertical_scrollbar_for`
-/// caches the first handle it is given, so a fresh handle desyncs the thumb from
-/// the content (ISSUE-0034).
+/// Reset the detail pane's scroll position to the top when a request is
+/// selected or a detail tab changes.
 fn reset_detail_scroll(handle: &ScrollHandle) {
     handle.set_offset(point(px(0.), px(0.)));
+}
+
+/// Render the detail pane's scrollable body with a scrollbar overlay. The
+/// scrollbar must live on a *separate* element from the scrolled content:
+/// `vertical_scrollbar_for` adds the thumb as a child of the element it is
+/// called on, so attaching it to the same element that scrolls
+/// (`overflow_y_scroll` + `track_scroll`) makes the thumb scroll with the
+/// content and inverts it (ISSUE-0034).
+fn detail_scroll_body(
+    body: String,
+    scroll_handle: &ScrollHandle,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    v_flex()
+        .id("network-detail-body")
+        .size_full()
+        .child(
+            div()
+                .id("network-detail-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(scroll_handle)
+                .p_2()
+                .child(Label::new(body)),
+        )
+        .vertical_scrollbar_for(scroll_handle, window, cx)
+        .into_any_element()
 }
 
 fn next_throttle_preset(control: &Value) -> ThrottlePreset {
@@ -920,9 +938,6 @@ mod tests {
 
     #[test]
     fn reset_detail_scroll_resets_offset_without_replacing_handle() {
-        // The detail pane's scrollbar (vertical_scrollbar_for) caches the first
-        // handle it is given, so selection/tab changes must reuse the handle
-        // (reset) rather than replace it (ISSUE-0034).
         let handle = ScrollHandle::new();
         handle.set_offset(point(px(0.), px(-100.)));
         reset_detail_scroll(&handle);
