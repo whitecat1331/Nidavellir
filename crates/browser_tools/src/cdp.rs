@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use async_tungstenite::client_async;
 use async_tungstenite::tungstenite::{Error as TungsteniteError, Message};
 use futures::channel::oneshot;
+use futures::future::{select, Either};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use gpui::BackgroundExecutor;
 use serde_json::{Value, json};
@@ -10,6 +11,7 @@ use smol::net::TcpStream;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use url::Url;
 
 /// An error returned by the Chrome DevTools Protocol client.
@@ -23,6 +25,12 @@ pub enum CdpError {
 
 /// Maximum number of events buffered per session before the oldest drop.
 const MAX_BUFFERED_EVENTS_PER_SESSION: usize = 500;
+
+/// How long to wait for a CDP response before failing the command. Chrome can
+/// withhold a response indefinitely (for example a navigation parked by `Fetch`
+/// interception); without a bound the `AgentBrowserApi` sessions mutex was held
+/// across the await, deadlocking the whole browser surface (ISSUE-0035).
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A command queued for delivery over the browser-level websocket.
 struct Outgoing {
@@ -68,7 +76,10 @@ impl EventBuffer {
 /// continuously drains incoming messages, routing responses back to the
 /// awaiting command and fanning events out by `sessionId`. Capture is
 /// continuous rather than a side effect of the next command.
+#[derive(Clone)]
 pub struct CdpClient {
+    executor: BackgroundExecutor,
+    timeout: Duration,
     outgoing: Sender<Outgoing>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     next_id: Arc<AtomicU64>,
@@ -97,6 +108,8 @@ impl CdpClient {
             .detach();
 
         Ok(Self {
+            executor: executor.clone(),
+            timeout: DEFAULT_COMMAND_TIMEOUT,
             outgoing,
             pending,
             next_id: Arc::new(AtomicU64::new(0)),
@@ -136,9 +149,15 @@ impl CdpClient {
             self.pending.lock().unwrap().remove(&id);
             return Err(anyhow!("failed to send CDP command: connection closed"));
         }
-        response
-            .await
-            .map_err(|_| anyhow!("CDP connection closed while awaiting response"))?
+        match select(Box::pin(response), Box::pin(self.executor.timer(self.timeout))).await {
+            Either::Left((result, _timer)) => {
+                result.map_err(|_| anyhow!("CDP connection closed while awaiting response"))?
+            }
+            Either::Right(((), _response)) => {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(anyhow!("CDP command {method} timed out after {:?}", self.timeout));
+            }
+        }
     }
 
     /// Borrow the most recent buffered events without draining them.
@@ -211,5 +230,30 @@ async fn read_loop<S>(
     let mut pending = pending.lock().unwrap();
     for (_, responder) in pending.drain() {
         let _ = responder.send(Err(anyhow!("CDP connection closed")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn command_times_out_when_no_response(cx: &mut TestAppContext) {
+        // A client whose outgoing messages are buffered but never drained and
+        // whose pending responders are never resolved: a CDP command that
+        // Chrome withholds (ISSUE-0035) must fail with a timeout rather than
+        // awaiting the response forever.
+        let (outgoing, _incoming) = unbounded::<Outgoing>();
+        let client = CdpClient {
+            executor: cx.background_executor.clone(),
+            timeout: Duration::from_millis(500),
+            outgoing,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(Mutex::new(EventBuffer::default())),
+        };
+        let result = client.send_command("Browser.getVersion", json!({})).await;
+        assert!(result.is_err(), "expected command to time out, got {result:?}");
     }
 }

@@ -125,34 +125,42 @@ impl AgentBrowserApi {
     }
 
     pub async fn open_target(&self, session_id: u64, url: &str) -> Result<Value> {
+        let client = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&session_id).context("unknown browser session")?;
+            session.client.clone()
+        };
+        let target = create_target(&client, url, &self.background_executor).await?;
+        let target_json = target_to_json(&target);
+        let target_id = target.target_id.clone();
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
-        let target = create_target(&session.client, url, &self.background_executor).await?;
-        let target_json = target_to_json(&target);
-        let target_id = target.target_id.clone();
         session.active_target_id = Some(target_id.clone());
         session.targets.insert(target_id, target);
         Ok(target_json)
     }
 
     pub async fn close_target(&self, session_id: u64, target_id: &str) -> Result<()> {
+        let (client, target) = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(&session_id)
+                .context("unknown browser session")?;
+            let target = session
+                .targets
+                .remove(target_id)
+                .context("unknown browser target")?;
+            (session.client.clone(), target)
+        };
+        client
+            .send_command("Target.closeTarget", json!({ "targetId": target.target_id }))
+            .await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .context("unknown browser session")?;
-        let target = session
-            .targets
-            .remove(target_id)
-            .context("unknown browser target")?;
-        session
-            .client
-            .send_command(
-                "Target.closeTarget",
-                json!({ "targetId": target.target_id }),
-            )
-            .await?;
         if session.active_target_id.as_deref() == Some(target_id) {
             session.active_target_id = session.targets.keys().next().cloned();
         }
@@ -177,43 +185,43 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         url: &str,
     ) -> Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Page.navigate",
                 json!({ "url": url }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         update_target_url(session, target_id, url);
         Ok(())
     }
 
     pub async fn snapshot(&self, session_id: u64, target_id: Option<&str>) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let page = evaluate_value(
-            &session.client,
-            Some(&target_session_id),
-            SNAPSHOT_EXPRESSION,
-        )
-        .await?;
-        let target = get_target(session, target_id)?;
+        let (client, target_session_id, resolved_target_id, fallback_url) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let target_session_id = resolve_target_session_id(session, target_id)?;
+            let target = get_target(session, target_id)?;
+            (
+                session.client.clone(),
+                target_session_id,
+                target.target_id.clone(),
+                target.url.clone(),
+            )
+        };
+        let page = evaluate_value(&client, Some(&target_session_id), SNAPSHOT_EXPRESSION).await?;
 
         Ok(json!({
-            "target_id": target.target_id,
+            "target_id": resolved_target_id,
             "url": page
                 .get("url")
                 .cloned()
-                .unwrap_or_else(|| Value::String(target.url.clone())),
+                .unwrap_or_else(|| Value::String(fallback_url)),
             "title": page.get("title").cloned().unwrap_or(Value::Null),
             "text": page.get("text").cloned().unwrap_or(Value::Null),
             "elements": page
@@ -224,13 +232,8 @@ impl AgentBrowserApi {
     }
 
     pub async fn screenshot(&self, session_id: u64, target_id: Option<&str>) -> Result<String> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Page.captureScreenshot",
@@ -250,13 +253,8 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         expression: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Runtime.evaluate",
@@ -288,16 +286,12 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         selector: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
         let expression = format!(
             "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ clicked: false, reason: 'no element matches selector' }}; el.click(); return {{ clicked: true, tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').toString().slice(0, 500) }}; }})()",
             selector = serde_json::to_string(selector)?,
         );
-        let value = evaluate_value(&session.client, Some(&target_session_id), &expression).await?;
+        let value = evaluate_value(&client, Some(&target_session_id), &expression).await?;
         Ok(json!({ "clicked": value }))
     }
 
@@ -308,17 +302,13 @@ impl AgentBrowserApi {
         selector: &str,
         text: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
 
         let focus = format!(
             "(() => {{ const el = document.querySelector({selector}); if (!el) return {{ focused: false, reason: 'no element matches selector' }}; el.focus(); return {{ focused: true, tag: el.tagName.toLowerCase() }}; }})()",
             selector = serde_json::to_string(selector)?,
         );
-        let focused = evaluate_value(&session.client, Some(&target_session_id), &focus).await?;
+        let focused = evaluate_value(&client, Some(&target_session_id), &focus).await?;
         if focused.get("focused").and_then(Value::as_bool) != Some(true) {
             return Ok(json!({
                 "typed": false,
@@ -329,8 +319,7 @@ impl AgentBrowserApi {
             }));
         }
 
-        session
-            .client
+        client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Input.insertText",
@@ -428,13 +417,8 @@ impl AgentBrowserApi {
         offset: usize,
         max_length: usize,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.getResponseBody",
@@ -445,6 +429,8 @@ impl AgentBrowserApi {
             .get("base64Encoded")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&session_id).context("unknown browser session")?;
         let mime_type = session
             .network_store
             .request(request_id)
@@ -493,21 +479,23 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         request_id: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        sync_network_store(session);
-        if let Some(post_data) = session
-            .network_store
-            .request(request_id)
-            .and_then(|request| request.post_data.clone())
-        {
-            return Ok(json!({ "request_id": request_id, "post_data": post_data }));
-        }
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(&session_id)
+                .context("unknown browser session")?;
+            sync_network_store(session);
+            if let Some(post_data) = session
+                .network_store
+                .request(request_id)
+                .and_then(|request| request.post_data.clone())
+            {
+                return Ok(json!({ "request_id": request_id, "post_data": post_data }));
+            }
+            let target_session_id = resolve_target_session_id(session, target_id)?;
+            (session.client.clone(), target_session_id)
+        };
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.getRequestPostData",
@@ -524,17 +512,12 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         urls: &[String],
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
         let mut params = json!({});
         if !urls.is_empty() {
             params["urls"] = json!(urls);
         }
-        session
-            .client
+        client
             .send_command_with_session(Some(&target_session_id), "Network.getCookies", params)
             .await
     }
@@ -546,13 +529,8 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         request_id: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.getWebSocketFrames",
@@ -629,19 +607,18 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         conditions: ThrottleConditions,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.emulateNetworkConditions",
                 conditions.to_cdp_params(),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.offline = conditions.offline;
         session.control.throttle = Some(conditions);
         Ok(result)
@@ -653,21 +630,25 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         offline: bool,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let mut conditions = session.control.throttle.clone().unwrap_or_default();
+        let (client, target_session_id, mut conditions) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let target_session_id = resolve_target_session_id(session, target_id)?;
+            let conditions = session.control.throttle.clone().unwrap_or_default();
+            (session.client.clone(), target_session_id, conditions)
+        };
         conditions.offline = offline;
-        let result = session
-            .client
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.emulateNetworkConditions",
                 conditions.to_cdp_params(),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.offline = offline;
         session.control.throttle = Some(conditions);
         Ok(result)
@@ -679,19 +660,18 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         disabled: bool,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setCacheDisabled",
                 json!({ "cacheDisabled": disabled }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.cache_disabled = disabled;
         Ok(result)
     }
@@ -702,19 +682,18 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         bypass: bool,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setBypassServiceWorker",
                 json!({ "bypass": bypass }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.bypass_service_worker = bypass;
         Ok(result)
     }
@@ -725,19 +704,18 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         urls: &[String],
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setBlockedURLs",
                 json!({ "urls": urls }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.blocked_urls = urls.to_vec();
         Ok(result)
     }
@@ -749,25 +727,29 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         urls: &[String],
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let mut merged = session.control.blocked_urls.clone();
-        for url in urls {
-            if !merged.iter().any(|existing| existing == url) {
-                merged.push(url.clone());
+        let (client, target_session_id, merged) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let target_session_id = resolve_target_session_id(session, target_id)?;
+            let mut merged = session.control.blocked_urls.clone();
+            for url in urls {
+                if !merged.iter().any(|existing| existing == url) {
+                    merged.push(url.clone());
+                }
             }
-        }
-        let result = session
-            .client
+            (session.client.clone(), target_session_id, merged)
+        };
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setBlockedURLs",
                 json!({ "urls": &merged }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.blocked_urls = merged;
         Ok(result)
     }
@@ -779,26 +761,30 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         urls: &[String],
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let merged = session
-            .control
-            .blocked_urls
-            .iter()
-            .filter(|existing| !urls.contains(existing))
-            .cloned()
-            .collect::<Vec<_>>();
-        let result = session
-            .client
+        let (client, target_session_id, merged) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let target_session_id = resolve_target_session_id(session, target_id)?;
+            let merged = session
+                .control
+                .blocked_urls
+                .iter()
+                .filter(|existing| !urls.contains(existing))
+                .cloned()
+                .collect::<Vec<_>>();
+            (session.client.clone(), target_session_id, merged)
+        };
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setBlockedURLs",
                 json!({ "urls": &merged }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.blocked_urls = merged;
         Ok(result)
     }
@@ -808,13 +794,8 @@ impl AgentBrowserApi {
         session_id: u64,
         target_id: Option<&str>,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.clearBrowserCache",
@@ -828,13 +809,8 @@ impl AgentBrowserApi {
         session_id: u64,
         target_id: Option<&str>,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.clearBrowserCookies",
@@ -849,13 +825,8 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         params: Value,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(Some(&target_session_id), "Network.setCookie", params)
             .await
     }
@@ -866,13 +837,8 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         params: Value,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(Some(&target_session_id), "Network.deleteCookies", params)
             .await
     }
@@ -883,19 +849,18 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         headers: &HashMap<String, String>,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setExtraHTTPHeaders",
                 json!({ "headers": headers }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.extra_http_headers = headers.clone();
         Ok(result)
     }
@@ -906,19 +871,18 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         user_agent: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        let result = session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Network.setUserAgentOverride",
                 json!({ "userAgent": user_agent }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.user_agent = Some(user_agent.to_string());
         Ok(result)
     }
@@ -929,16 +893,11 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
         patterns: &[InterceptionPattern],
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
         let config = InterceptionConfig {
             patterns: patterns.to_vec(),
         };
-        let result = session
-            .client
+        let result = client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Fetch.enable",
@@ -951,6 +910,10 @@ impl AgentBrowserApi {
                 }),
             )
             .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .context("unknown browser session")?;
         session.control.interception = Some(config);
         Ok(result)
     }
@@ -996,13 +959,8 @@ impl AgentBrowserApi {
         request_id: &str,
         error_reason: &str,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
-        session
-            .client
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        client
             .send_command_with_session(
                 Some(&target_session_id),
                 "Fetch.failRequest",
@@ -1069,19 +1027,14 @@ impl AgentBrowserApi {
         request_id: &str,
         fields: Value,
     ) -> Result<Value> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id)
-            .context("unknown browser session")?;
-        let target_session_id = resolve_target_session_id(session, target_id)?;
+        let (client, target_session_id) = self.session_client(session_id, target_id).await?;
         let mut params = json!({ "requestId": request_id });
         if let Some(object) = fields.as_object() {
             for (key, value) in object {
                 params[key] = value.clone();
             }
         }
-        session
-            .client
+        client
             .send_command_with_session(Some(&target_session_id), method, params)
             .await
     }
@@ -1112,6 +1065,23 @@ impl AgentBrowserApi {
             child.kill().context("failed to close Chromium")?;
         }
         Ok(())
+    }
+
+    /// Clone the session's CDP client and resolve the target session id under
+    /// the lock, then release the lock before the caller awaits a CDP round
+    /// trip. The sessions mutex must never be held across a CDP command:
+    /// Chrome can withhold a response (e.g. a navigation parked by `Fetch`
+    /// interception), which would otherwise deadlock every other browser call
+    /// that needs the same lock (ISSUE-0035).
+    async fn session_client(
+        &self,
+        session_id: u64,
+        target_id: Option<&str>,
+    ) -> Result<(CdpClient, String)> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&session_id).context("unknown browser session")?;
+        let target_session_id = resolve_target_session_id(session, target_id)?;
+        Ok((session.client.clone(), target_session_id))
     }
 }
 
