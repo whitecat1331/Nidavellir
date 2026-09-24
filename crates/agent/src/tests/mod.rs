@@ -4802,9 +4802,11 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
 async fn test_agent_connection(cx: &mut TestAppContext) {
     cx.update(settings::init);
     let templates = Templates::new();
+    let fake_fs = fs::FakeFs::new(cx.background_executor.clone());
 
     // Initialize language model system with test provider
     cx.update(|cx| {
+        <dyn fs::Fs>::set_global(fake_fs.clone(), cx);
         gpui_tokio::init(cx);
 
         let http_client = FakeHttpClient::with_404_response();
@@ -4819,7 +4821,6 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     cx.executor().forbid_parking();
 
     // Create a project for new_thread
-    let fake_fs = cx.update(|cx| fs::FakeFs::new(cx.background_executor().clone()));
     fake_fs.insert_tree(path!("/test"), json!({})).await;
     let project = Project::test(fake_fs.clone(), [Path::new("/test")], cx).await;
     let cwd = PathList::new(&[Path::new("/test")]);
@@ -5555,6 +5556,7 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
         match model {
             TestModel::Fake => {}
             TestModel::Sonnet4 => {
+                <dyn fs::Fs>::set_global(fs.clone(), cx);
                 gpui_tokio::init(cx);
                 let http_client = ReqwestClient::user_agent("agent tests").unwrap();
                 cx.set_http_client(Arc::new(http_client));
