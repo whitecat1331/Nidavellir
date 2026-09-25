@@ -8,7 +8,7 @@ use gpui::{App, AsyncApp, Context, Entity, Task, TaskExt};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     ApiKeyState, AuthenticateError, DisabledReason, EnvVar, IconOrSvg, InlineDescription,
-    LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    LanguageModel, LanguageModelClient, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelCompletionStream, LanguageModelId, LanguageModelName, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelRequestTool, LanguageModelToolUse, LanguageModelToolUseId,
@@ -492,7 +492,9 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
             )),
         ))
     }
+}
 
+impl LanguageModelClient for OllamaLanguageModelProvider {
     fn stream_completion(
         &self,
         model: &LanguageModel,
