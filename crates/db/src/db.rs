@@ -126,9 +126,13 @@ const CONNECTION_INITIALIZE_QUERY: &str = sql!(
     PRAGMA foreign_keys=TRUE;
 );
 
+// db.sqlite is shared between Zed instances on the same machine, so keep the
+// write-lock timeout high (matching `Connection::open_with_flags`) rather than
+// the old 500ms, which surfaced SQLITE_BUSY under contention and silently
+// dropped saves — e.g. a fresh thread's sidebar row never being written.
 const DB_INITIALIZE_QUERY: &str = sql!(
     PRAGMA journal_mode=WAL;
-    PRAGMA busy_timeout=500;
+    PRAGMA busy_timeout=5000;
     PRAGMA case_sensitive_like=TRUE;
     PRAGMA synchronous=NORMAL;
 );
