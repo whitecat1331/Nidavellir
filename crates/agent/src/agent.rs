@@ -77,6 +77,13 @@ use util::rel_path::RelPath;
 
 const MAXIMUM_RETRY_JITTER_FRACTION: f64 = 0.1;
 
+/// The sidebar writes a thread's metadata row eagerly, before the async save
+/// worker commits the thread blob to `threads.db`. Opening a thread in that
+/// window (possibly created by another instance) would otherwise surface a
+/// spurious "no thread found", so re-check a few times before giving up.
+const THREAD_LOAD_RETRY_ATTEMPTS: usize = 5;
+const THREAD_LOAD_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 pub(crate) fn jitter_retry_delay(delay: Duration) -> Duration {
     let jitter = delay.mul_f64(rand::rng().random_range(0.0..MAXIMUM_RETRY_JITTER_FRACTION));
     delay.checked_add(jitter).unwrap_or(Duration::MAX)
@@ -1670,10 +1677,20 @@ impl NativeAgent {
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
-            let db_thread = database
-                .load_thread(id.clone())
-                .await?
-                .with_context(|| format!("no thread found with ID: {id:?}"))?;
+            let mut db_thread = None;
+            for attempt in 0..THREAD_LOAD_RETRY_ATTEMPTS {
+                db_thread = database.load_thread(id.clone()).await?;
+                if db_thread.is_some() {
+                    break;
+                }
+                if attempt + 1 < THREAD_LOAD_RETRY_ATTEMPTS {
+                    cx.background_executor()
+                        .timer(THREAD_LOAD_RETRY_DELAY)
+                        .await;
+                }
+            }
+            let db_thread =
+                db_thread.with_context(|| format!("no thread found with ID: {id:?}"))?;
 
             this.update(cx, |this, cx| {
                 let project_id = this.get_or_create_project_state(&project, cx);
