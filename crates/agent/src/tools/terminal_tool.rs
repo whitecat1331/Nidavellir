@@ -1020,7 +1020,11 @@ async fn run_terminal_tool(
     // detection, ask the user whether to kill the command or let it continue;
     // stop it automatically if they don't answer within the window.
     let mut sampler_armed = true;
-    let mut last_output_len = 0usize;
+    // The snapshot the sampler saw on the previous poll. Deltas are derived by
+    // comparing whole snapshots, never by an offset into the current one: the
+    // terminal re-renders its screen on every poll, so an offset remembered from
+    // an earlier snapshot can land inside a multi-byte character.
+    let mut previous_output = String::new();
     let mut sampler_state = ErrorStreamState::default();
     let mut detected_error_lines = 0usize;
 
@@ -1045,56 +1049,55 @@ async fn run_terminal_tool(
                 if sampler_armed {
                     if let Ok(output) = terminal.current_output(cx) {
                         let content = &output.output;
-                        if content.len() > last_output_len {
-                            let delta = &content[last_output_len..];
-                            last_output_len = content.len();
-                            if detect_error_stream(delta, &mut sampler_state) {
-                                detected_error_lines = sampler_state.error_lines;
-                                let decision = cx.update(|cx| {
-                                    event_stream.prompt_for_decision(
-                                        None,
-                                        Some(format!(
-                                            "Detected a sustained stream of error output \
-                                             ({detected_error_lines} error-signature lines). \
-                                             Kill the command or let it continue? It is stopped \
-                                             automatically in 10 s.",
-                                        )),
-                                        vec![
-                                            acp::PermissionOption::new(
-                                                acp::PermissionOptionId::new("kill"),
-                                                "Kill",
-                                                acp::PermissionOptionKind::RejectOnce,
-                                            ),
-                                            acp::PermissionOption::new(
-                                                acp::PermissionOptionId::new("continue"),
-                                                "Continue",
-                                                acp::PermissionOptionKind::AllowOnce,
-                                            ),
-                                        ],
-                                        cx,
-                                    )
-                                });
-                                let kill = futures::select! {
-                                    outcome = decision.fuse() => match outcome {
-                                        Ok(option_id) => option_id.0.as_ref() == "kill",
-                                        Err(_) => true,
-                                    },
-                                    _ = cx.background_executor()
-                                        .timer(SAMPLER_KILL_CONTINUE_WINDOW)
-                                        .fuse() => true,
-                                };
-                                if kill {
-                                    failure_detected = true;
-                                    let reason = format!("a sustained stream of {detected_error_lines} error-signature lines was detected");
-                                    terminal
-                                        .mark_failure_detected(reason, cx)
-                                        .map_err(|e| e.to_string())?;
-                                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                                    wait_for_exit.await;
-                                    break 'wait;
-                                }
-                                sampler_armed = false;
+                        if let Some(new_output) =
+                            new_output_since(&mut previous_output, content, &mut sampler_state)
+                            && detect_error_stream(new_output, &mut sampler_state)
+                        {
+                            detected_error_lines = sampler_state.error_lines;
+                            let decision = cx.update(|cx| {
+                                event_stream.prompt_for_decision(
+                                    None,
+                                    Some(format!(
+                                        "Detected a sustained stream of error output \
+                                         ({detected_error_lines} error-signature lines). \
+                                         Kill the command or let it continue? It is stopped \
+                                         automatically in 10 s.",
+                                    )),
+                                    vec![
+                                        acp::PermissionOption::new(
+                                            acp::PermissionOptionId::new("kill"),
+                                            "Kill",
+                                            acp::PermissionOptionKind::RejectOnce,
+                                        ),
+                                        acp::PermissionOption::new(
+                                            acp::PermissionOptionId::new("continue"),
+                                            "Continue",
+                                            acp::PermissionOptionKind::AllowOnce,
+                                        ),
+                                    ],
+                                    cx,
+                                )
+                            });
+                            let kill = futures::select! {
+                                outcome = decision.fuse() => match outcome {
+                                    Ok(option_id) => option_id.0.as_ref() == "kill",
+                                    Err(_) => true,
+                                },
+                                _ = cx.background_executor()
+                                    .timer(SAMPLER_KILL_CONTINUE_WINDOW)
+                                    .fuse() => true,
+                            };
+                            if kill {
+                                failure_detected = true;
+                                let reason = format!("a sustained stream of {detected_error_lines} error-signature lines was detected");
+                                terminal
+                                    .mark_failure_detected(reason, cx)
+                                    .map_err(|e| e.to_string())?;
+                                terminal.kill(cx).map_err(|e| e.to_string())?;
+                                wait_for_exit.await;
+                                break 'wait;
                             }
+                            sampler_armed = false;
                         }
                     }
                 }
@@ -1358,8 +1361,42 @@ struct ErrorStreamState {
     total_lines: usize,
 }
 
-fn detect_error_stream(delta: &str, state: &mut ErrorStreamState) -> bool {
-    for line in delta.lines() {
+/// Returns the part of the terminal snapshot the sampler has not scanned yet, and
+/// records `content` as the snapshot to compare the next poll against.
+///
+/// `current_output` returns a freshly rendered screen snapshot, not an append-only
+/// stream: scrollback eviction, in-place redraws (progress bars, full-screen
+/// programs), and re-wrapping all move its prefix, so a byte offset remembered from
+/// an earlier poll can land inside a multi-byte character. When the previous
+/// snapshot is still a prefix of `content`, only the appended tail is new; otherwise
+/// the already-counted lines are gone from the screen and [`detect_error_stream`]
+/// must start over from this snapshot.
+fn new_output_since<'a>(
+    previous: &mut String,
+    content: &'a str,
+    state: &mut ErrorStreamState,
+) -> Option<&'a str> {
+    let new_output = if previous.is_empty() {
+        (!content.is_empty()).then_some(content)
+    } else if let Some(appended) = content.strip_prefix(previous.as_str()) {
+        (!appended.is_empty()).then_some(appended)
+    } else {
+        // The snapshot is not an extension of the previous one: the terminal
+        // redrew, re-wrapped, or evicted scrollback, so the lines already
+        // accounted for are no longer the ones on screen. Restart the
+        // accounting from this snapshot instead of double-counting its lines.
+        *state = ErrorStreamState::default();
+        Some(content)
+    };
+
+    previous.clear();
+    previous.push_str(content);
+
+    new_output
+}
+
+fn detect_error_stream(new_output: &str, state: &mut ErrorStreamState) -> bool {
+    for line in new_output.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1608,6 +1645,132 @@ mod tests {
         let mut state = ErrorStreamState::default();
         let delta = "error: 1\nerror: 2\n";
         assert!(!detect_error_stream(delta, &mut state));
+    }
+
+    #[test]
+    fn test_output_sampler_delta_reports_only_appended_output() {
+        let mut previous = String::new();
+        let mut state = ErrorStreamState::default();
+
+        assert_eq!(new_output_since(&mut previous, "", &mut state), None);
+        assert_eq!(
+            new_output_since(&mut previous, "building\n", &mut state),
+            Some("building\n")
+        );
+        assert_eq!(
+            new_output_since(&mut previous, "building\nlinking\n", &mut state),
+            Some("linking\n")
+        );
+        // A snapshot the sampler has already seen has nothing new to scan.
+        assert_eq!(
+            new_output_since(&mut previous, "building\nlinking\n", &mut state),
+            None
+        );
+    }
+
+    #[test]
+    fn test_output_sampler_regression_byte_offset_delta_panicked_on_moved_snapshot() {
+        // The 2026-09-23 crash: the terminal had rendered 5 bytes, then redrew the
+        // line as `───`, so byte 5 of the new snapshot fell inside `─` (bytes
+        // 3..6). The old sampler's `&content[last_output_len..]` panicked there on
+        // the main thread and aborted the editor.
+        let previous_len = 5;
+        let snapshot = "───\n";
+        assert!(!snapshot.is_char_boundary(previous_len));
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let byte_offset_slice = std::panic::catch_unwind(|| &snapshot[previous_len..]);
+        std::panic::set_hook(hook);
+        let payload = byte_offset_slice.expect_err("fixture stopped reproducing the panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("is not a char boundary"),
+            "fixture stopped reproducing the char-boundary panic: {message}"
+        );
+
+        // Comparing snapshots instead of offsets survives it: a moved prefix hands
+        // the whole snapshot over for scanning rather than a bogus slice.
+        let mut previous = String::from("✓ x");
+        let mut state = ErrorStreamState::default();
+        assert_eq!(
+            new_output_since(&mut previous, snapshot, &mut state),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn test_output_sampler_rescans_rewritten_snapshots_without_double_counting() {
+        let mut previous = String::new();
+        let mut state = ErrorStreamState::default();
+
+        let snapshot = "line one\nline two\n";
+        let new_output = new_output_since(&mut previous, snapshot, &mut state).unwrap();
+        assert!(!detect_error_stream(new_output, &mut state));
+        assert_eq!(state.total_lines, 2);
+
+        // Grow → shrink → re-wrap: scrollback evicted a line and the remaining one
+        // came back re-wrapped, so the snapshot is neither an extension nor a
+        // prefix of the previous one.
+        let rewritten = "─ re-wrapped ─\nline two\n";
+        let new_output = new_output_since(&mut previous, rewritten, &mut state).unwrap();
+        assert_eq!(new_output, rewritten);
+        assert!(!detect_error_stream(new_output, &mut state));
+
+        // The counters describe the snapshot on screen, not the evicted line.
+        assert_eq!(state.total_lines, 2);
+        assert_eq!(state.error_lines, 0);
+    }
+
+    #[test]
+    fn test_output_sampler_detects_error_flood_from_rewritten_snapshots() {
+        let mut previous = String::new();
+        let mut state = ErrorStreamState::default();
+        let mut detected_after = None;
+
+        // A failing command whose box-drawing header is redrawn as it goes: every
+        // poll shows a different window of error lines, so none of the snapshots is
+        // an extension of the previous one.
+        for window in 1..=12 {
+            let snapshot = (window..window + 5)
+                .map(|line| format!("── error: failure {line}\n"))
+                .collect::<String>();
+            if let Some(new_output) = new_output_since(&mut previous, &snapshot, &mut state)
+                && detect_error_stream(new_output, &mut state)
+            {
+                detected_after = Some(window);
+                break;
+            }
+        }
+
+        assert_eq!(detected_after, Some(1));
+    }
+
+    #[test]
+    fn test_output_sampler_detects_sustained_errors_across_appended_snapshots() {
+        let mut previous = String::new();
+        let mut state = ErrorStreamState::default();
+        let mut detected_after = None;
+
+        for line in 1..=12 {
+            let snapshot = (1..=line)
+                .map(|line| format!("error: failure {line}\n"))
+                .collect::<String>();
+            if let Some(new_output) = new_output_since(&mut previous, &snapshot, &mut state)
+                && detect_error_stream(new_output, &mut state)
+            {
+                detected_after = Some(line);
+                break;
+            }
+        }
+
+        // Nothing fires during the startup grace, then the flood is detected once
+        // it is error-dominated.
+        assert_eq!(detected_after, Some(4));
     }
 
     #[test]
