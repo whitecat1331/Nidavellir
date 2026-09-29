@@ -4325,6 +4325,13 @@ impl AgentPanel {
             }
 
             this.update_in(cx, |this, window, cx| {
+                // The disk check is asynchronous, so the user may have switched
+                // threads while it was in flight. Never yank them back to a
+                // thread they already left.
+                if this.active_thread_id(cx) != Some(thread_id) {
+                    return;
+                }
+
                 // Discard the stale in-memory session before rebuilding so
                 // `load_agent_thread` reads the newer on-disk copy rather than
                 // reusing the cached session. Skipping the save is important:
@@ -4578,6 +4585,11 @@ impl AgentPanel {
                 window,
                 cx,
             );
+            // A parked thread keeps its last in-memory copy, which can be older
+            // than the shared database if another instance wrote to it while it
+            // was parked. Now that the view is active, discard and reload it if
+            // the on-disk copy moved.
+            self.reload_active_thread_if_stale(window, cx);
             return;
         }
 
