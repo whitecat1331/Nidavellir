@@ -37,6 +37,7 @@ use crate::DEFAULT_THREAD_TITLE;
 /// written by other Zed instances. A thread created in one instance should
 /// appear in another instance's sidebar without a manual reload, so this
 /// interval bounds the cross-instance propagation latency.
+#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
 const THREAD_METADATA_CHANGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
@@ -1388,6 +1389,12 @@ impl ThreadMetadataStore {
         // Poll the shared database for changes written by other Zed instances
         // and reload so their threads appear in this instance's sidebar without
         // waiting for a user interaction.
+        //
+        // Not spawned under test: the deterministic test scheduler jumps
+        // straight to the next pending timer whenever it parks, so a periodic
+        // reload would fire at arbitrary points mid-test and race whatever the
+        // test is asserting. `change_fingerprint` is unit-tested directly.
+        #[cfg(not(any(test, feature = "test-support")))]
         let _change_watch_task = cx.spawn({
             let watch_db = db.clone();
             async move |this, cx| {
@@ -1423,6 +1430,8 @@ impl ThreadMetadataStore {
                 }
             }
         });
+        #[cfg(any(test, feature = "test-support"))]
+        let _change_watch_task = Task::ready(());
 
         let mut this = Self {
             db,
