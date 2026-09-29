@@ -77,6 +77,15 @@ use util::rel_path::RelPath;
 
 const MAXIMUM_RETRY_JITTER_FRACTION: f64 = 0.1;
 
+/// The sidebar writes a thread's metadata row eagerly, but an empty thread is
+/// not persisted at all (`thread_save_payload` skips it) and the save worker
+/// commits asynchronously after the first message. Opening a thread in that
+/// window — especially one another instance is still starting — would surface a
+/// spurious "no thread found", so keep re-checking well past the promotion →
+/// first-save gap before concluding the thread is really missing.
+const THREAD_LOAD_RETRY_ATTEMPTS: usize = 40;
+const THREAD_LOAD_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 pub(crate) fn jitter_retry_delay(delay: Duration) -> Duration {
     let jitter = delay.mul_f64(rand::rng().random_range(0.0..MAXIMUM_RETRY_JITTER_FRACTION));
     delay.checked_add(jitter).unwrap_or(Duration::MAX)
@@ -1670,10 +1679,37 @@ impl NativeAgent {
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
-            let db_thread = database
-                .load_thread(id.clone())
-                .await?
-                .with_context(|| format!("no thread found with ID: {id:?}"))?;
+            let mut db_thread = None;
+            for attempt in 0..THREAD_LOAD_RETRY_ATTEMPTS {
+                db_thread = database.load_thread(id.clone()).await?;
+                if db_thread.is_some() {
+                    if attempt > 0 {
+                        log::info!(
+                            "[THREAD] content for {id:?} appeared after {} retr{}",
+                            attempt,
+                            if attempt == 1 { "y" } else { "ies" }
+                        );
+                    }
+                    break;
+                }
+                if attempt == 0 {
+                    log::info!(
+                        "[THREAD] no persisted content for {id:?} yet; waiting up to {:?} (another instance may still be starting it)",
+                        THREAD_LOAD_RETRY_DELAY * (THREAD_LOAD_RETRY_ATTEMPTS as u32 - 1)
+                    );
+                }
+                if attempt + 1 < THREAD_LOAD_RETRY_ATTEMPTS {
+                    cx.background_executor()
+                        .timer(THREAD_LOAD_RETRY_DELAY)
+                        .await;
+                }
+            }
+            let db_thread = db_thread.with_context(|| {
+                log::warn!(
+                    "[THREAD] giving up on {id:?}: no persisted content after {THREAD_LOAD_RETRY_ATTEMPTS} attempts"
+                );
+                format!("no thread found with ID: {id:?}")
+            })?;
 
             this.update(cx, |this, cx| {
                 let project_id = this.get_or_create_project_state(&project, cx);
