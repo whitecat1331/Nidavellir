@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use agent::{ThreadStore, ZED_AGENT_ID};
@@ -31,6 +32,13 @@ use workspace::{
 };
 
 use crate::DEFAULT_THREAD_TITLE;
+
+/// How often the sidebar metadata store polls the shared database for changes
+/// written by other Zed instances. A thread created in one instance should
+/// appear in another instance's sidebar without a manual reload, so this
+/// interval bounds the cross-instance propagation latency.
+#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+const THREAD_METADATA_CHANGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -516,6 +524,7 @@ pub struct ThreadMetadataStore {
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
+    _change_watch_task: Task<()>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1377,6 +1386,53 @@ impl ThreadMetadataStore {
             }
         });
 
+        // Poll the shared database for changes written by other Zed instances
+        // and reload so their threads appear in this instance's sidebar without
+        // waiting for a user interaction.
+        //
+        // Not spawned under test: the deterministic test scheduler jumps
+        // straight to the next pending timer whenever it parks, so a periodic
+        // reload would fire at arbitrary points mid-test and race whatever the
+        // test is asserting. `change_fingerprint` is unit-tested directly.
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _change_watch_task = cx.spawn({
+            let watch_db = db.clone();
+            async move |this, cx| {
+                let baseline = cx
+                    .background_spawn({
+                        let watch_db = watch_db.clone();
+                        async move { watch_db.change_fingerprint() }
+                    })
+                    .await;
+                let mut last_fingerprint = baseline.ok();
+
+                loop {
+                    cx.background_executor()
+                        .timer(THREAD_METADATA_CHANGE_POLL_INTERVAL)
+                        .await;
+                    let fingerprint = cx
+                        .background_spawn({
+                            let watch_db = watch_db.clone();
+                            async move { watch_db.change_fingerprint() }
+                        })
+                        .await;
+                    let Ok(fingerprint) = fingerprint else {
+                        continue;
+                    };
+                    if last_fingerprint.as_ref() == Some(&fingerprint) {
+                        continue;
+                    }
+                    last_fingerprint = Some(fingerprint);
+                    this.update(cx, |this, cx| {
+                        let _ = this.reload(cx);
+                    })
+                    .ok();
+                }
+            }
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        let _change_watch_task = Task::ready(());
+
         let mut this = Self {
             db,
             threads: HashMap::default(),
@@ -1389,6 +1445,7 @@ impl ThreadMetadataStore {
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
+            _change_watch_task,
         };
         let _ = this.reload(cx);
         this
@@ -1666,6 +1723,21 @@ impl ThreadMetadataDb {
     /// Only returns threads that have a `session_id`.
     pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
         self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+    }
+
+    /// A cheap change signal for the sidebar metadata table, used to detect
+    /// writes from other Zed instances sharing the same database file. Any
+    /// insert, delete, archive, or timestamp update changes at least one of
+    /// the aggregated values, so a polling watcher can reload on external
+    /// changes without deserializing every row.
+    pub fn change_fingerprint(&self) -> anyhow::Result<String> {
+        let row = self.select_row::<String>(
+            "SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || \
+             COALESCE(MAX(interacted_at), '') || ':' || COALESCE(MAX(created_at), '') || ':' || \
+             COALESCE(SUM(archived), 0) \
+             FROM sidebar_threads",
+        )?()?;
+        Ok(row.unwrap_or_default())
     }
 
     /// Upsert metadata for a thread.
@@ -2174,6 +2246,33 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_change_fingerprint_changes_after_save(_cx: &mut TestAppContext) {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let baseline = db.change_fingerprint().unwrap();
+
+        db.save(make_metadata(
+            "session-1",
+            "Title",
+            Utc::now(),
+            PathList::default(),
+        ))
+        .await
+        .unwrap();
+
+        let changed = db.change_fingerprint().unwrap();
+        assert_ne!(
+            baseline, changed,
+            "change_fingerprint must change after a save"
+        );
     }
 
     #[gpui::test]
