@@ -2160,6 +2160,13 @@ mod tests {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
+            // Use an isolated DB so parallel tests can't see or overwrite each
+            // other's workspace/kvp records. Without this, `WorkspaceDb` and
+            // `KeyValueStore` fall back to the process-wide test database, and
+            // the remote-connection backfill tests flake: another test that runs
+            // `run_store_migrations` writes the same backfill kvp key, so this
+            // test's migration returns early and never backfills.
+            cx.set_global(db::AppDatabase::test_new());
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             release_channel::init("0.0.0".parse().unwrap(), cx);
