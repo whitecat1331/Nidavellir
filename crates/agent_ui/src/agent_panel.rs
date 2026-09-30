@@ -5057,6 +5057,19 @@ impl AgentPanel {
             .is_some_and(|thread| !thread.read(cx).entries().is_empty())
     }
 
+    /// Whether the active thread carries an explicit title (e.g. a review
+    /// thread seeded with "Review: …"). Empty drafts normally have no title;
+    /// this lets the toolbar show the title editor instead of the generic
+    /// "New … Thread" placeholder.
+    fn active_thread_has_title(&self, cx: &App) -> bool {
+        self.active_thread_id(cx).is_some_and(|thread_id| {
+            ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(thread_id))
+                .and_then(|metadata| metadata.title())
+                .is_some()
+        })
+    }
+
     /// Whether the active view is in the **ephemeral** new-draft slot
     pub fn active_view_is_new_draft(&self, cx: &App) -> bool {
         self.draft_thread.as_ref().is_some_and(|draft| {
@@ -6733,7 +6746,9 @@ impl AgentPanel {
             .flex_none()
             .justify_between();
 
-        let empty_thread_title = matches!(mode, ToolbarMode::EmptyThread).then(|| {
+        let empty_thread_title = (matches!(mode, ToolbarMode::EmptyThread)
+            && !self.active_thread_has_title(cx))
+        .then(|| {
             Label::new(format!("New {} Thread", selected_agent_label))
                 .color(Color::Muted)
                 .truncate()
