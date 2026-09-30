@@ -259,6 +259,7 @@
       "cmd-alt-c": "agent::OpenSettings",
       "cmd-alt-m": "agent::ToggleOptionsMenu",
       "cmd-alt-shift-n": "agent::ToggleNewThreadMenu",
+      "cmd-alt-r": "agent::ReviewThreadInWorktree",
       "cmd-shift-e": "project_panel::ToggleFocus",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],

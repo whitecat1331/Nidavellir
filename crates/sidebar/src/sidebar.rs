@@ -311,6 +311,14 @@ fn draft_display_label_for_thread_metadata(
     workspace: &ThreadEntryWorkspace,
     cx: &App,
 ) -> Option<(SharedString, DraftKind)> {
+    // A draft that carries an explicit title (e.g. a review thread seeded with
+    // a "Review: …" title) is labelled by that title rather than its prompt
+    // text. Plain user drafts have no title, so they keep the prompt-derived
+    // label below.
+    if let Some(title) = metadata.title() {
+        return Some((title, DraftKind::WithContent));
+    }
+
     let workspace = match workspace {
         ThreadEntryWorkspace::Open(workspace) => Some(workspace),
         ThreadEntryWorkspace::Closed { .. } => None,

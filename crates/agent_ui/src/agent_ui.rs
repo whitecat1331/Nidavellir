@@ -333,6 +333,10 @@ actions!(
         SyncThreads,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Opens a review thread in a fresh git worktree copied from the active
+        /// thread's checkout, so the reviewer can explore and mutate without
+        /// touching the original work.
+        ReviewThreadInWorktree,
     ]
 );
 
