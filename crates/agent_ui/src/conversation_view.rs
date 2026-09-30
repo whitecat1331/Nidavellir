@@ -1129,6 +1129,7 @@ impl ConversationView {
             );
 
             let mut resumed_without_history = false;
+            let new_session_title = title.clone();
             let result = if let Some(session_id) = resume_session_id.clone() {
                 cx.update(|_, cx| {
                     if connection.supports_load_session() {
@@ -1187,6 +1188,11 @@ impl ConversationView {
                     Ok(thread) => {
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
                         let root_session_id = thread.read(cx).session_id().clone();
+                        if let Some(title) = new_session_title {
+                            thread.update(cx, |thread, cx| {
+                                thread.set_title(title, cx).detach_and_log_err(cx);
+                            });
+                        }
 
                         let conversation = cx.new(|cx| {
                             let mut conversation = Conversation::default();
