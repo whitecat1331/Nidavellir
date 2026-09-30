@@ -851,8 +851,12 @@ pub trait ThreadEnvironment {
 pub struct SiblingThreadRequest {
     /// A short title for the new thread, shown in the sidebar.
     pub title: SharedString,
-    /// The initial prompt to send to the new thread.
+    /// The prompt to seed the new thread with. Submitted immediately when
+    /// `auto_submit` is true; otherwise it is only prefilled in the new
+    /// thread's editor for the user to review and send.
     pub prompt: String,
+    /// Whether to submit `prompt` automatically once the new thread opens.
+    pub auto_submit: bool,
     /// Optional agent ID to use. Defaults to the native Zed agent.
     pub agent_id: Option<String>,
     /// Optional model override, as `provider/model-id`.

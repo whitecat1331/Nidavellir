@@ -177,6 +177,7 @@ impl AgentTool for CreateThreadTool {
             let request = SiblingThreadRequest {
                 title: title.clone(),
                 prompt: input.prompt,
+                auto_submit: true,
                 agent_id: input.agent,
                 model: input.model,
                 use_new_worktree: input.use_new_worktree,
