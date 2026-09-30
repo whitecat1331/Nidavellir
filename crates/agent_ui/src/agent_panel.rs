@@ -3286,6 +3286,9 @@ impl AgentPanel {
         let Some(conversation_view) = self.active_conversation_view().cloned() else {
             return;
         };
+        if !conversation_view.read(cx).has_user_submitted_prompt(cx) {
+            return;
+        }
 
         let parent_title = conversation_view.read(cx).title(cx);
         let request = agent::SiblingThreadRequest {
