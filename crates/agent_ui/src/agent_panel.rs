@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -4275,6 +4275,53 @@ impl AgentPanel {
         self.cleanup_retained_threads(cx);
     }
 
+    fn insert_retained_thread(
+        &mut self,
+        thread_id: ThreadId,
+        conversation_view: Entity<ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        self.retained_threads
+            .insert(thread_id, conversation_view.clone());
+        self.observe_retained_thread(thread_id, conversation_view, cx);
+    }
+
+    fn observe_retained_thread(
+        &mut self,
+        thread_id: ThreadId,
+        conversation_view: Entity<ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = if let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) {
+            let subscription = cx.subscribe(&acp_thread, |this, acp_thread, event, cx| {
+                if matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged
+                        | AcpThreadEvent::SubmissionUpdated(_)
+                        | AcpThreadEvent::ToolAuthorizationReceived(_)
+                        | AcpThreadEvent::ElicitationResponded(_)
+                ) && acp_thread.read(cx).is_idle_for_retention()
+                {
+                    this.cleanup_retained_threads(cx);
+                }
+            });
+            subscription
+        } else {
+            cx.observe(&conversation_view, move |this, conversation_view, cx| {
+                if conversation_view.read(cx).root_thread(cx).is_some() {
+                    this.observe_retained_thread(thread_id, conversation_view, cx);
+                }
+            })
+        };
+        self.retained_thread_subscriptions
+            .insert(thread_id, subscription);
+    }
+
+    fn remove_retained_thread(&mut self, thread_id: &ThreadId) -> Option<Entity<ConversationView>> {
+        self.retained_thread_subscriptions.remove(thread_id);
+        self.retained_threads.remove(thread_id)
+    }
+
     fn cleanup_retained_threads(&mut self, cx: &App) {
         let mut potential_removals = self
             .retained_threads
@@ -4284,7 +4331,7 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
+                thread.connection().supports_load_session() && thread.is_idle_for_retention()
             })
             .collect::<Vec<_>>();
 
