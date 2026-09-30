@@ -51,8 +51,8 @@ use crate::{
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
     NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, ResetFastModeWarnings,
-    ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
-    ToggleNewThreadMenu, ToggleOptionsMenu,
+    ResetTrialEndUpsell, ResetTrialUpsell, ReviewThreadInWorktree, ShowAllSidebarThreadMetadata,
+    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -392,6 +392,11 @@ pub fn init(cx: &mut App) {
                             )
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &ReviewThreadInWorktree, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.review_thread_in_worktree(window, cx));
                     }
                 })
                 .register_action(
@@ -3265,6 +3270,44 @@ impl AgentPanel {
         thread_id
     }
 
+    /// Opens a review subthread in a fresh git worktree copied from the active
+    /// thread's checkout, so a reviewer can explore and mutate freely without
+    /// touching the original work.
+    ///
+    /// The new worktree is created from the current `HEAD`, so it contains the
+    /// source checkout's **committed** state only — uncommitted changes are not
+    /// carried over. The review prompt is prefilled in the new thread's editor
+    /// rather than submitted, leaving the user in control of when the reviewer
+    /// starts.
+    fn review_thread_in_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            return;
+        };
+
+        let parent_title = conversation_view.read(cx).title(cx);
+        let request = agent::SiblingThreadRequest {
+            title: format!("Review: {parent_title}").into(),
+            prompt: review_thread_seed_prompt(&parent_title),
+            agent_id: None,
+            model: None,
+            use_new_worktree: true,
+            worktree_name: None,
+            base_ref: None,
+            auto_submit: false,
+        };
+
+        let host = AgentPanelSiblingHost::new(cx.entity().downgrade(), window.window_handle());
+        cx.spawn(async move |_panel, cx| {
+            agent::SiblingThreadHost::create_sibling_thread(&host, request, cx)
+                .await
+                .map(|_info| ())
+        })
+        .detach_and_log_err(cx);
+    }
+
     pub fn activate_retained_thread(
         &mut self,
         id: ThreadId,
@@ -5273,6 +5316,23 @@ fn task_context_for_worktree(
     })
 }
 
+/// Seed prompt for a review subthread started via
+/// [`AgentPanel::review_thread_in_worktree`]. The prompt is prefilled, not
+/// submitted, so the user can adjust it before the reviewer runs.
+fn review_thread_seed_prompt(parent_title: &str) -> String {
+    format!(
+        "Review the work from the agent thread \"{parent_title}\".
+
+This thread runs in a fresh git worktree checked out at that thread's HEAD, so you can read, run, and edit freely without disturbing the original checkout. Only committed state is present; uncommitted changes from the parent checkout are not carried over.
+
+Please:
+- Inspect the change, starting with `git diff` against the base branch and `git log`.
+- Look for correctness bugs, missed edge cases, and unintended behavior changes.
+- Run the relevant tests and report any failures.
+- Report your findings first and hold off on edits until I ask for them."
+    )
+}
+
 /// Bridges agent-side `SiblingThreadHost` calls to `AgentPanel`. Constructed
 /// and installed on a `NativeAgent` by the agent panel when a native-agent
 /// thread is created.
@@ -5329,7 +5389,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
                     request.prompt.clone(),
                 ))],
-                auto_submit: true,
+                auto_submit: request.auto_submit,
             };
 
             let title: SharedString = request.title.clone();
@@ -6229,6 +6289,11 @@ impl AgentPanel {
                                         }
                                     });
                                 }
+
+                                menu = menu.action(
+                                    "Review Thread in Worktree\u{2026}",
+                                    Box::new(ReviewThreadInWorktree),
+                                );
 
                                 menu = menu.separator();
                             }
