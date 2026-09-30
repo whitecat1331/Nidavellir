@@ -5,12 +5,14 @@ use agent_settings::AgentSettings;
 use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, shared_browser_api};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Task, WeakEntity, Window, actions, div, list, px,
+    AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, point, px,
 };
 use serde_json::Value;
 use settings::Settings;
-use ui::{Button, IconName, Label, Tab, prelude::*};
+use ui::{
+    Button, IconName, Label, StatefulInteractiveElement, Tab, TintColor, WithScrollbar, prelude::*,
+};
 use ui_input::InputField;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -181,6 +183,7 @@ pub struct NetworkPanel {
     response_body: Option<String>,
     detail_tab: DetailTab,
     list_state: ListState,
+    detail_scroll_handle: ScrollHandle,
     _refresh_task: Task<()>,
 }
 
@@ -214,8 +217,10 @@ impl NetworkPanel {
                 response_body: None,
                 detail_tab: DetailTab::Headers,
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
+                detail_scroll_handle: ScrollHandle::new(),
                 _refresh_task: Task::ready(()),
             };
+            this.list_state.set_follow_mode(FollowMode::Tail);
             this.schedule_refresh(cx);
             this
         })
@@ -262,7 +267,9 @@ impl NetworkPanel {
         self.control = snapshot.control;
         self.requests = snapshot.requests;
         let visible = self.visible_requests(cx).len();
-        self.list_state.reset(visible);
+        if visible != self.list_state.item_count() {
+            self.list_state.reset(visible);
+        }
         log::info!(
             "[network-panel] apply: session={} driven_by={} requests={} visible={} list_items={}",
             session_id,
@@ -392,6 +399,7 @@ impl NetworkPanel {
     fn select_request(&mut self, request_id: &str, cx: &mut Context<Self>) {
         self.selected_request_id = Some(request_id.to_string());
         self.response_body = None;
+        reset_detail_scroll(&self.detail_scroll_handle);
         let Some(session_id) = self.session_id else {
             return;
         };
@@ -401,14 +409,10 @@ impl NetworkPanel {
             let body = browser_api
                 .get_response_body(session_id, None, &request_id, 0, 65_536)
                 .await
-                .ok();
+                .map_err(|error| error.to_string());
             if this
                 .update(cx, |panel, cx| {
-                    panel.response_body = body
-                        .as_ref()
-                        .and_then(|value| value.get("body"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    panel.response_body = Some(response_body_label(&body));
                     cx.notify();
                 })
                 .is_err()
@@ -464,7 +468,9 @@ impl NetworkPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_throttle(cx))),
             )
             .child(
-                Button::new("offline", if offline { "Online" } else { "Offline" })
+                Button::new("offline", offline_label(offline))
+                    .toggle_state(offline)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_offline(cx))),
             )
             .child(self.filter_editor.clone())
@@ -540,7 +546,7 @@ impl NetworkPanel {
         .into_any_element()
     }
 
-    fn render_detail(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(request) = self.selected_request() else {
             return div()
                 .p_2()
@@ -550,12 +556,7 @@ impl NetworkPanel {
                 .into_any_element();
         };
         let body = self.detail_body(request);
-        v_flex()
-            .size_full()
-            .overflow_hidden()
-            .p_2()
-            .child(Label::new(body))
-            .into_any_element()
+        detail_scroll_body(body, &self.detail_scroll_handle, window, cx)
     }
 
     fn detail_body(&self, request: &Value) -> String {
@@ -593,6 +594,16 @@ impl NetworkPanel {
                     .unwrap_or(Value::Null)
             ),
             DetailTab::Cookies => {
+                let request_cookie = request
+                    .get("request_headers")
+                    .and_then(|headers| headers.get("cookie"))
+                    .or_else(|| {
+                        request
+                            .get("request_headers")
+                            .and_then(|headers| headers.get("Cookie"))
+                    })
+                    .and_then(Value::as_str)
+                    .unwrap_or("(none)");
                 let set_cookie = request
                     .get("response_headers")
                     .and_then(|headers| headers.get("set-cookie"))
@@ -603,7 +614,7 @@ impl NetworkPanel {
                     })
                     .and_then(Value::as_str)
                     .unwrap_or("(none)");
-                format!("Set-Cookie: {set_cookie}")
+                format!("Request Cookie: {request_cookie}\nSet-Cookie: {set_cookie}")
             }
         }
     }
@@ -621,6 +632,7 @@ impl NetworkPanel {
                         let tab = *tab;
                         cx.listener(move |this, _, _, cx| {
                             this.detail_tab = tab;
+                            reset_detail_scroll(&this.detail_scroll_handle);
                             cx.notify();
                         })
                     })
@@ -690,26 +702,95 @@ impl Panel for NetworkPanel {
 
 impl gpui::Render for NetworkPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let toolbar = self.render_toolbar(cx).into_any_element();
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .grid()
+            .grid_cols(2)
+            .grid_rows(1)
+            .children(vec![
+                self.render_list(window, cx).into_any_element(),
+                div()
+                    .size_full()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(self.render_detail_tabs(cx))
+                    .child(self.render_detail(window, cx))
+                    .into_any_element(),
+            ])
+            .into_any_element();
+        panel_root()
             .track_focus(&self.focus_handle)
-            .size_full()
-            .flex_col()
-            .child(self.render_toolbar(cx))
-            .child(div().flex_1().flex().flex_row().children(vec![
-                    div()
-                        .w_1_2()
-                        .flex_none()
-                        .h_full()
-                        .child(self.render_list(window, cx))
-                        .into_any_element(),
-                    div()
-                        .flex_1()
-                        .flex_col()
-                        .overflow_hidden()
-                        .child(self.render_detail_tabs(cx))
-                        .child(self.render_detail(cx))
-                        .into_any_element(),
-                ]))
+            .child(toolbar)
+            .child(content)
+    }
+}
+
+/// The panel's root container: a flex column that fills its parent. It must
+/// be `flex().flex_col()` - `flex_col()` alone only sets flex-direction, not
+/// `display: flex`, so a bare `flex_col()` root is a block and the `flex_1`
+/// waterfall grid row never grows to fill the panel.
+fn panel_root() -> Div {
+    div().flex().flex_col().size_full()
+}
+
+/// Reset the detail pane's scroll position to the top when a request is
+/// selected or a detail tab changes.
+fn reset_detail_scroll(handle: &ScrollHandle) {
+    handle.set_offset(point(px(0.), px(0.)));
+}
+
+/// Render the detail pane's scrollable body with a scrollbar overlay. The
+/// scrollbar must live on a *separate* element from the scrolled content:
+/// `vertical_scrollbar_for` adds the thumb as a child of the element it is
+/// called on, so attaching it to the same element that scrolls
+/// (`overflow_y_scroll` + `track_scroll`) makes the thumb scroll with the
+/// content and inverts it (ISSUE-0034).
+fn detail_scroll_body(
+    body: String,
+    scroll_handle: &ScrollHandle,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    v_flex()
+        .id("network-detail-body")
+        .size_full()
+        .child(
+            div()
+                .id("network-detail-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(scroll_handle)
+                .p_2()
+                .child(Label::new(body)),
+        )
+        .vertical_scrollbar_for(scroll_handle, window, cx)
+        .into_any_element()
+}
+
+/// Map a `get_response_body` result to the text shown in the Response tab, so
+/// a failed or binary body renders a concrete state instead of a permanent
+/// "Loading response body…" spinner (ISSUE-0036).
+fn response_body_label(result: &Result<Value, String>) -> String {
+    match result {
+        Ok(value) => {
+            if value.get("binary").and_then(Value::as_bool) == Some(true) {
+                let size = value
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("(binary body: {size} bytes)")
+            } else {
+                value
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(empty body)")
+                    .to_string()
+            }
+        }
+        Err(error) => format!("Failed to load response body: {error}"),
     }
 }
 
@@ -747,8 +828,25 @@ fn throttle_label(control: &Value) -> &'static str {
         (true, _) => "Offline",
         (_, Some(2_000)) => "Slow 3G",
         (_, Some(563)) => "Fast 3G",
+        // Toggling offline off materialises an explicit `latency_ms: 0` even
+        // though nothing is throttled, so zero means "no throttling" — not a
+        // custom preset (ISSUE-0033).
+        (_, Some(0)) => "Online",
         (_, Some(_)) => "Custom",
         _ => "Online",
+    }
+}
+
+/// Label for the offline toggle.
+///
+/// State-based, matching `throttle_label`'s condition display: an offline
+/// session must not show one control reading "Offline" and the adjacent toggle
+/// reading "Online" (ISSUE-0031).
+fn offline_label(offline: bool) -> &'static str {
+    if offline {
+        "Offline"
+    } else {
+        "Online"
     }
 }
 
@@ -756,9 +854,146 @@ fn headers_text(value: Option<&Value>) -> String {
     let Some(object) = value.and_then(Value::as_object) else {
         return "(none)".to_string();
     };
-    object
+    let mut entries: Vec<(&str, &str)> = object
         .iter()
-        .map(|(name, value)| format!("{name}: {}", value.as_str().unwrap_or("")))
+        .map(|(name, value)| (name.as_str(), value.as_str().unwrap_or("")))
+        .collect();
+    entries.sort_unstable();
+    entries
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        headers_text, offline_label, panel_root, reset_detail_scroll, response_body_label,
+        throttle_label,
+    };
+    use gpui::{IntoElement, ParentElement, Pixels, ScrollHandle, Styled, TestAppContext, div, point, px, size};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[gpui::test]
+    fn panel_root_grows_waterfall_grid_row(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let grid_row_heights = Rc::new(RefCell::new(Vec::<Pixels>::new()));
+
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .grid()
+            .grid_cols(2)
+            .grid_rows(1)
+            .on_children_prepainted({
+                let heights = grid_row_heights.clone();
+                move |bounds, _, _| {
+                    heights.replace(bounds.iter().map(|b| b.size.height).collect());
+                }
+            })
+            .children(vec![
+                div().size_full().into_any_element(),
+                div()
+                    .size_full()
+                    .flex_col()
+                    .child(div().h(px(24.)).w_full())
+                    .child(div().h(px(60.)).w_full())
+                    .into_any_element(),
+            ]);
+
+        cx.draw(point(px(0.), px(0.)), size(px(1024.), px(420.)), |_, _| {
+            panel_root()
+                .child(div().h(px(40.)).w_full())
+                .child(content)
+                .into_any_element()
+        });
+
+        // 420px panel - 40px toolbar = 380px grid row. A block root (flex_col()
+        // without flex()) leaves the grid row content-sized (~84px).
+        let heights = grid_row_heights.borrow();
+        assert_eq!(heights.len(), 2, "grid row should have two cells");
+        for (i, height) in heights.iter().enumerate() {
+            assert!(
+                *height >= px(300.),
+                "waterfall grid cell {i} should fill the panel (>=300px), got {heights:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn headers_text_sorts_header_names() {
+        let headers = serde_json::json!({
+            "z-last": "zebra",
+            "a-first": "alpha",
+            "m-middle": "mike",
+        });
+        let text = headers_text(Some(&headers));
+        assert_eq!(text, "a-first: alpha\nm-middle: mike\nz-last: zebra");
+    }
+
+    #[test]
+    fn offline_label_matches_offline_state() {
+        // ISSUE-0031: the toggle used to read "Online" while offline was on,
+        // contradicting the throttle label's "Offline" for the same state.
+        assert_eq!(offline_label(true), "Offline");
+        assert_eq!(offline_label(false), "Online");
+    }
+
+    #[test]
+    fn throttle_label_treats_zero_latency_as_online() {
+        // ISSUE-0033: toggling offline off materialises `latency_ms: 0`, which
+        // used to be labelled "Custom".
+        let unthrottled = serde_json::json!({
+            "offline": false,
+            "throttle": { "latency_ms": 0 },
+        });
+        assert_eq!(throttle_label(&unthrottled), "Online");
+
+        // Presets, custom throttling and the offline state are unchanged.
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 2_000 } })),
+            "Slow 3G"
+        );
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 563 } })),
+            "Fast 3G"
+        );
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 5_000 } })),
+            "Custom"
+        );
+        assert_eq!(throttle_label(&serde_json::json!({ "offline": true })), "Offline");
+        assert_eq!(throttle_label(&serde_json::json!({})), "Online");
+    }
+
+    #[test]
+    fn reset_detail_scroll_resets_offset_without_replacing_handle() {
+        let handle = ScrollHandle::new();
+        handle.set_offset(point(px(0.), px(-100.)));
+        reset_detail_scroll(&handle);
+        assert_eq!(handle.offset(), point(px(0.), px(0.)));
+    }
+
+    #[test]
+    fn response_body_label_surfaces_failure_and_binary_states() {
+        // ISSUE-0036: a failed or binary body used to render as a permanent
+        // "Loading response body…" spinner because the error was discarded.
+        assert_eq!(
+            response_body_label(&Err("boom".to_string())),
+            "Failed to load response body: boom"
+        );
+
+        let binary = serde_json::json!({ "binary": true, "size": 4096 });
+        assert_eq!(
+            response_body_label(&Ok(binary)),
+            "(binary body: 4096 bytes)"
+        );
+
+        let text = serde_json::json!({ "binary": false, "body": "hello world" });
+        assert_eq!(response_body_label(&Ok(text)), "hello world");
+    }
 }

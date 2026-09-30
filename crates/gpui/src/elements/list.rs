@@ -1725,7 +1725,7 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, point,
         px, size,
     };
 
@@ -2402,6 +2402,129 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 7);
         assert_eq!(offset.offset_in_item, px(40.));
+        assert!(state.is_following_tail());
+    }
+
+    #[gpui::test]
+    fn test_list_in_grid_cell_fills_height(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // A `List` element does not consume a flex row's cross-axis height (the
+        // network panel's empty-waterfall regression). A grid cell has a
+        // definite height, so the list fills it with size_full() and renders
+        // its tail. The grid must declare grid_rows(1): without it the row is
+        // implicit/auto (content-sized), the list grows to its full content
+        // height, and nothing is left to scroll.
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().flex().flex_col().size_full()
+                    .child(div().h(px(40.)).w_full())
+                    .child(
+                        div().flex_1().min_h_0().grid().grid_cols(2).grid_rows(1).children(vec![
+                            list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                                .size_full()
+                                .into_any_element(),
+                            div().size_full().flex_col().child(div().h(px(24.)).w_full()).into_any_element(),
+                        ]),
+                    )
+            }
+        }
+
+        let state = ListState::new(120, crate::ListAlignment::Top, px(24.0));
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(440.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        // 440px panel - 40px toolbar = 400px row. 120 items x 24px = 2880px.
+        // A bounded cell anchors follow-tail near item 120 - ceil(400/24) = ~103.
+        // A content-sized cell anchors at 0 (everything fits); a zero-height
+        // cell anchors at 120. Assert the bounded middle.
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix >= 90 && scroll_top.item_ix <= 110,
+            "list cell should be bounded and render the tail, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
+    }
+
+    #[gpui::test]
+    fn test_follow_tail_with_reset_driven_growth_renders_tail(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // Reproduce the network panel's growth pattern: start empty, follow the
+        // tail, and reset the list to the new count on every refresh.
+        let state = ListState::new(0, crate::ListAlignment::Top, px(24.0));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                    .w_full()
+                    .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
+        // Grow 0 -> 120 one item at a time, drawing after each reset like the
+        // panel's 2s refresh loop does.
+        for count in 1..=120 {
+            state.reset(count);
+            cx.draw(point(px(0.), px(0.)), size(px(300.), px(400.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+
+        // With a 400px viewport and 24px items, follow-tail should anchor near
+        // the tail (120 - ceil(400/24) = ~103). If only a couple of rows were
+        // laid out, the anchor would sit at ~118 instead.
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix <= 110,
+            "follow-tail should render the tail after reset-driven growth, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
+        assert!(state.is_following_tail());
+    }
+
+    #[gpui::test]
+    fn test_follow_tail_with_splice_driven_growth_renders_tail(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(0, crate::ListAlignment::Top, px(24.0));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                    .w_full()
+                    .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+
+        let mut old_count = 0usize;
+        for count in 1..=120 {
+            state.splice(old_count..old_count, count - old_count);
+            old_count = count;
+            cx.draw(point(px(0.), px(0.)), size(px(300.), px(400.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+
+        let scroll_top = state.logical_scroll_top();
+        assert!(
+            scroll_top.item_ix <= 110,
+            "follow-tail should render the tail after splice-driven growth, got scroll_top.item_ix={}",
+            scroll_top.item_ix,
+        );
         assert!(state.is_following_tail());
     }
 
