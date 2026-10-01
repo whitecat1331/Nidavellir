@@ -552,7 +552,7 @@ impl NetworkPanel {
             .into_any_element()
     }
 
-    fn render_list(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let session_count = if self.session_id.is_some() { 1 } else { 0 };
         if session_count == 0 {
             return div()
@@ -565,12 +565,17 @@ impl NetworkPanel {
                 ))
                 .into_any_element();
         }
-        list(
-            self.list_state.clone(),
-            cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
-        )
-        .size_full()
-        .into_any_element()
+        div()
+            .size_full()
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
+                )
+                .size_full(),
+            )
+            .vertical_scrollbar_for(&self.list_state, window, cx)
+            .into_any_element()
     }
 
     fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
