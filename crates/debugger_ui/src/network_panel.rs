@@ -7,7 +7,7 @@ use db::kvp::KeyValueStore;
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    FollowMode, ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div,
+    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div,
     list, point, px,
 };
 use serde_json::Value;
@@ -247,7 +247,6 @@ impl NetworkPanel {
                 workspace_id,
                 _refresh_task: Task::ready(()),
             };
-            this.list_state.set_follow_mode(FollowMode::Tail);
             this.schedule_refresh(cx);
             this
         })
