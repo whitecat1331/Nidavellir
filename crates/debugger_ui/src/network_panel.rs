@@ -3,10 +3,12 @@ use std::time::Duration;
 
 use agent_settings::AgentSettings;
 use browser_tools::{AgentBrowserApi, DrivenBy, RequestFilter, ThrottlePreset, shared_browser_api};
+use db::kvp::KeyValueStore;
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
-    AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, point, px,
+    AnyElement, App, Context, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    FollowMode, ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div,
+    list, point, px,
 };
 use serde_json::Value;
 use settings::Settings;
@@ -14,6 +16,7 @@ use ui::{
     Button, IconName, Label, StatefulInteractiveElement, Tab, TintColor, WithScrollbar, prelude::*,
 };
 use ui_input::InputField;
+use util::ResultExt;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -36,6 +39,17 @@ register_feature_flag!(NetworkPanelFeatureFlag);
 
 const NETWORK_PANEL_KEY: &str = "NetworkPanel";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// KVP scope (per workspace) holding the waterfall/detail split fraction.
+const SPLIT_FRACTION_KVP_KEY: &str = "network_panel_split";
+const DEFAULT_SPLIT_FRACTION: f32 = 0.5;
+const MIN_SPLIT_FRACTION: f32 = 0.2;
+const MAX_SPLIT_FRACTION: f32 = 0.8;
+const DIVIDER_HANDLE_WIDTH: f32 = 8.0;
+
+/// Drag marker for the waterfall/detail divider, mirroring the split editor's
+/// `DraggedSplitHandle`: the handle starts the drag, the row consumes the moves.
+struct DraggedPanelDivider;
 
 /// The detail pane tabs shown for the selected request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +198,8 @@ pub struct NetworkPanel {
     detail_tab: DetailTab,
     list_state: ListState,
     detail_scroll_handle: ScrollHandle,
+    split_fraction: f32,
+    workspace_id: Option<String>,
     _refresh_task: Task<()>,
 }
 
@@ -202,6 +218,15 @@ impl NetworkPanel {
             let http_client = workspace.project().read(cx).client().http_client();
             let browser_api = shared_browser_api(cx, chromium_path, http_client);
 
+            let workspace_id = workspace
+                .database_id()
+                .map(|id| i64::from(id).to_string())
+                .or_else(|| workspace.session_id());
+            let split_fraction = workspace_id
+                .as_deref()
+                .and_then(|id| read_split_fraction(id, cx))
+                .unwrap_or(DEFAULT_SPLIT_FRACTION);
+
             let mut this = Self {
                 browser_api,
                 focus_handle,
@@ -218,6 +243,8 @@ impl NetworkPanel {
                 detail_tab: DetailTab::Headers,
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 detail_scroll_handle: ScrollHandle::new(),
+                split_fraction,
+                workspace_id,
                 _refresh_task: Task::ready(()),
             };
             this.list_state.set_follow_mode(FollowMode::Tail);
@@ -703,27 +730,120 @@ impl Panel for NetworkPanel {
 impl gpui::Render for NetworkPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let toolbar = self.render_toolbar(cx).into_any_element();
-        let content = div()
+        let split_fraction = self.split_fraction;
+        let content = h_flex()
+            .id("network-panel-split")
             .flex_1()
             .min_h_0()
-            .grid()
-            .grid_cols(2)
-            .grid_rows(1)
-            .children(vec![
-                self.render_list(window, cx).into_any_element(),
+            .size_full()
+            .on_drag_move::<DraggedPanelDivider>(cx.listener(
+                |this, event: &DragMoveEvent<DraggedPanelDivider>, _window, cx| {
+                    this.on_divider_drag(event, cx);
+                },
+            ))
+            .on_drop::<DraggedPanelDivider>(cx.listener(
+                |this, _: &DraggedPanelDivider, _window, cx| {
+                    this.persist_split_fraction(cx);
+                },
+            ))
+            .child(
                 div()
-                    .size_full()
+                    .id("network-panel-waterfall")
+                    .min_w_0()
+                    .flex_shrink_1()
+                    .h_full()
+                    .flex_basis(DefiniteLength::Fraction(split_fraction))
+                    .overflow_hidden()
+                    .child(self.render_list(window, cx).into_any_element()),
+            )
+            .child(self.render_divider(cx))
+            .child(
+                div()
+                    .id("network-panel-detail")
+                    .min_w_0()
+                    .flex_shrink_1()
+                    .h_full()
+                    .flex_basis(DefiniteLength::Fraction(1.0 - split_fraction))
                     .flex_col()
                     .overflow_hidden()
                     .child(self.render_detail_tabs(cx))
-                    .child(self.render_detail(window, cx))
-                    .into_any_element(),
-            ])
-            .into_any_element();
+                    .child(self.render_detail(window, cx)),
+            );
         panel_root()
             .track_focus(&self.focus_handle)
             .child(toolbar)
             .child(content)
+    }
+}
+
+impl NetworkPanel {
+    /// Render the ~1px divider with a wider invisible hitbox so it is easy to
+    /// grab. The handle starts the drag; the row's `on_drag_move` updates the
+    /// split fraction. Double-click resets to 50/50.
+    fn render_divider(&self, cx: &mut Context<Self>) -> AnyElement {
+        let this = cx.entity();
+        div()
+            .id("network-panel-divider")
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .w(px(1.))
+            .bg(cx.theme().colors().pane_group_border)
+            .child(
+                div()
+                    .id("network-panel-divider-handle")
+                    .absolute()
+                    .left(px(-DIVIDER_HANDLE_WIDTH / 2.0))
+                    .w(px(DIVIDER_HANDLE_WIDTH))
+                    .h_full()
+                    .cursor_col_resize()
+                    .block_mouse_except_scroll()
+                    .on_click({
+                        move |event, _window, cx| {
+                            if event.click_count() >= 2 {
+                                this.update(cx, |this, cx| {
+                                    this.split_fraction = DEFAULT_SPLIT_FRACTION;
+                                    this.persist_split_fraction(cx);
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    })
+                    .on_drag(DraggedPanelDivider, |_, _, _, cx| cx.new(|_| gpui::Empty)),
+            )
+            .into_any_element()
+    }
+
+    /// Convert a divider drag into a new split fraction, clamped so neither
+    /// pane collapses. `DragMoveEvent::bounds` is the row the handle lives in,
+    /// so the fraction is position-relative and survives dock resizes.
+    fn on_divider_drag(
+        &mut self,
+        event: &DragMoveEvent<DraggedPanelDivider>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = event.bounds;
+        if let Some(fraction) =
+            split_fraction_for_position(bounds.left(), bounds.right(), event.event.position.x)
+        {
+            self.split_fraction = fraction;
+            cx.notify();
+        }
+    }
+
+    /// Persist the split fraction to the per-workspace KVP store.
+    fn persist_split_fraction(&self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.workspace_id.clone() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        let fraction = self.split_fraction.to_string();
+        cx.background_spawn(async move {
+            kvp.scoped(SPLIT_FRACTION_KVP_KEY)
+                .write(workspace_id, fraction)
+                .await
+        })
+        .detach_and_log_err(cx);
     }
 }
 
@@ -733,6 +853,26 @@ impl gpui::Render for NetworkPanel {
 /// waterfall grid row never grows to fill the panel.
 fn panel_root() -> Div {
     div().flex().flex_col().size_full()
+}
+
+/// Read the persisted waterfall/detail split fraction for a workspace, if any.
+fn read_split_fraction(workspace_id: &str, cx: &App) -> Option<f32> {
+    KeyValueStore::global(cx)
+        .scoped(SPLIT_FRACTION_KVP_KEY)
+        .read(workspace_id)
+        .log_err()
+        .flatten()
+        .and_then(|json| json.parse::<f32>().ok())
+}
+
+/// Map a divider drag position to a split fraction, clamped so neither pane
+/// collapses. Returns `None` for a zero-width row (nothing meaningful to drag).
+fn split_fraction_for_position(left: Pixels, right: Pixels, position_x: Pixels) -> Option<f32> {
+    let width = right - left;
+    if width <= px(0.) {
+        return None;
+    }
+    Some(((position_x - left) / width).clamp(MIN_SPLIT_FRACTION, MAX_SPLIT_FRACTION))
 }
 
 /// Reset the detail pane's scroll position to the top when a request is
@@ -843,11 +983,7 @@ fn throttle_label(control: &Value) -> &'static str {
 /// session must not show one control reading "Offline" and the adjacent toggle
 /// reading "Online" (ISSUE-0031).
 fn offline_label(offline: bool) -> &'static str {
-    if offline {
-        "Offline"
-    } else {
-        "Online"
-    }
+    if offline { "Offline" } else { "Online" }
 }
 
 fn headers_text(value: Option<&Value>) -> String {
@@ -866,14 +1002,17 @@ fn headers_text(value: Option<&Value>) -> String {
         .join("\n")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
-        headers_text, offline_label, panel_root, reset_detail_scroll, response_body_label,
-        throttle_label,
+        DEFAULT_SPLIT_FRACTION, MAX_SPLIT_FRACTION, MIN_SPLIT_FRACTION, headers_text,
+        offline_label, panel_root, reset_detail_scroll, response_body_label,
+        split_fraction_for_position, throttle_label,
     };
-    use gpui::{IntoElement, ParentElement, Pixels, ScrollHandle, Styled, TestAppContext, div, point, px, size};
+    use gpui::{
+        IntoElement, ParentElement, Pixels, ScrollHandle, Styled, TestAppContext, div, point, px,
+        size,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -925,6 +1064,28 @@ mod tests {
     }
 
     #[test]
+    fn split_fraction_for_position_clamps_and_rejects_zero_width() {
+        let left = px(0.);
+        let right = px(400.);
+        assert_eq!(
+            split_fraction_for_position(left, right, px(0.)),
+            Some(MIN_SPLIT_FRACTION)
+        );
+        assert_eq!(
+            split_fraction_for_position(left, right, px(200.)),
+            Some(DEFAULT_SPLIT_FRACTION)
+        );
+        assert_eq!(
+            split_fraction_for_position(left, right, px(400.)),
+            Some(MAX_SPLIT_FRACTION)
+        );
+        assert_eq!(
+            split_fraction_for_position(px(100.), px(100.), px(100.)),
+            None
+        );
+    }
+
+    #[test]
     fn headers_text_sorts_header_names() {
         let headers = serde_json::json!({
             "z-last": "zebra",
@@ -966,7 +1127,10 @@ mod tests {
             throttle_label(&serde_json::json!({ "throttle": { "latency_ms": 5_000 } })),
             "Custom"
         );
-        assert_eq!(throttle_label(&serde_json::json!({ "offline": true })), "Offline");
+        assert_eq!(
+            throttle_label(&serde_json::json!({ "offline": true })),
+            "Offline"
+        );
         assert_eq!(throttle_label(&serde_json::json!({})), "Online");
     }
 
