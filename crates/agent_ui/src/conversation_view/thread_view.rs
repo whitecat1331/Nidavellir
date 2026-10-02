@@ -10658,10 +10658,9 @@ impl ThreadView {
             Icon::new(IconName::ToolPencil).color(Color::Muted)
         };
 
-        let tool_icon = if is_file && has_failed && has_revealed_diff {
+        let interrupted_edit = is_file && has_failed && has_revealed_diff;
+        let tool_icon = if interrupted_edit {
             div()
-                .id(entry_ix)
-                .tooltip(Tooltip::text("Interrupted Edit"))
                 .child(DecoratedIcon::new(
                     file_icon,
                     Some(
@@ -10743,7 +10742,19 @@ impl ThreadView {
                     .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
             })
             .overflow_hidden()
-            .child(tool_icon)
+            .child(
+                div()
+                    .id(("tool-call-icon", entry_ix))
+                    .flex_none()
+                    .when_some(
+                        Self::tool_call_icon_tooltip(
+                            tool_call.tool_name.as_ref(),
+                            interrupted_edit,
+                        ),
+                        |this, tooltip| this.tooltip(Tooltip::text(tooltip)),
+                    )
+                    .child(tool_icon),
+            )
             .child(if has_location {
                 h_flex()
                     .id(("open-tool-call-location", entry_ix))

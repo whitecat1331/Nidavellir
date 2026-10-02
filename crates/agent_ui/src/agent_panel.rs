@@ -1560,7 +1560,7 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
-                if this.retained_threads.remove(thread_id).is_some() {
+                if this.remove_retained_thread(thread_id).is_some() {
                     cx.notify();
                 }
             },
@@ -1844,7 +1844,7 @@ impl AgentPanel {
                 let draft_id = draft.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(draft_id, draft);
+                self.insert_retained_thread(draft_id, draft, cx);
             } else if *draft.read(cx).agent_key() != self.selected_agent {
                 let old_draft_id = draft.read(cx).thread_id;
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3201,7 +3201,7 @@ impl AgentPanel {
             return false;
         }
 
-        self.retained_threads.remove(&thread_id);
+        self.remove_retained_thread(&thread_id);
         self.set_ephemeral_draft(conversation_view, cx);
         true
     }
@@ -3268,8 +3268,7 @@ impl AgentPanel {
             self.set_selected_agent_and_persist(original, cx);
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
-        self.retained_threads
-            .insert(thread_id, thread.conversation_view);
+        self.insert_retained_thread(thread_id, thread.conversation_view, cx);
         thread_id
     }
 
@@ -3321,7 +3320,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let conversation_view = if let Some(view) = self.retained_threads.remove(&id) {
+        let conversation_view = if let Some(view) = self.remove_retained_thread(&id) {
             self.try_make_empty_draft_ephemeral(view.clone(), cx);
             view
         } else if let Some(draft) = &self.draft_thread {
@@ -3373,7 +3372,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.retained_threads.remove(&id);
+        self.remove_retained_thread(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
         });
@@ -4262,7 +4261,7 @@ impl AgentPanel {
                 let thread_id = conversation_view.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(thread_id, conversation_view);
+                self.insert_retained_thread(thread_id, conversation_view, cx);
                 self.cleanup_retained_threads(cx);
             }
             return;
@@ -4274,7 +4273,7 @@ impl AgentPanel {
             return;
         }
 
-        self.retained_threads.insert(thread_id, conversation_view);
+        self.insert_retained_thread(thread_id, conversation_view, cx);
         self.cleanup_retained_threads(cx);
     }
 
@@ -4348,7 +4347,7 @@ impl AgentPanel {
             .take(n)
             .collect::<Vec<_>>();
         for id in to_remove {
-            self.retained_threads.remove(&id);
+            self.remove_retained_thread(&id);
         }
     }
 
@@ -4434,7 +4433,7 @@ impl AgentPanel {
                 // saving here would clobber the newer on-disk content.
                 connection.discard_session(&session_id, cx);
                 this.base_view = BaseView::Uninitialized;
-                this.retained_threads.remove(&thread_id);
+                this.remove_retained_thread(&thread_id);
                 this.refresh_base_view_subscriptions(window, cx);
                 this.load_agent_thread(
                     agent,
@@ -4574,7 +4573,7 @@ impl AgentPanel {
                             this.draft_thread = None;
                             this._draft_editor_observation = None;
                         }
-                        this.retained_threads.remove(&thread_id);
+                        this.remove_retained_thread(&thread_id);
                         cx.emit(AgentPanelEvent::ThreadInteracted { thread_id });
                     }
                 },
@@ -4673,7 +4672,7 @@ impl AgentPanel {
             );
             return;
         }
-        if let Some(conversation_view) = self.retained_threads.remove(&thread_id) {
+        if let Some(conversation_view) = self.remove_retained_thread(&thread_id) {
             self.try_make_empty_draft_ephemeral(conversation_view.clone(), cx);
             self.set_base_view(
                 BaseView::AgentThread { conversation_view },
@@ -7277,7 +7276,7 @@ impl AgentPanel {
     /// Drops a thread's `ConversationView` from `retained_threads` without
     /// deleting its metadata or kvp state. Simulates the post-restart
     pub fn test_unload_retained_thread(&mut self, id: ThreadId) -> bool {
-        self.retained_threads.remove(&id).is_some()
+        self.remove_retained_thread(&id).is_some()
     }
 
     /// Opens an external thread using an arbitrary AgentServer.
