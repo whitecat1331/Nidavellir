@@ -106,6 +106,7 @@ text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
+ui_input.workspace = true
 unicode-script.workspace = true
 unicode-segmentation.workspace = true
 url.workspace = true

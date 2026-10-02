@@ -545,6 +545,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "ui_input",
  "unicode-script",
  "unicode-segmentation",
  "url",
