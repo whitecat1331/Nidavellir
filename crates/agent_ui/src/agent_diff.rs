@@ -103,8 +103,14 @@ impl AgentDiffPane {
                 window,
                 cx,
             );
-            diff_display_editor
-                .set_diff_hunk_renderer(Some(agent_diff_renderer(&thread, workspace.clone(), comments.clone())), cx);
+            diff_display_editor.set_diff_hunk_renderer(
+                Some(agent_diff_renderer(
+                    &thread,
+                    workspace.clone(),
+                    comments.clone(),
+                )),
+                cx,
+            );
             diff_display_editor.update_editors(cx, |editor, _cx| {
                 editor.register_addon(AgentDiffAddon);
             });
@@ -883,22 +889,25 @@ fn render_diff_hunk_controls(
                 let workspace = comment_workspace;
                 let hunk_range = hunk_range.clone();
                 move |_event, window, cx| {
-                    let Some(descriptor) = hunk_anchor_descriptor(&editor, hunk_range.clone(), cx)
-                    else {
-                        return;
+                    let descriptor = match hunk_anchor_descriptor(&editor, hunk_range.clone(), cx) {
+                        Ok(descriptor) => descriptor,
+                        Err(error) => {
+                            log::error!("[REVIEW] cannot anchor a review comment: {error}");
+                            return;
+                        }
                     };
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.toggle_modal(window, cx, |window, cx| {
-                                ReviewCommentModal::new(
-                                    comments.clone(),
-                                    descriptor.clone(),
-                                    window,
-                                    cx,
-                                )
-                            });
-                        })
-                        .ok();
+                    if let Err(error) = workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            ReviewCommentModal::new(
+                                comments.clone(),
+                                descriptor.clone(),
+                                window,
+                                cx,
+                            )
+                        });
+                    }) {
+                        log::error!("[REVIEW] cannot open the review-comment modal: {error}");
+                    }
                 }
             }),
         ])
@@ -996,10 +1005,21 @@ fn hunk_anchor_descriptor(
     editor: &Entity<Editor>,
     hunk_range: Range<editor::Anchor>,
     cx: &App,
-) -> Option<AnchorDescriptor> {
+) -> Result<AnchorDescriptor, String> {
     let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
-    let (buffer_snapshot, buffer_offset) = snapshot.point_to_buffer_offset(hunk_range.start)?;
-    let file_path = buffer_snapshot.file()?.path().to_string();
+    let (buffer_snapshot, buffer_offset) = snapshot
+        .point_to_buffer_offset(hunk_range.start)
+        .ok_or_else(|| {
+            format!(
+                "the hunk's start anchor maps to no buffer excerpt (multibuffer offset {})",
+                hunk_range.start.to_offset(&snapshot).0
+            )
+        })?;
+    let file_path = buffer_snapshot
+        .file()
+        .ok_or_else(|| "the hunk's buffer has no file".to_string())?
+        .path()
+        .to_string();
 
     let start_in_buffer = buffer_offset.0;
     let hunk_len = hunk_range
@@ -1010,7 +1030,7 @@ fn hunk_anchor_descriptor(
     let end_in_buffer = (start_in_buffer + hunk_len).min(buffer_snapshot.len());
 
     let buffer_text = buffer_snapshot.text();
-    Some(AnchorDescriptor::from_text(
+    Ok(AnchorDescriptor::from_text(
         file_path,
         &buffer_text,
         start_in_buffer..end_in_buffer,
