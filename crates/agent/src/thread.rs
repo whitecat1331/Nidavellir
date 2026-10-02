@@ -2578,6 +2578,19 @@ impl Thread {
         ))
     }
 
+    pub(crate) fn auto_compaction_enabled(&self, cx: &App) -> bool {
+        AgentSettings::get_global(cx).auto_compact.enabled
+            && self.input_token_capacity().is_some_and(|max_input_tokens| {
+                // Models with a small context window don't leave enough headroom for a
+                // compaction pass; the UI warns the user about the token limit instead.
+                max_input_tokens >= MIN_COMPACTION_CONTEXT_WINDOW
+            })
+    }
+
+    pub(crate) fn subagent_partial_output(&self) -> String {
+        subagent_partial_output_from_messages(&self.messages, self.pending_message.as_ref())
+    }
+
     pub fn latest_token_usage(&self) -> Option<acp_thread::TokenUsage> {
         let usage = self.latest_request_token_usage()?;
         let model = self.model()?;
@@ -4768,6 +4781,50 @@ fn total_input_tokens(usage: language_model::TokenUsage) -> u64 {
         .input_tokens
         .saturating_add(usage.cache_creation_input_tokens)
         .saturating_add(usage.cache_read_input_tokens)
+}
+
+fn subagent_partial_output_from_messages(
+    messages: &[Arc<Message>],
+    pending_message: Option<&AgentMessage>,
+) -> String {
+    let Some(user_message_ix) = messages
+        .iter()
+        .rposition(|message| matches!(&**message, Message::User(_)))
+    else {
+        return String::new();
+    };
+
+    let mut text_messages = pending_message
+        .into_iter()
+        .chain(
+            messages
+                .iter()
+                .skip(user_message_ix + 1)
+                .rev()
+                .filter_map(|message| message.as_agent_message()),
+        )
+        .filter_map(|message| {
+            let characters = message
+                .content
+                .iter()
+                .rev()
+                .filter_map(|content| match content {
+                    AgentMessageContent::Text(text) => Some(text),
+                    _ => None,
+                })
+                .flat_map(|text| text.chars().rev())
+                .take(4096)
+                .collect::<Vec<_>>();
+            if characters.is_empty() {
+                None
+            } else {
+                Some(characters.into_iter().rev().collect::<String>())
+            }
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    text_messages.reverse();
+    text_messages.join("\n\n")
 }
 
 /// Reserves output without subtracting it from an independent input ceiling.
