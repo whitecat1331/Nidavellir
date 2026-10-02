@@ -13106,7 +13106,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.cycle_category_option(
-                            acp_v1::SessionConfigOptionCategory::ThoughtLevel,
+                            acp_v2::SessionConfigOptionCategory::ThoughtLevel,
                             false,
                             cx,
                         )
@@ -13125,7 +13125,7 @@ impl Render for ThreadView {
                     if let Some(config_options_view) = this.config_options_view.clone() {
                         let handled = config_options_view.update(cx, |view, cx| {
                             view.toggle_category_picker(
-                                acp_v1::SessionConfigOptionCategory::ThoughtLevel,
+                                acp_v2::SessionConfigOptionCategory::ThoughtLevel,
                                 window,
                                 cx,
                             )
@@ -13173,7 +13173,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.toggle_category_picker(
-                            acp_v1::SessionConfigOptionCategory::Mode,
+                            acp_v2::SessionConfigOptionCategory::Mode,
                             window,
                             cx,
                         )
@@ -13196,7 +13196,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.cycle_category_option(
-                            acp_v1::SessionConfigOptionCategory::Mode,
+                            acp_v2::SessionConfigOptionCategory::Mode,
                             false,
                             cx,
                         )
@@ -13223,7 +13223,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.toggle_category_picker(
-                            acp_v1::SessionConfigOptionCategory::Model,
+                            acp_v2::SessionConfigOptionCategory::Model,
                             window,
                             cx,
                         )
@@ -13245,7 +13245,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.cycle_category_option(
-                            acp_v1::SessionConfigOptionCategory::Model,
+                            acp_v2::SessionConfigOptionCategory::Model,
                             true,
                             cx,
                         )
