@@ -5,7 +5,8 @@ use crate::{
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
     MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot, ReadFileTool, RenameTool,
     SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    ThreadSearchTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
+    decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -2267,6 +2268,8 @@ impl Thread {
         self.add_tool(AskUserTool);
 
         self.add_tool(MemoryTool);
+
+        self.add_tool(ThreadSearchTool);
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 

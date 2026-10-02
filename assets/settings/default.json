@@ -1265,6 +1265,7 @@
         "name": "Read",
         "tools": {
           "memory": true,
+          "thread_search": true,
           "browser": true,
           "network": true,
           "create_thread": true,
@@ -1291,6 +1292,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "memory": true,
+          "thread_search": true,
           "browser": true,
           "network": true,
           "copy_path": true,
@@ -1323,6 +1325,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "memory": true,
+          "thread_search": true,
           "browser": true,
           "network": true,
           "copy_path": true,
@@ -1357,6 +1360,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "memory": true,
+          "thread_search": true,
           "browser": true,
           "network": true,
           "copy_path": true,
