@@ -150,11 +150,10 @@ async fn search_threads(
     threads: &[DbThreadMetadata],
     database: &ThreadsDatabase,
 ) -> Result<ThreadSearchToolOutput, ThreadSearchToolOutput> {
-    let query_lower = query.to_lowercase();
     let mut matches: Vec<String> = Vec::new();
 
     for metadata in threads {
-        if matches_query(metadata.title.as_str(), &query_lower) {
+        if matches_query(metadata.title.as_str(), query) {
             matches.push(format_match(metadata, "summary"));
             continue;
         }
@@ -166,7 +165,7 @@ async fn search_threads(
                 error: format!("Failed to load thread \"{}\": {error}", metadata.id.0),
             })?
         {
-            if matches_query(&thread.to_markdown(), &query_lower) {
+            if matches_query(&thread.to_markdown(), query) {
                 matches.push(format_match(metadata, "content"));
             }
         }
@@ -259,8 +258,8 @@ fn resolve_thread<'a>(
         .ok_or_else(|| format!("No thread with id \"{id}\"."))
 }
 
-fn matches_query(haystack: &str, query_lower: &str) -> bool {
-    haystack.to_lowercase().contains(query_lower)
+fn matches_query(haystack: &str, query: &str) -> bool {
+    haystack.to_lowercase().contains(&query.to_lowercase())
 }
 
 #[cfg(test)]
@@ -484,11 +483,10 @@ mod tests {
             },
             &database,
         )
-        .await
-        .unwrap();
+        .await;
         assert!(matches!(
             missing,
-            ThreadSearchToolOutput::Error { error } if error.contains("No thread with id")
+            Err(ThreadSearchToolOutput::Error { error }) if error.contains("No thread with id")
         ));
     }
 }
