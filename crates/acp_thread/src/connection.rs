@@ -1057,7 +1057,9 @@ mod test_support {
                 response_tx,
             } = sessions.get_mut(&params.session_id).unwrap();
             let mut tasks = vec![];
-            if self.next_prompt_updates.lock().is_empty() {
+            if let Some(receiver) = self.next_prompt_response.lock().take() {
+                cx.spawn(async move |_| receiver.await?)
+            } else if self.next_prompt_updates.lock().is_empty() {
                 let (tx, rx) = oneshot::channel();
                 response_tx.replace(tx);
                 cx.spawn(async move |_| {
