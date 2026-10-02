@@ -6186,15 +6186,15 @@ impl AcpThread {
         let completion = async move |thread: WeakEntity<Self>, cx: &mut AsyncApp| {
             let response = rx.await;
 
-            thread
-                .update(cx, |this, cx| {
-                    if this.turn_id == turn_id {
-                        this.update_last_checkpoint(cx)
-                    } else {
-                        Task::ready(Ok(()))
-                    }
-                })?
-                .await?;
+            // Run the git checkpoint in the background. It only decides whether
+            // to surface the "restore checkpoint" affordance, so awaiting it here
+            // would keep the thread in the "generating" state after the model has
+            // already finished streaming.
+            thread.update(cx, |this, cx| {
+                if this.turn_id == turn_id {
+                    this.update_last_checkpoint(cx).detach();
+                }
+            })?;
 
             thread.update(cx, |this, cx| {
                 if this.turn_id == turn_id && this.parent_session_id.is_none() {
@@ -15035,6 +15035,7 @@ mod tests {
         cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["Lorem".into()], cx)))
             .await
             .unwrap();
+        cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
             assert_eq!(
                 thread.to_markdown(cx),
@@ -15055,6 +15056,7 @@ mod tests {
         cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["ipsum".into()], cx)))
             .await
             .unwrap();
+        cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
             assert_eq!(
                 thread.to_markdown(cx),
@@ -15091,6 +15093,7 @@ mod tests {
         cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["dolor".into()], cx)))
             .await
             .unwrap();
+        cx.run_until_parked();
         thread.read_with(cx, |thread, cx| {
             assert_eq!(
                 thread.to_markdown(cx),
