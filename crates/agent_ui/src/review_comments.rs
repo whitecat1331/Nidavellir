@@ -141,9 +141,8 @@ impl ReviewCommentModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor = cx.new(|cx| {
-            InputField::new(window, cx, "Leave a review comment…").label("New comment")
-        });
+        let editor = cx
+            .new(|cx| InputField::new(window, cx, "Leave a review comment…").label("New comment"));
         let subscription = cx.observe_in(&comments, window, |_this, _comments, _window, cx| {
             cx.notify();
         });
@@ -164,7 +163,8 @@ impl ReviewCommentModal {
         let anchor = self.descriptor.clone();
         self.comments
             .update(cx, |comments, cx| comments.add(anchor, body, cx));
-        self.editor.update(cx, |editor, cx| editor.clear(window, cx));
+        self.editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
         cx.emit(DismissEvent);
     }
 }
@@ -189,24 +189,26 @@ impl Render for ReviewCommentModal {
                     .border_1()
                     .border_color(cx.theme().colors().border)
                     .child(Label::new(comment.body))
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new(("delete-review-comment", index), "Delete").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.comments
-                                        .update(cx, |comments, cx| comments.remove(&id, cx));
-                                }),
-                            ),
+                    .child(h_flex().justify_end().child(
+                        Button::new(("delete-review-comment", index), "Delete").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.comments
+                                    .update(cx, |comments, cx| comments.remove(&id, cx));
+                            }),
                         ),
-                    )
+                    ))
             })
             .collect::<Vec<_>>();
 
         v_flex()
             .key_context("ReviewCommentModal")
+            .elevation_3(cx)
+            .bg(cx.theme().colors().editor_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_md()
             .w(gpui::px(420.))
             .max_h(gpui::px(480.))
-            .overflow_hidden()
             .gap_2()
             .p_3()
             .child(Label::new("Review comments"))
@@ -217,12 +219,14 @@ impl Render for ReviewCommentModal {
                 h_flex()
                     .gap_2()
                     .justify_end()
-                    .child(Button::new("submit-review-comment", "Comment").on_click(
-                        cx.listener(|this, _, window, cx| this.submit(window, cx)),
-                    ))
-                    .child(Button::new("close-review-comment", "Close").on_click(
-                        cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                    )),
+                    .child(
+                        Button::new("submit-review-comment", "Comment")
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    )
+                    .child(
+                        Button::new("close-review-comment", "Close")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
             )
     }
 }
