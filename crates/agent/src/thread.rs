@@ -2991,7 +2991,7 @@ impl Thread {
                                             Some(error_message),
                                         )
                                     })?;
-                                    return Err(retry_error);
+                                    return Err(retry_error.context("Automatic context compaction failed"));
                                 }
                             }
                         }
@@ -3002,7 +3002,7 @@ impl Thread {
                                     Some(error_message),
                                 )
                             })?;
-                            return Err(error);
+                            return Err(error.context("Automatic context compaction failed"));
                         }
                     }
                 }
