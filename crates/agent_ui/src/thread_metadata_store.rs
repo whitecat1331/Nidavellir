@@ -1730,6 +1730,7 @@ impl ThreadMetadataDb {
     /// insert, delete, archive, or timestamp update changes at least one of
     /// the aggregated values, so a polling watcher can reload on external
     /// changes without deserializing every row.
+    #[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
     pub fn change_fingerprint(&self) -> anyhow::Result<String> {
         let row = self.select_row::<String>(
             "SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || \
