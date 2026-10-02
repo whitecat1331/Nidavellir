@@ -268,7 +268,7 @@ mod tests {
     use super::*;
     use crate::{DbSandboxGrants, DbThread, Message, UserMessage, UserMessageContent};
     use acp_thread::ClientUserMessageId;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
     use collections::HashMap;
     use util::path_list::PathList;
 
