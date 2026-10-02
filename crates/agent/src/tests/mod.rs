@@ -1,7 +1,7 @@
 use super::*;
 use acp_thread::{
-    AgentConnection, AgentModelGroupName, AgentModelList, ClientUserMessageId, PermissionOptions,
-    ThreadStatus,
+    AgentConnection, AgentModelGroupName, AgentModelId, AgentModelList, ClientUserMessageId,
+    PermissionOptions, ThreadStatus,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentProfileId;
@@ -233,7 +233,12 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(&self, _label: String, _cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
+    fn create_subagent(
+        &self,
+        _label: String,
+        _model: Option<AgentModelId>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
             .subagent_handle
             .clone()
@@ -274,7 +279,12 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(&self, _label: String, _cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
+    fn create_subagent(
+        &self,
+        _label: String,
+        _model: Option<AgentModelId>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
     }
 }

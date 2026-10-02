@@ -65,7 +65,7 @@ use project::{
 use prompt_store::{ProjectContext, RULES_FILE_NAMES, RulesFileContext, WorktreeContext};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelProviderSetting, LanguageModelSelection, Settings as _, update_settings_file};
+use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -3575,8 +3575,13 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, cx)
+    fn create_subagent(
+        &self,
+        label: String,
+        model: Option<AgentModelId>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent_thread(label, model, cx)
     }
 
     fn resume_subagent(
@@ -4102,7 +4107,7 @@ mod internal_tests {
         LanguageModelName, LanguageModelProviderId, LanguageModelProviderName, Speed,
     };
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{LanguageModelProviderSetting, SettingsStore};
     use util::{path, rel_path::rel_path};
 
     #[gpui::test]
@@ -7694,10 +7699,10 @@ mod internal_tests {
         };
 
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), cx))
+            .update(|cx| environment.create_subagent_thread("first".to_string(), None, cx))
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), cx))
+            .update(|cx| environment.create_subagent_thread("second".to_string(), None, cx))
             .unwrap();
         cx.run_until_parked();
 
