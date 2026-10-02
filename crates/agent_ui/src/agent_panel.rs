@@ -11810,6 +11810,16 @@ mod tests {
             thread_ids.push(thread_id);
         }
 
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 6,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
         let base_time = Instant::now();
 
         for session_id in session_ids.iter().take(6) {
@@ -11828,6 +11838,13 @@ mod tests {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
                 });
             }
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
             panel.cleanup_retained_threads(cx);
         });
 
@@ -11885,6 +11902,16 @@ mod tests {
             loadable_thread_ids.push(thread_id);
         }
 
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 6,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
         let base_time = Instant::now();
 
         for session_id in loadable_session_ids.iter().take(6) {
@@ -11903,6 +11930,13 @@ mod tests {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
                 });
             }
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
             panel.cleanup_retained_threads(cx);
         });
 
