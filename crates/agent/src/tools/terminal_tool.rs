@@ -33,8 +33,9 @@ const MAX_TERMINAL_TIMEOUT_MS: u64 = 7_200_000;
 // output before the timeout fires.
 const SAMPLER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-// How long to leave the "kill or continue" prompt open before stopping the
-// command automatically when the user doesn't respond.
+// How long to leave the "kill or continue" prompt open. The command keeps
+// running if the prompt goes unanswered: only an explicit "Kill" stops it, so a
+// heuristic on printed output can never kill a command in an unattended run.
 const SAMPLER_KILL_CONTINUE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Executes a shell one-liner and returns the combined output.
@@ -1060,8 +1061,8 @@ async fn run_terminal_tool(
                                     Some(format!(
                                         "Detected a sustained stream of error output \
                                          ({detected_error_lines} error-signature lines). \
-                                         Kill the command or let it continue? It is stopped \
-                                         automatically in 10 s.",
+                                         Kill the command, or let it continue? It keeps \
+                                         running if you don't answer.",
                                     )),
                                     vec![
                                         acp::PermissionOption::new(
@@ -1078,15 +1079,13 @@ async fn run_terminal_tool(
                                     cx,
                                 )
                             });
-                            let kill = futures::select! {
-                                outcome = decision.fuse() => match outcome {
-                                    Ok(option_id) => option_id.0.as_ref() == "kill",
-                                    Err(_) => true,
-                                },
+                            let choice = futures::select! {
+                                outcome = decision.fuse() => outcome.ok(),
                                 _ = cx.background_executor()
                                     .timer(SAMPLER_KILL_CONTINUE_WINDOW)
-                                    .fuse() => true,
+                                    .fuse() => None,
                             };
+                            let kill = should_kill_after_error_stream(choice);
                             if kill {
                                 failure_detected = true;
                                 let reason = format!("a sustained stream of {detected_error_lines} error-signature lines was detected");
@@ -1422,6 +1421,17 @@ fn is_error_line(line: &str) -> bool {
         .any(|signature| lower.contains(*signature))
 }
 
+/// Whether the sampler's detected error stream should stop the command.
+///
+/// Only an explicit "Kill" does: an unanswered prompt (the decision window
+/// elapsing) or a closed decision channel lets the command run to completion.
+/// An unattended / autonomous run has nobody to answer, so defaulting to a kill
+/// turned a heuristic on printed text into a mid-flight stop of a command that
+/// may be perfectly healthy — the real failure signal is the exit code.
+fn should_kill_after_error_stream(choice: Option<acp::PermissionOptionId>) -> bool {
+    matches!(choice, Some(option_id) if option_id.0.as_ref() == "kill")
+}
+
 fn terminal_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TERMINAL_TIMEOUT_MS);
     if timeout_ms > MAX_TERMINAL_TIMEOUT_MS {
@@ -1603,6 +1613,25 @@ fn resolve_cd_in_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sampler_does_not_kill_without_an_explicit_choice() {
+        // Unanswered prompt / decision window elapsed / channel closed. This is
+        // the regression: the old logic returned `true` here and killed the
+        // command mid-flight in an unattended run.
+        assert!(
+            !should_kill_after_error_stream(None),
+            "an unanswered sampler prompt must not kill the command"
+        );
+        // An explicit "Continue" also keeps it running.
+        assert!(!should_kill_after_error_stream(Some(
+            acp::PermissionOptionId::new("continue")
+        )));
+        // An explicit "Kill" is the only thing that stops the command.
+        assert!(should_kill_after_error_stream(Some(
+            acp::PermissionOptionId::new("kill")
+        )));
+    }
 
     #[test]
     fn test_terminal_timeout_default_and_cap() {
