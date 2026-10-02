@@ -1506,6 +1506,19 @@ impl ThreadView {
         }
     }
 
+    fn tool_call_icon_tooltip(
+        tool_name: Option<&SharedString>,
+        interrupted_edit: bool,
+    ) -> Option<SharedString> {
+        let tool_name = tool_name.filter(|name| !name.trim().is_empty());
+        match (tool_name, interrupted_edit) {
+            (Some(name), true) => Some(format!("Interrupted Edit\nTool: {name}").into()),
+            (Some(name), false) => Some(format!("Tool: {name}").into()),
+            (None, true) => Some("Interrupted Edit".into()),
+            (None, false) => None,
+        }
+    }
+
     pub(crate) fn in_flight_prompt(&self, cx: &App) -> Option<Arc<[acp_v1::ContentBlock]>> {
         let record = self.thread.read(cx);
         let record = record.submission(self.current_submission?)?;

@@ -7046,7 +7046,7 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, cx| {
         assert!(subagent_thread.is_subagent());
         assert_eq!(subagent_thread.depth(), 1);
@@ -7117,7 +7117,7 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -7182,7 +7182,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         thread
     });
     let deep_subagent_thread = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&deep_parent_thread, cx);
+        let mut thread = Thread::new_subagent(&deep_parent_thread, None, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -7453,7 +7453,7 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent = cx.new(|cx| Thread::new_subagent(&parent, cx));
+    let subagent = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
 
     parent.update(cx, |thread, _cx| {
         thread.register_running_subagent(subagent.downgrade());
@@ -7492,7 +7492,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
     assert_eq!(request.thread_id, Some(test.handle.id().to_string()));
     assert_eq!(
         request.messages.last().unwrap().string_contents(),
-        COMPACTION_PROMPT
+        agent_settings::COMPACTION_PROMPT
     );
     assert_eq!(
         request
@@ -7843,9 +7843,9 @@ async fn test_subagent_compaction_error_propagation(cx: &mut TestAppContext) {
 async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     let fake = init_test(cx);
     cx.update(|cx| {
-        let mut settings = AgentSettings::get_global(cx).clone();
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
         settings.auto_compact.enabled = false;
-        AgentSettings::override_global(settings, cx);
+        agent_settings::AgentSettings::override_global(settings, cx);
     });
     cx.update(|cx| {
         cx.update_flags(true, vec!["subagents".to_string()]);
@@ -9802,15 +9802,15 @@ impl SubagentCompactionTest {
     async fn new_with_files(files: serde_json::Value, cx: &mut TestAppContext) -> Self {
         let fake = init_test(cx);
         cx.update(|cx| {
-            let mut settings = AgentSettings::get_global(cx).clone();
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
             settings.auto_compact.enabled = true;
-            settings.auto_compact.threshold = AutoCompactThreshold::Percentage(0.9);
+            settings.auto_compact.threshold = agent_settings::AutoCompactThreshold::Percentage(0.9);
             for profile in settings.profiles.values_mut() {
                 profile
                     .tools
                     .insert(EchoTool::NAME.to_string().into(), true);
             }
-            AgentSettings::override_global(settings, cx);
+            agent_settings::AgentSettings::override_global(settings, cx);
         });
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/test"), files).await;
@@ -9861,9 +9861,9 @@ impl SubagentCompactionTest {
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
-            let mut settings = AgentSettings::get_global(cx).clone();
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
             settings.auto_compact.enabled = enabled;
-            AgentSettings::override_global(settings, cx);
+            agent_settings::AgentSettings::override_global(settings, cx);
         });
         let model = self.fake.update_model("fake", |model| {
             model.max_token_count = max_tokens;

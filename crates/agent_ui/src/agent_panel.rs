@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -1172,6 +1172,7 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
+    retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1585,6 +1586,7 @@ impl AgentPanel {
             draft_thread: None,
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
+            retained_thread_subscriptions: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -5586,7 +5588,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                     let id = format!("{}/{}", provider_id.0, model.id().0);
                     let is_default = default
                         .as_ref()
-                        .map(|cm| cm.provider.id() == provider_id && cm.model.id() == model.id())
+                        .map(|cm| cm.provider_id == provider_id && cm.id == model.id())
                         .unwrap_or(false);
                     models.push(agent::AvailableModel {
                         id,

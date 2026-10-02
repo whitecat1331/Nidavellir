@@ -65,7 +65,7 @@ use project::{
 use prompt_store::{ProjectContext, RULES_FILE_NAMES, RulesFileContext, WorktreeContext};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelSelection, Settings as _, update_settings_file};
+use settings::{LanguageModelProviderSetting, LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -2807,6 +2807,20 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     }
 }
 
+fn subagent_model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
+    let settings = agent_settings::AgentSettings::get_global(cx);
+    let Some((provider, model)) = model_id.as_ref().split_once('/') else {
+        return model_id_to_selection(model_id, cx);
+    };
+    if let Some(selection) = settings.subagent_model.as_ref()
+        && selection.provider.0 == provider
+        && selection.model == model
+    {
+        return selection.clone();
+    }
+    model_id_to_selection(model_id, cx)
+}
+
 fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
     let id = model_id.as_ref();
     let (provider, model) = id.split_once('/').unwrap_or(("", id));
@@ -3338,8 +3352,22 @@ impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
         label: String,
+        model: Option<AgentModelId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
+        let model = if let Some(model_id) = model {
+            let available = self.agent.read_with(cx, |agent, _| {
+                agent.models.model_from_id(&model_id).is_some()
+            })?;
+            if !available {
+                anyhow::bail!(
+                    "Model {model_id} is unavailable. Call list_agents_and_models to inspect available models."
+                );
+            }
+            Some(subagent_model_id_to_selection(&model_id, cx))
+        } else {
+            None
+        };
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
@@ -3355,7 +3383,7 @@ impl NativeThreadEnvironment {
         }
 
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
+            let mut thread = Thread::new_subagent(&parent_thread_entity, model.as_ref(), cx);
             thread.set_title(label.into(), cx);
             thread
         });
@@ -4560,6 +4588,7 @@ mod internal_tests {
                 restored_session_id.clone(),
                 saved_thread,
                 PathList::new(&[Path::new("/a")]),
+                None,
             )
             .await
             .expect("provider-native compaction should save");
@@ -6127,7 +6156,7 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, cx)));
+        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx)));
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
