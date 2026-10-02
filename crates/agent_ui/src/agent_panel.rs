@@ -11810,15 +11810,7 @@ mod tests {
             thread_ids.push(thread_id);
         }
 
-        cx.update(|_window, cx| {
-            AgentSettings::override_global(
-                AgentSettings {
-                    max_idle_retained_threads: 6,
-                    ..AgentSettings::get_global(cx).clone()
-                },
-                cx,
-            );
-        });
+        cx.update(|_window, cx| cx.set_global(MaxIdleRetainedThreads(6)));
 
         let base_time = Instant::now();
 
@@ -11838,13 +11830,7 @@ mod tests {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
                 });
             }
-            AgentSettings::override_global(
-                AgentSettings {
-                    max_idle_retained_threads: 5,
-                    ..AgentSettings::get_global(cx).clone()
-                },
-                cx,
-            );
+            cx.set_global(MaxIdleRetainedThreads(5));
             panel.cleanup_retained_threads(cx);
         });
 
@@ -11902,15 +11888,7 @@ mod tests {
             loadable_thread_ids.push(thread_id);
         }
 
-        cx.update(|_window, cx| {
-            AgentSettings::override_global(
-                AgentSettings {
-                    max_idle_retained_threads: 6,
-                    ..AgentSettings::get_global(cx).clone()
-                },
-                cx,
-            );
-        });
+        cx.update(|_window, cx| cx.set_global(MaxIdleRetainedThreads(6)));
 
         let base_time = Instant::now();
 
@@ -11930,13 +11908,7 @@ mod tests {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
                 });
             }
-            AgentSettings::override_global(
-                AgentSettings {
-                    max_idle_retained_threads: 5,
-                    ..AgentSettings::get_global(cx).clone()
-                },
-                cx,
-            );
+            cx.set_global(MaxIdleRetainedThreads(5));
             panel.cleanup_retained_threads(cx);
         });
 
