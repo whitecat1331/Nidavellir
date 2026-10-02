@@ -1867,7 +1867,7 @@ impl NativeAgent {
     /// threads database). We must not run the normal release save here,
     /// because saving the stale in-memory snapshot would clobber that newer
     /// content.
-    fn discard_session(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+    fn discard_session(&mut self, session_id: &acp_v1::SessionId, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.remove(session_id) else {
             return;
         };
@@ -2305,7 +2305,7 @@ impl NativeAgentConnection {
     /// Zed instance writing to the same thread).
     pub fn thread_updated_at(
         &self,
-        id: acp::SessionId,
+        id: acp_v1::SessionId,
         cx: &mut App,
     ) -> Task<Result<Option<DateTime<Utc>>>> {
         let database_future = ThreadsDatabase::connect(cx);
@@ -2318,7 +2318,7 @@ impl NativeAgentConnection {
     /// Discards a session from memory without saving it. This must only be
     /// used when the caller is about to reload the session from disk because
     /// the on-disk copy is newer than the in-memory copy.
-    pub fn discard_session(&self, session_id: &acp::SessionId, cx: &mut App) {
+    pub fn discard_session(&self, session_id: &acp_v1::SessionId, cx: &mut App) {
         self.0
             .update(cx, |agent, cx| agent.discard_session(session_id, cx));
     }
