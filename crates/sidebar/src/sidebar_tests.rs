@@ -474,6 +474,7 @@ fn save_thread_metadata(
             worktree_paths,
             archived: false,
             remote_connection,
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -510,6 +511,7 @@ fn save_thread_metadata_with_main_paths(
         worktree_paths: WorktreePaths::from_path_lists(main_worktree_paths, folder_paths).unwrap(),
         archived: false,
         remote_connection: None,
+        workspace_id: None,
     };
     cx.update(|cx| {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -537,6 +539,7 @@ fn save_draft_metadata_with_main_paths(
         worktree_paths: WorktreePaths::from_path_lists(main_worktree_paths, folder_paths).unwrap(),
         archived: false,
         remote_connection: None,
+        workspace_id: None,
     };
     cx.update(|cx| {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -1163,6 +1166,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
                 interacted_at: None,
                 archived: false,
                 remote_connection: None,
+                workspace_id: None,
             },
             icon: IconName::ZedAgent,
             icon_from_external_svg: None,
@@ -1255,6 +1259,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1282,6 +1287,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1309,6 +1315,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1337,6 +1344,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1365,6 +1373,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     interacted_at: None,
                     archived: false,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -7665,6 +7674,7 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
                     worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
                     archived: false,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 cx,
             )
@@ -7748,6 +7758,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
                 )])),
                 archived: false,
                 remote_connection: None,
+                workspace_id: None,
             },
             window,
             cx,
@@ -7818,6 +7829,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
                 ])),
                 archived: false,
                 remote_connection: None,
+                workspace_id: None,
             },
             window,
             cx,
@@ -7884,6 +7896,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
                 worktree_paths: WorktreePaths::default(),
                 archived: false,
                 remote_connection: None,
+                workspace_id: None,
             },
             window,
             cx,
@@ -7942,6 +7955,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
                 worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                 archived: false,
                 remote_connection: None,
+                workspace_id: None,
             },
             window,
             cx,
@@ -8001,6 +8015,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
                 )])),
                 archived: false,
                 remote_connection: None,
+                workspace_id: None,
             },
             window,
             cx,
@@ -8080,6 +8095,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
         )])),
         archived: false,
         remote_connection: None,
+        workspace_id: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
 
@@ -8163,6 +8179,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
         )])),
         archived: false,
         remote_connection: None,
+        workspace_id: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
 
@@ -8493,6 +8510,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
             )])),
             archived: false,
             remote_connection: Some(remote_host),
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -9147,6 +9165,7 @@ async fn test_archive_last_worktree_thread_not_blocked_by_remote_thread_at_same_
             )])),
             archived: false,
             remote_connection: Some(remote_host),
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(metadata, cx);
@@ -9960,6 +9979,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
                     worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                     archived: true,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 cx,
             )
@@ -10054,6 +10074,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
                     worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                     archived: true,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 cx,
             )
@@ -10283,6 +10304,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
                     ])),
                     archived: true,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 cx,
             )
@@ -11136,6 +11158,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
                     .expect("main and folder paths should be well-formed"),
                     archived: true,
                     remote_connection: None,
+                    workspace_id: None,
                 },
                 cx,
             )
@@ -11685,6 +11708,7 @@ async fn test_legacy_thread_with_canonical_path_opens_main_repo_workspace(cx: &m
             )])),
             archived: false,
             remote_connection: None,
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -12673,6 +12697,7 @@ mod property_test {
             worktree_paths: WorktreePaths::from_path_lists(main_worktree_paths, path_list).unwrap(),
             archived: false,
             remote_connection: None,
+            workspace_id: None,
         };
         cx.update(|_, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx))
@@ -12746,6 +12771,7 @@ mod property_test {
                         worktree_paths: project.read(cx).worktree_paths(cx),
                         archived: false,
                         remote_connection: project.read(cx).remote_connection_options(cx),
+                        workspace_id: None,
                     });
                     cx.update(|_, cx| {
                         ThreadMetadataStore::global(cx)
@@ -13614,6 +13640,7 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
             .unwrap(),
             archived: false,
             remote_connection,
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -14579,6 +14606,7 @@ async fn test_remote_archive_thread_with_active_connection(
             .unwrap(),
             archived: false,
             remote_connection,
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -14720,6 +14748,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
             .unwrap(),
             archived: false,
             remote_connection: Some(remote_connection.clone()),
+            workspace_id: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
