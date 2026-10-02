@@ -590,6 +590,7 @@ impl Terminal {
                 ..Default::default()
             }),
             user_stopped: Arc::new(AtomicBool::new(false)),
+            failure_reason: None,
             _sandbox: None,
         }
     }
