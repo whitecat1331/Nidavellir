@@ -16,7 +16,7 @@ use sqlez::{
     connection::Connection,
     statement::Statement,
 };
-use std::{io::ErrorKind, path::PathBuf, sync::Arc};
+use std::{io::ErrorKind, ops::Range, path::PathBuf, sync::Arc};
 use ui::{App, SharedString};
 use util::path_list::PathList;
 use zed_env_vars::ZED_STATELESS;
@@ -410,6 +410,154 @@ pub struct ThreadReconcileSummary {
     pub merged_session_ids: Vec<String>,
 }
 
+/// Lifecycle of a review comment anchored to an agent edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCommentStatus {
+    /// Anchored to its hunk and shown as active.
+    Open,
+    /// Marked done by the user; retained for history.
+    Resolved,
+    /// The anchor could not be relocated onto the current buffer (the hunk was
+    /// rewritten wholesale, or the file left the action log). Kept visible so a
+    /// comment is never silently lost, but not treated as attached to code.
+    Unresolved,
+}
+
+impl ReviewCommentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "resolved" => Self::Resolved,
+            "unresolved" => Self::Unresolved,
+            _ => Self::Open,
+        }
+    }
+}
+
+/// A persistable stand-in for a live `text::Anchor`.
+///
+/// `text::Anchor` is a CRDT position that is only meaningful against the buffer
+/// replica that minted it and does not implement `Serialize`, so a review
+/// comment stores this descriptor instead and re-mints an anchor on load via
+/// [`AnchorDescriptor::resolve_offset`]. Relocation is by exact anchored text
+/// first (nearest the recorded offset when the text repeats), which is what lets
+/// a comment survive inserts and deletes even though the raw anchor cannot be
+/// persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorDescriptor {
+    /// Project-relative path of the commented file, as shown in the review pane.
+    pub file_path: String,
+    /// Exact text of the anchored region at creation time, bounded in length.
+    /// Empty for a zero-width anchor (a pure insertion/deletion boundary).
+    pub anchored_text: String,
+    /// Byte offset of the anchor within the file at creation time. Used to pick
+    /// between repeated matches, and as the fallback for a zero-width anchor.
+    pub offset_hint: usize,
+    /// Lines immediately preceding the anchor, captured for display and as a
+    /// future fuzzy-relocation input.
+    #[serde(default)]
+    pub context_before: Vec<String>,
+}
+
+impl AnchorDescriptor {
+    /// Cap on the anchored text stored per comment, so a whole-file "created"
+    /// hunk does not bloat the row.
+    const MAX_ANCHORED_TEXT_BYTES: usize = 1024;
+    /// Number of preceding lines captured as context.
+    const CONTEXT_LINES: usize = 3;
+
+    /// Build a descriptor for the byte range `anchor_range` within `text`.
+    pub fn from_text(file_path: String, text: &str, anchor_range: Range<usize>) -> Self {
+        let start = anchor_range.start.min(text.len());
+        let end = anchor_range.end.min(text.len()).max(start);
+        Self {
+            file_path,
+            anchored_text: truncate_at_char_boundary(
+                &text[start..end],
+                Self::MAX_ANCHORED_TEXT_BYTES,
+            )
+            .to_string(),
+            offset_hint: start,
+            context_before: preceding_lines(text, start, Self::CONTEXT_LINES),
+        }
+    }
+
+    /// Resolve this descriptor to a byte offset in `current_text`, or `None`
+    /// when the anchor can no longer be trusted (the caller should mark the
+    /// comment `Unresolved` rather than mis-anchor it).
+    pub fn resolve_offset(&self, current_text: &str) -> Option<usize> {
+        if self.anchored_text.is_empty() {
+            // A zero-width anchor has no text to match; the recorded offset is
+            // the best available position, clamped to the current buffer.
+            return Some(self.offset_hint.min(current_text.len()));
+        }
+
+        let mut matches = current_text
+            .match_indices(self.anchored_text.as_str())
+            .map(|(offset, _)| offset);
+        let first = matches.next()?;
+        // Prefer the occurrence closest to where the anchor was recorded, so a
+        // repeated block relocates to its own instance rather than the first.
+        Some(matches.fold(first, |best, offset| {
+            if offset.abs_diff(self.offset_hint) < best.abs_diff(self.offset_hint) {
+                offset
+            } else {
+                best
+            }
+        }))
+    }
+}
+
+/// A review comment anchored to a specific agent edit hunk.
+#[derive(Debug, Clone)]
+pub struct DbReviewComment {
+    pub id: String,
+    pub thread_id: acp::SessionId,
+    pub anchor: AnchorDescriptor,
+    pub body: String,
+    pub status: ReviewCommentStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The up-to-`count` whole lines immediately before `offset`, oldest first.
+fn preceding_lines(text: &str, offset: usize, count: usize) -> Vec<String> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let mut lines: Vec<String> = text[..offset]
+        .lines()
+        .rev()
+        .take(count)
+        .map(str::to_string)
+        .collect();
+    lines.reverse();
+    lines
+}
+
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
@@ -528,6 +676,30 @@ impl ThreadsDatabase {
         {
             s().ok();
         }
+
+        // Phase C: review comments anchored to agent edit hunks. Kept in their
+        // own table (not inside the thread blob) so comment edits stay off the
+        // transcript-save path and the reconcile pass can re-point them when it
+        // archives a merged-away thread.
+        connection.exec(indoc! {"
+                CREATE TABLE IF NOT EXISTS review_comments (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    anchor TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            "})?()
+        .map_err(|e| e.context("Failed to create review_comments table"))?;
+
+        connection.exec(indoc! {"
+                CREATE INDEX IF NOT EXISTS review_comments_thread_id
+                    ON review_comments(thread_id)
+            "})?()
+        .map_err(|e| e.context("Failed to create review_comments index"))?;
 
         let db = Self {
             executor,
@@ -812,6 +984,10 @@ impl ThreadsDatabase {
                     DELETE FROM threads WHERE id = ?
                 "})?;
 
+                let mut delete_comments = connection.exec_bound::<Arc<str>>(indoc! {"
+                    DELETE FROM review_comments WHERE thread_id = ?
+                "})?;
+
                 let mut sandboxed_terminal_temp_dirs = Vec::new();
                 for thread_id in ids_to_delete {
                     if let Some(temp_dir) = select(thread_id.clone())?.into_iter().next().and_then(
@@ -819,7 +995,8 @@ impl ThreadsDatabase {
                     ) {
                         sandboxed_terminal_temp_dirs.push(temp_dir);
                     }
-                    delete(thread_id)?;
+                    delete(thread_id.clone())?;
+                    delete_comments(thread_id)?;
                 }
 
                 sandboxed_terminal_temp_dirs
@@ -864,6 +1041,116 @@ impl ThreadsDatabase {
                 Self::remove_sandboxed_terminal_temp_dir(temp_dir);
             }
 
+            Ok(())
+        })
+    }
+
+    /// All review comments attached to `thread_id`, oldest first.
+    pub fn list_review_comments(
+        &self,
+        thread_id: acp::SessionId,
+    ) -> Task<Result<Vec<DbReviewComment>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection
+                .select_bound::<Arc<str>, (String, String, String, String, String, String, String)>(
+                    indoc! {"
+                SELECT id, file_path, anchor, body, status, created_at, updated_at
+                FROM review_comments
+                WHERE thread_id = ?
+                ORDER BY created_at ASC, id ASC
+            "},
+                )?;
+
+            let mut comments = Vec::new();
+            for (id, file_path, anchor, body, status, created_at, updated_at) in
+                select(thread_id.0.clone())?
+            {
+                let mut anchor =
+                    serde_json::from_str::<AnchorDescriptor>(&anchor).unwrap_or_else(|_| {
+                        AnchorDescriptor {
+                            file_path: file_path.clone(),
+                            anchored_text: String::new(),
+                            offset_hint: 0,
+                            context_before: Vec::new(),
+                        }
+                    });
+                // The path has its own column; keep the parsed descriptor in sync
+                // if the stored JSON is stale or damaged.
+                anchor.file_path = file_path;
+
+                comments.push(DbReviewComment {
+                    id,
+                    thread_id: thread_id.clone(),
+                    anchor,
+                    body,
+                    status: ReviewCommentStatus::from_db_str(&status),
+                    created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+                    updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
+                });
+            }
+
+            Ok(comments)
+        })
+    }
+
+    /// Insert a new review comment or update an existing one (matched by id).
+    pub fn upsert_review_comment(&self, comment: DbReviewComment) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let anchor = serde_json::to_string(&comment.anchor)?;
+
+            let mut upsert = connection.exec_bound::<(
+                String,
+                Arc<str>,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+            )>(indoc! {"
+                INSERT INTO review_comments
+                    (id, thread_id, file_path, anchor, body, status, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    file_path = excluded.file_path,
+                    anchor = excluded.anchor,
+                    body = excluded.body,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+            "})?;
+
+            upsert((
+                comment.id,
+                comment.thread_id.0,
+                comment.anchor.file_path.clone(),
+                anchor,
+                comment.body,
+                comment.status.as_str().to_string(),
+                comment.created_at.to_rfc3339(),
+                comment.updated_at.to_rfc3339(),
+            ))?;
+
+            Ok(())
+        })
+    }
+
+    /// Delete a single review comment by id.
+    pub fn delete_review_comment(&self, id: String) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut delete = connection.exec_bound::<String>(indoc! {"
+                DELETE FROM review_comments WHERE id = ?
+            "})?;
+            delete(id)?;
             Ok(())
         })
     }
@@ -1040,6 +1327,42 @@ pub fn resolve_thread_id(cx: &mut App, id: acp::SessionId) -> Task<Result<Option
     })
 }
 
+/// Load the review comments persisted for `thread_id`, oldest first.
+/// See [`ThreadsDatabase::list_review_comments`].
+pub fn load_review_comments(
+    cx: &mut App,
+    thread_id: acp::SessionId,
+) -> Task<Result<Vec<DbReviewComment>>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    let executor = cx.background_executor().clone();
+    executor.spawn(async move {
+        let database = database_future.await.map_err(|err| anyhow!(err))?;
+        database.list_review_comments(thread_id).await
+    })
+}
+
+/// Insert or update a review comment.
+/// See [`ThreadsDatabase::upsert_review_comment`].
+pub fn save_review_comment(cx: &mut App, comment: DbReviewComment) -> Task<Result<()>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    let executor = cx.background_executor().clone();
+    executor.spawn(async move {
+        let database = database_future.await.map_err(|err| anyhow!(err))?;
+        database.upsert_review_comment(comment).await
+    })
+}
+
+/// Delete a review comment by id.
+/// See [`ThreadsDatabase::delete_review_comment`].
+pub fn delete_review_comment(cx: &mut App, id: String) -> Task<Result<()>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    let executor = cx.background_executor().clone();
+    executor.spawn(async move {
+        let database = database_future.await.map_err(|err| anyhow!(err))?;
+        database.delete_review_comment(id).await
+    })
+}
+
 fn reconcile_threads_sync(connection: &Arc<Mutex<Connection>>) -> Result<ThreadReconcileSummary> {
     reconcile_threads_scoped_sync(connection, None)
 }
@@ -1182,8 +1505,17 @@ fn reconcile_threads_scoped_sync(
             let mut archive = connection.exec_bound::<(Arc<str>, Arc<str>)>(indoc! {"
                     UPDATE threads SET merged_into = ?1 WHERE id = ?2
                 "})?;
+            let mut repoint_comments = connection.exec_bound::<(Arc<str>, Arc<str>)>(indoc! {"
+                    UPDATE review_comments SET thread_id = ?1 WHERE thread_id = ?2
+                "})?;
             for member in members.iter().skip(1) {
                 archive((
+                    Arc::from(canonical.id.as_str()),
+                    Arc::from(member.id.as_str()),
+                ))?;
+                // Review comments follow the merge so they are never orphaned on
+                // an archived thread.
+                repoint_comments((
                     Arc::from(canonical.id.as_str()),
                     Arc::from(member.id.as_str()),
                 ))?;
@@ -1438,6 +1770,193 @@ mod tests {
             entries[0].created_at.is_some(),
             "created_at should be populated"
         );
+    }
+
+    fn make_review_comment(id: &str, thread: &str, body: &str) -> DbReviewComment {
+        let now = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        DbReviewComment {
+            id: id.to_string(),
+            thread_id: session_id(thread),
+            anchor: AnchorDescriptor {
+                file_path: "src/main.rs".to_string(),
+                anchored_text: "fn main() {}".to_string(),
+                offset_hint: 0,
+                context_before: Vec::new(),
+            },
+            body: body.to_string(),
+            status: ReviewCommentStatus::Open,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_review_comments_roundtrip(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        database
+            .upsert_review_comment(make_review_comment("c1", "thread-a", "first"))
+            .await
+            .unwrap();
+        database
+            .upsert_review_comment(make_review_comment("c2", "thread-a", "second"))
+            .await
+            .unwrap();
+        database
+            .upsert_review_comment(make_review_comment("c3", "thread-b", "other"))
+            .await
+            .unwrap();
+
+        let comments = database
+            .list_review_comments(session_id("thread-a"))
+            .await
+            .unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, "c1");
+        assert_eq!(comments[0].body, "first");
+        assert_eq!(comments[0].status, ReviewCommentStatus::Open);
+        assert_eq!(comments[0].anchor.file_path, "src/main.rs");
+        assert_eq!(comments[0].anchor.anchored_text, "fn main() {}");
+        assert_eq!(comments[1].id, "c2");
+    }
+
+    #[gpui::test]
+    async fn test_review_comment_upsert_updates_in_place(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        database
+            .upsert_review_comment(make_review_comment("c1", "thread-a", "before"))
+            .await
+            .unwrap();
+
+        let mut updated = make_review_comment("c1", "thread-a", "after");
+        updated.status = ReviewCommentStatus::Resolved;
+        database.upsert_review_comment(updated).await.unwrap();
+
+        let comments = database
+            .list_review_comments(session_id("thread-a"))
+            .await
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "after");
+        assert_eq!(comments[0].status, ReviewCommentStatus::Resolved);
+    }
+
+    #[gpui::test]
+    async fn test_review_comment_delete(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        database
+            .upsert_review_comment(make_review_comment("c1", "thread-a", "x"))
+            .await
+            .unwrap();
+        database
+            .delete_review_comment("c1".to_string())
+            .await
+            .unwrap();
+        assert!(
+            database
+                .list_review_comments(session_id("thread-a"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_review_comments_follow_reconcile(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let older_id = session_id("older");
+        let newer_id = session_id("newer");
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let mut older = make_thread("Thread", timestamp);
+        older.messages.push(user_message("hello reconcile"));
+        let mut newer = make_thread("Thread", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 1).unwrap());
+        newer.messages.push(user_message("hello reconcile"));
+
+        database
+            .save_thread(older_id.clone(), older, PathList::default(), None)
+            .await
+            .unwrap();
+        database
+            .save_thread(newer_id.clone(), newer, PathList::default(), None)
+            .await
+            .unwrap();
+
+        database
+            .upsert_review_comment(make_review_comment("c1", "newer", "on the loser"))
+            .await
+            .unwrap();
+
+        database.reconcile_threads().await.unwrap();
+
+        let comments = database.list_review_comments(older_id).await.unwrap();
+        assert_eq!(
+            comments.len(),
+            1,
+            "comment should follow the merge to the canonical thread"
+        );
+        assert_eq!(comments[0].id, "c1");
+        assert!(
+            database
+                .list_review_comments(session_id("newer"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_anchor_descriptor_resolves_exact_match() {
+        let text = "line one\nline two\nfn target() {}\nline four\n";
+        let start = text.find("fn target()").unwrap();
+        let descriptor = AnchorDescriptor::from_text(
+            "src/lib.rs".to_string(),
+            text,
+            start..start + "fn target()".len(),
+        );
+        assert_eq!(descriptor.resolve_offset(text), Some(start));
+        assert!(
+            descriptor
+                .context_before
+                .iter()
+                .any(|line| line == "line two")
+        );
+    }
+
+    #[test]
+    fn test_anchor_descriptor_follows_offset_after_insert() {
+        let original = "alpha\nbravo\ntarget\ncharlie\n";
+        let start = original.find("target").unwrap();
+        let descriptor = AnchorDescriptor::from_text(
+            "f.rs".to_string(),
+            original,
+            start..start + "target".len(),
+        );
+
+        let edited = "new line\nalpha\nbravo\ntarget\ncharlie\n";
+        let expected = edited.find("target").unwrap();
+        assert_eq!(descriptor.resolve_offset(edited), Some(expected));
+    }
+
+    #[test]
+    fn test_anchor_descriptor_prefers_nearest_repeated_match() {
+        let original = "dup\nx\ndup\ndup\n";
+        // Anchor the second occurrence.
+        let start = original.match_indices("dup").nth(1).unwrap().0;
+        let descriptor =
+            AnchorDescriptor::from_text("f.rs".to_string(), original, start..start + "dup".len());
+        assert_eq!(descriptor.resolve_offset(original), Some(start));
+    }
+
+    #[test]
+    fn test_anchor_descriptor_unresolved_when_text_removed() {
+        let original = "keep\nremove me\nkeep\n";
+        let start = original.find("remove me").unwrap();
+        let descriptor = AnchorDescriptor::from_text(
+            "f.rs".to_string(),
+            original,
+            start..start + "remove me".len(),
+        );
+        assert_eq!(descriptor.resolve_offset("keep\nkeep\n"), None);
     }
 
     #[test]
