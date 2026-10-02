@@ -7133,6 +7133,16 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
     });
 
     let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
+    let explicit_selection = LanguageModelSelection {
+        provider: LanguageModelProviderSetting("fake-corp".to_string()),
+        model: "explicit-model".to_string(),
+        enable_thinking: false,
+        effort: None,
+        speed: None,
+    };
+    let explicit_subagent_thread =
+        cx.new(|cx| Thread::new_subagent(&parent_thread, Some(&explicit_selection), cx));
+
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -7142,8 +7152,18 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
         assert_eq!(subagent_thread.thinking_effort(), Some(&"high".to_string()));
     });
 
+    explicit_subagent_thread.read_with(cx, |subagent_thread, _cx| {
+        assert_eq!(
+            subagent_thread.model().map(|model| model.id()),
+            Some(explicit_model.id())
+        );
+        assert!(!subagent_thread.thinking_enabled());
+        assert_eq!(subagent_thread.thinking_effort(), None);
+    });
+
     parent_thread.update(cx, |parent_thread, _cx| {
         parent_thread.register_running_subagent(subagent_thread.downgrade());
+        parent_thread.register_running_subagent(explicit_subagent_thread.downgrade());
     });
     parent_thread.update(cx, |parent_thread, cx| {
         parent_thread.set_model(parent_model.clone(), cx);
@@ -7158,6 +7178,15 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
         );
         assert!(subagent_thread.thinking_enabled());
         assert_eq!(subagent_thread.thinking_effort(), Some(&"high".to_string()));
+    });
+
+    explicit_subagent_thread.read_with(cx, |subagent_thread, _cx| {
+        assert_eq!(
+            subagent_thread.model().map(|model| model.id()),
+            Some(explicit_model.id())
+        );
+        assert!(!subagent_thread.thinking_enabled());
+        assert_eq!(subagent_thread.thinking_effort(), None);
     });
 }
 

@@ -3659,14 +3659,6 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     }
 }
 
-#[derive(Debug, Clone)]
-enum SubagentPromptResult {
-    Completed,
-    Cancelled,
-    ContextWindowWarning,
-    Error(String),
-}
-
 pub struct NativeSubagentHandle {
     session_id: acp_v1::SessionId,
     parent_thread: WeakEntity<Thread>,
