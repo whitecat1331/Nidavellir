@@ -60,6 +60,7 @@ urlencoding.workspace = true
 [dev-dependencies]
 env_logger.workspace = true
 gpui = { workspace = true, "features" = ["test-support"] }
+markdown = { workspace = true, features = ["test-support"] }
 indoc.workspace = true
 parking_lot.workspace = true
 project = { workspace = true, "features" = ["test-support"] }
