@@ -1,13 +1,15 @@
+use crate::review_comments::{ReviewCommentModal, ReviewComments};
 use crate::{Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
 use acp_thread::{AcpThread, AcpThreadEvent};
 use action_log::{ActionLogTelemetry, LastRejectUndo};
+use agent::AnchorDescriptor;
 use agent_settings::AgentSettings;
 use anyhow::Result;
 use buffer_diff::DiffHunkStatus;
 use collections::{HashMap, HashSet};
 use editor::{
     DiffHunkRenderer, Direction, Editor, EditorEvent, EditorSettings, MultiBuffer,
-    MultiBufferSnapshot, SelectionEffects, SplittableEditor, ToPoint,
+    MultiBufferSnapshot, SelectionEffects, SplittableEditor, ToOffset, ToPoint,
     actions::{GoToHunk, GoToPreviousHunk},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -88,6 +90,7 @@ impl AgentDiffPane {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+        let comments = ReviewComments::new(thread.read(cx).session_id().clone(), cx);
 
         let project = thread.read(cx).project().clone();
         let editor = cx.new(|cx| {
@@ -101,7 +104,7 @@ impl AgentDiffPane {
                 cx,
             );
             diff_display_editor
-                .set_diff_hunk_renderer(Some(agent_diff_renderer(&thread, workspace.clone())), cx);
+                .set_diff_hunk_renderer(Some(agent_diff_renderer(&thread, workspace.clone(), comments.clone())), cx);
             diff_display_editor.update_editors(cx, |editor, _cx| {
                 editor.register_addon(AgentDiffAddon);
             });
@@ -118,6 +121,7 @@ impl AgentDiffPane {
                 cx.subscribe(&thread, |this, _thread, event, cx| {
                     this.handle_acp_thread_event(event, cx)
                 }),
+                cx.subscribe(&comments, |_this, _comments, _event, cx| cx.notify()),
             ],
             multibuffer,
             editor,
@@ -737,15 +741,18 @@ impl Render for AgentDiffPane {
 struct AgentDiffHunkRenderer {
     thread: Entity<AcpThread>,
     workspace: WeakEntity<Workspace>,
+    comments: Entity<ReviewComments>,
 }
 
 fn agent_diff_renderer(
     thread: &Entity<AcpThread>,
     workspace: WeakEntity<Workspace>,
+    comments: Entity<ReviewComments>,
 ) -> Arc<dyn DiffHunkRenderer> {
     Arc::new(AgentDiffHunkRenderer {
         thread: thread.clone(),
         workspace,
+        comments,
     })
 }
 
@@ -770,6 +777,7 @@ impl DiffHunkRenderer for AgentDiffHunkRenderer {
             &self.thread,
             editor,
             self.workspace.clone(),
+            &self.comments,
             cx,
         )
     }
@@ -788,9 +796,14 @@ fn render_diff_hunk_controls(
     thread: &Entity<AcpThread>,
     editor: &Entity<Editor>,
     workspace: WeakEntity<Workspace>,
+    comments: &Entity<ReviewComments>,
     cx: &mut App,
 ) -> AnyElement {
     let editor = editor.clone();
+    let comment_workspace = workspace.clone();
+    let comment_count = hunk_file_path(&editor, &hunk_range, cx)
+        .map(|path| comments.read(cx).open_count_for_file(&path))
+        .unwrap_or(0);
     // Drop shadows render as a dark halo on transparent windows.
     let opaque_window =
         cx.theme().window_background_appearance() == gpui::WindowBackgroundAppearance::Opaque;
@@ -856,6 +869,38 @@ fn render_diff_hunk_controls(
                         });
                     }
                 }),
+            Button::new(
+                ("comment", row as u64),
+                if comment_count > 0 {
+                    format!("Comment ({comment_count})")
+                } else {
+                    "Comment".to_string()
+                },
+            )
+            .on_click({
+                let editor = editor.clone();
+                let comments = comments.clone();
+                let workspace = comment_workspace;
+                let hunk_range = hunk_range.clone();
+                move |_event, window, cx| {
+                    let Some(descriptor) = hunk_anchor_descriptor(&editor, hunk_range.clone(), cx)
+                    else {
+                        return;
+                    };
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.toggle_modal(window, cx, |window, cx| {
+                                ReviewCommentModal::new(
+                                    comments.clone(),
+                                    descriptor.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        })
+                        .ok();
+                }
+            }),
         ])
         .when(
             !editor.read(cx).buffer().read(cx).all_diff_hunks_expanded(),
@@ -933,6 +978,44 @@ fn render_diff_hunk_controls(
 }
 
 struct AgentDiffAddon;
+
+/// The file the hunk's start belongs to, for labelling a review comment.
+fn hunk_file_path(
+    editor: &Entity<Editor>,
+    hunk_range: &Range<editor::Anchor>,
+    cx: &App,
+) -> Option<String> {
+    let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+    let (buffer_snapshot, _offset) = snapshot.point_to_buffer_offset(hunk_range.start)?;
+    Some(buffer_snapshot.file()?.path().to_string())
+}
+
+/// Build a persistable anchor for a hunk, mapped from multibuffer coordinates
+/// into the underlying file so it can be relocated after a reload.
+fn hunk_anchor_descriptor(
+    editor: &Entity<Editor>,
+    hunk_range: Range<editor::Anchor>,
+    cx: &App,
+) -> Option<AnchorDescriptor> {
+    let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+    let (buffer_snapshot, buffer_offset) = snapshot.point_to_buffer_offset(hunk_range.start)?;
+    let file_path = buffer_snapshot.file()?.path().to_string();
+
+    let start_in_buffer = buffer_offset.0;
+    let hunk_len = hunk_range
+        .end
+        .to_offset(&snapshot)
+        .0
+        .saturating_sub(hunk_range.start.to_offset(&snapshot).0);
+    let end_in_buffer = (start_in_buffer + hunk_len).min(buffer_snapshot.len());
+
+    let buffer_text = buffer_snapshot.text();
+    Some(AnchorDescriptor::from_text(
+        file_path,
+        &buffer_text,
+        start_in_buffer..end_in_buffer,
+    ))
+}
 
 impl editor::Addon for AgentDiffAddon {
     fn to_any(&self) -> &dyn std::any::Any {
@@ -1604,9 +1687,14 @@ impl AgentDiff {
                     .insert(weak_editor.clone(), reviewing_state.clone());
 
                 if previous_state.is_none() {
+                    let comments = ReviewComments::new(thread.read(cx).session_id().clone(), cx);
                     editor.update(cx, |editor, cx| {
                         editor.set_diff_hunk_renderer(
-                            Some(agent_diff_renderer(&thread, workspace.clone())),
+                            Some(agent_diff_renderer(
+                                &thread,
+                                workspace.clone(),
+                                comments.clone(),
+                            )),
                             cx,
                         );
                         editor.set_expand_all_diff_hunks(cx);
