@@ -1,4 +1,4 @@
-use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
+use acp_thread::{AgentModelId, SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use gpui::{App, SharedString, Task};
@@ -44,6 +44,11 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
+    /// Optional model override. Pass the exact `models[].id` returned for the
+    /// native Zed agent (`is_native: true`) by `list_agents_and_models`.
+    /// Omit to preserve default behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
@@ -161,11 +166,22 @@ impl AgentTool for SpawnAgentTool {
                     session_info: None,
                 })?;
 
+            let SpawnAgentToolInput {
+                label,
+                message,
+                session_id,
+                model,
+            } = input;
             let (subagent, mut session_info) = cx.update(|cx| {
-                let subagent = if let Some(session_id) = input.session_id {
-                    self.environment.resume_subagent(session_id, cx)
-                } else {
-                    self.environment.create_subagent(input.label, cx)
+                let subagent = match (session_id, model) {
+                    (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                        "model cannot be changed when resuming a subagent session"
+                    )),
+                    (Some(session_id), None) => self.environment.resume_subagent(session_id, cx),
+                    (None, model) => {
+                        self.environment
+                            .create_subagent(label, model.map(AgentModelId::from), cx)
+                    }
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
@@ -190,7 +206,7 @@ impl AgentTool for SpawnAgentTool {
                 Ok((subagent, session_info))
             })?;
 
-            let send_result = subagent.send(input.message, cx).await;
+            let send_result = subagent.send(message, cx).await;
 
             let status = if send_result.is_ok() {
                 "completed"
