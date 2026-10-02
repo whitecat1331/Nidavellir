@@ -6186,15 +6186,23 @@ impl AcpThread {
         let completion = async move |thread: WeakEntity<Self>, cx: &mut AsyncApp| {
             let response = rx.await;
 
-            // Run the git checkpoint in the background. It only decides whether
-            // to surface the "restore checkpoint" affordance, so awaiting it here
-            // would keep the thread in the "generating" state after the model has
-            // already finished streaming.
-            thread.update(cx, |this, cx| {
-                if this.turn_id == turn_id {
-                    this.update_last_checkpoint(cx).detach();
-                }
-            })?;
+            thread
+                .update(cx, |this, cx| {
+                    if this.turn_id == turn_id {
+                        if this.parent_session_id.is_none() {
+                            // Detach the checkpoint for the agent panel so the turn
+                            // goes idle promptly; subagents await it so the parent's
+                            // send preserves the terminal result.
+                            this.update_last_checkpoint(cx).detach();
+                            Task::ready(Ok(()))
+                        } else {
+                            this.update_last_checkpoint(cx)
+                        }
+                    } else {
+                        Task::ready(Ok(()))
+                    }
+                })?
+                .await?;
 
             thread.update(cx, |this, cx| {
                 if this.turn_id == turn_id && this.parent_session_id.is_none() {
