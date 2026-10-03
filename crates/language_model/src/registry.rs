@@ -477,7 +477,7 @@ impl LanguageModelRegistry {
 
         self.inline_assistant_model
             .clone()
-            .or_else(|| self.default_model.clone())
+            .or_else(|| self.default_model())
     }
 
     pub fn commit_message_model(&self, cx: &App) -> Option<LanguageModel> {
