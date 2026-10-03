@@ -1,5 +1,5 @@
 use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 use streaming_diff::StreamingDiff;
@@ -30,9 +30,9 @@ fn streaming_diff_push_new(criterion: &mut Criterion) {
                     |mut diff| {
                         let mut operation_count = 0;
                         for chunk in chunk_text(&fixture.new_text, CHUNK_SIZE) {
-                            operation_count += black_box(diff.push_new(chunk)).len();
+                            operation_count += std::hint::black_box(diff.push_new(chunk)).len();
                         }
-                        black_box(operation_count);
+                        std::hint::black_box(operation_count);
                     },
                     BatchSize::SmallInput,
                 );
@@ -58,12 +58,12 @@ fn streaming_diff_finish(criterion: &mut Criterion) {
                     || {
                         let mut diff = StreamingDiff::new(fixture.old_text.clone());
                         for chunk in chunk_text(&fixture.new_text, CHUNK_SIZE) {
-                            black_box(diff.push_new(chunk));
+                            std::hint::black_box(diff.push_new(chunk));
                         }
                         diff
                     },
                     |diff| {
-                        black_box(diff.finish());
+                        std::hint::black_box(diff.finish());
                     },
                     BatchSize::SmallInput,
                 );

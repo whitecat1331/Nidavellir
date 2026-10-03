@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use edit_prediction::metrics::compute_kept_rate;
 
 fn repeated_function_lines(line_count: usize) -> String {
@@ -52,10 +52,10 @@ fn kept_rate_benchmark(c: &mut Criterion) {
             &text,
             |bench, text| {
                 bench.iter(|| {
-                    black_box(compute_kept_rate(
-                        black_box(text),
-                        black_box(text),
-                        black_box(text),
+                    std::hint::black_box(compute_kept_rate(
+                        std::hint::black_box(text),
+                        std::hint::black_box(text),
+                        std::hint::black_box(text),
                     ));
                 });
             },
@@ -72,10 +72,10 @@ fn kept_rate_benchmark(c: &mut Criterion) {
             |bench, inputs| {
                 let (base, predicted, final_text) = inputs;
                 bench.iter(|| {
-                    black_box(compute_kept_rate(
-                        black_box(base),
-                        black_box(predicted),
-                        black_box(final_text),
+                    std::hint::black_box(compute_kept_rate(
+                        std::hint::black_box(base),
+                        std::hint::black_box(predicted),
+                        std::hint::black_box(final_text),
                     ));
                 });
             },
@@ -92,10 +92,10 @@ fn kept_rate_benchmark(c: &mut Criterion) {
             |bench, inputs| {
                 let (base, predicted, final_text) = inputs;
                 bench.iter(|| {
-                    black_box(compute_kept_rate(
-                        black_box(base),
-                        black_box(predicted),
-                        black_box(final_text),
+                    std::hint::black_box(compute_kept_rate(
+                        std::hint::black_box(base),
+                        std::hint::black_box(predicted),
+                        std::hint::black_box(final_text),
                     ));
                 });
             },
@@ -112,10 +112,10 @@ fn kept_rate_benchmark(c: &mut Criterion) {
             |bench, inputs| {
                 let (base, predicted, final_text) = inputs;
                 bench.iter(|| {
-                    black_box(compute_kept_rate(
-                        black_box(base),
-                        black_box(predicted),
-                        black_box(final_text),
+                    std::hint::black_box(compute_kept_rate(
+                        std::hint::black_box(base),
+                        std::hint::black_box(predicted),
+                        std::hint::black_box(final_text),
                     ));
                 });
             },

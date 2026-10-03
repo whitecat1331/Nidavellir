@@ -17,7 +17,7 @@ use benchmarks::bench_utils::{
     rust_file_line_count, rust_identifier as identifier,
 };
 use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use editor::{Editor, EditorStyle};
 use futures::{StreamExt as _, pin_mut, task::noop_waker};
@@ -118,7 +118,7 @@ fn edit_file_tool_streaming(c: &mut Criterion) {
                         // to pump the executor to release `Entity<Buffer>` handles captured by
                         // background tasks) runs in criterion's drop phase after the timer has
                         // stopped, rather than inside the timed region.
-                        (black_box(output), harness)
+                        (std::hint::black_box(output), harness)
                     },
                     BatchSize::SmallInput,
                 );

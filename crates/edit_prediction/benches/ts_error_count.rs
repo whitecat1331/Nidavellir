@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use edit_prediction::metrics::count_tree_sitter_errors;
 use fs::FakeFs;
 use gpui::{AppContext as _, TestAppContext};
@@ -439,9 +439,9 @@ fn ts_error_count_benchmark(c: &mut Criterion) {
             case,
             |bench, case| {
                 bench.iter(|| {
-                    black_box(case.bytes);
-                    black_box(case.error_count);
-                    black_box(count_tree_sitter_errors(case.snapshot.syntax_layers()))
+                    std::hint::black_box(case.bytes);
+                    std::hint::black_box(case.error_count);
+                    std::hint::black_box(count_tree_sitter_errors(case.snapshot.syntax_layers()))
                 });
             },
         );

@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use gpui::rgba;
 use language::build_highlight_map;
 use theme::SyntaxTheme;
@@ -131,7 +131,7 @@ fn bench_build_highlight_map(c: &mut Criterion) {
                 BenchmarkId::new(capture_label, theme_label),
                 &(capture_names, &theme),
                 |b, (capture_names, theme)| {
-                    b.iter(|| build_highlight_map(black_box(capture_names), black_box(theme)));
+                    b.iter(|| build_highlight_map(std::hint::black_box(capture_names), std::hint::black_box(theme)));
                 },
             );
         }

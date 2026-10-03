@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use editor::{EditorStyle, MultiBuffer, display_map::*};
 use gpui::{AppContext as _, HighlightStyle, Hsla, TestDispatcher, font, px};
 use itertools::Itertools;
@@ -191,7 +191,7 @@ fn create_highlight_endpoints_benchmark(c: &mut Criterion) {
         &snapshot,
         |bench, snapshot| {
             bench.iter(|| {
-                black_box(snapshot.chunks(
+                std::hint::black_box(snapshot.chunks(
                     DisplayRow(400)..DisplayRow(400 + LINE_VIEW_PORT_COUNT as u32),
                     language::LanguageAwareStyling {
                         tree_sitter: false,
@@ -271,9 +271,9 @@ fn highlighted_chunks_benchmark(c: &mut Criterion) {
                         &editor_style,
                     );
                     for chunk in chunks {
-                        total_len += black_box(chunk.text).len();
+                        total_len += std::hint::black_box(chunk.text).len();
                     }
-                    black_box(total_len);
+                    std::hint::black_box(total_len);
                 });
             },
         );
