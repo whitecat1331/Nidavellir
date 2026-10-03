@@ -1282,7 +1282,7 @@ mod tests {
     use http_client::http::{HeaderMap, StatusCode};
     use language_model::{
         LanguageModelCompletionError, LanguageModelRequestMessage, MessageContent,
-        ProviderErrorCategory, Role, Speed,
+        ProviderErrorCategory, Role, Speed, StopReason,
     };
     use serde_json::json;
     use std::sync::Mutex;
