@@ -17,7 +17,7 @@ use agent_client_protocol::schema::{
     v2 as acp_v2,
 };
 use agent_client_protocol::{
-    Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, Handled, JsonRpcMessage,
+    Agent, Client, ConnectionTo, HandleDispatchFrom, Handled, JsonRpcMessage,
     JsonRpcResponse, Lines, Responder, UntypedMessage, V2Builder, V2ConnectionTo,
 };
 use anyhow::anyhow;
