@@ -22,6 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.1
+          components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all -- --check
       - name: Keymaps
@@ -41,6 +45,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.1
+          components: rustfmt, clippy
           targets: wasm32-wasip2, wasm32-unknown-unknown, x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Clippy
@@ -54,6 +61,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.1
+          components: rustfmt, clippy
           targets: wasm32-wasip2, wasm32-unknown-unknown, x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: cargo check
@@ -71,6 +81,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.1
+          components: rustfmt, clippy
           targets: wasm32-wasip2, wasm32-unknown-unknown, x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Crate tests
@@ -84,6 +97,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.1
+          components: rustfmt, clippy
           targets: wasm32-wasip2, wasm32-unknown-unknown, x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: cargo test --no-run
