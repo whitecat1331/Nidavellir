@@ -5818,7 +5818,7 @@ impl AgentPanel {
         self.spawn_initial_terminal(terminal_id, working_directory, source, window, cx);
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     fn spawn_initial_terminal(
         &mut self,
         terminal_id: TerminalId,
@@ -5842,7 +5842,7 @@ impl AgentPanel {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn spawn_initial_terminal(
         &mut self,
         terminal_id: TerminalId,
