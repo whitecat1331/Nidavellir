@@ -55,7 +55,7 @@ use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
-const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 async fn exited_load_error_after_drain(
     status: ExitStatus,
