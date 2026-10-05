@@ -2,6 +2,7 @@ mod apply_code_action_tool;
 mod ask_user_tool;
 mod browser_tool;
 mod context_server_registry;
+mod container_tool;
 mod copy_path_tool;
 mod create_directory_tool;
 mod create_thread_tool;
@@ -79,6 +80,7 @@ pub use apply_code_action_tool::*;
 pub use ask_user_tool::*;
 pub use browser_tool::*;
 pub use context_server_registry::*;
+pub use container_tool::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
 pub use create_thread_tool::*;
@@ -209,6 +211,7 @@ macro_rules! tools {
 tools! {
     ApplyCodeActionTool,
     AskUserTool,
+    ContainerTool,
     CopyPathTool,
     CreateDirectoryTool,
     CreateThreadTool,
@@ -292,10 +295,13 @@ mod tests {
     fn fetch_and_terminal_are_forbidden_in_restricted_mode() {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(ContainerTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
-            let expected = *name != FetchTool::NAME && *name != TerminalTool::NAME;
+            let expected = *name != FetchTool::NAME
+                && *name != TerminalTool::NAME
+                && *name != ContainerTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

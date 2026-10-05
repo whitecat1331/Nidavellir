@@ -1413,6 +1413,9 @@ mod tests {
             // Interactive prompt: always asks the user via prompt_for_decision,
             // so it has no settings-driven permission rules.
             "ask_user",
+            // Self-contained confirm gate: mutating ops require confirm:true in the
+            // tool input, not a settings-driven permission rule.
+            "container",
             "diagnostics",
             "find_path",
             "find_references",
@@ -1434,6 +1437,8 @@ mod tests {
             // Sibling/subagent thread creation delegates permission checks to
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
+            // Reads past agent threads; read-only, no permission checks.
+            "thread_search",
             "spawn_agent",
         ];
 

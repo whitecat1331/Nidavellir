@@ -1,4 +1,5 @@
 pub mod automations;
+mod containers;
 mod db;
 mod legacy_thread;
 mod memory;
