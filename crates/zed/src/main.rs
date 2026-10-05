@@ -724,7 +724,13 @@ fn main() {
             false,
             cx,
         );
-        automations::init(cx);
+        automations::init(
+            cx,
+            app_state.fs.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+        );
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);

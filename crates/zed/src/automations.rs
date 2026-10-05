@@ -1,13 +1,30 @@
-use std::time::Duration as StdDuration;
+use std::{rc::Rc, str::FromStr, sync::Arc, time::Duration as StdDuration};
 
+use acp_thread::AgentConnection;
 use agent::automations::{Automation, AutomationsStore, Schedule};
+use agent::{NativeAgent, NativeAgentConnection, Templates, ThreadStore};
+use agent_client_protocol::schema::v1 as acp;
+use anyhow::{Context as _, Result};
 use chrono::Utc;
-use gpui::App;
+use client::{Client, UserStore};
+use fs::Fs;
+use gpui::{App, AsyncApp, Entity};
+use language::LanguageRegistry;
+use language_model::{LanguageModelRegistry, SelectedModel};
+use node_runtime::NodeRuntime;
+use project::Project;
+use util::path_list::PathList;
 
 /// Arms the persisted automation schedule for the lifetime of the app. Each
-/// enabled automation fires on its interval, dispatching the Phase 7 headless
-/// runner (`eval-cli`) and recording the run.
-pub fn init(cx: &mut App) {
+/// enabled automation fires on its interval, running the prompt in-process
+/// through the native agent and recording the run.
+pub fn init(
+    cx: &mut App,
+    fs: Arc<dyn Fs>,
+    node_runtime: NodeRuntime,
+    user_store: Entity<UserStore>,
+    languages: Arc<LanguageRegistry>,
+) {
     let entries = match AutomationsStore::load(AutomationsStore::default_path()) {
         Ok(store) => store
             .automations()
@@ -23,12 +40,25 @@ pub fn init(cx: &mut App) {
     };
 
     for entry in entries {
-        cx.spawn(async move |cx| run_on_schedule(entry, cx).await)
-            .detach();
+        let fs = fs.clone();
+        let node_runtime = node_runtime.clone();
+        let user_store = user_store.clone();
+        let languages = languages.clone();
+        cx.spawn(async move |cx| {
+            run_on_schedule(entry, fs, node_runtime, user_store, languages, cx).await;
+        })
+        .detach();
     }
 }
 
-async fn run_on_schedule(mut entry: Automation, cx: &mut gpui::AsyncApp) {
+async fn run_on_schedule(
+    mut entry: Automation,
+    fs: Arc<dyn Fs>,
+    node_runtime: NodeRuntime,
+    user_store: Entity<UserStore>,
+    languages: Arc<LanguageRegistry>,
+    cx: &mut AsyncApp,
+) {
     loop {
         let Some(delay) = next_delay(&entry) else {
             log::warn!(
@@ -43,7 +73,19 @@ async fn run_on_schedule(mut entry: Automation, cx: &mut gpui::AsyncApp) {
 
         let started = Utc::now();
         log::info!("[AUTOMATION] {} firing: {}", entry.id, entry.prompt);
-        dispatch(&entry).await;
+        match run_prompt(
+            &entry,
+            fs.clone(),
+            node_runtime.clone(),
+            user_store.clone(),
+            languages.clone(),
+            cx,
+        )
+        .await
+        {
+            Ok(answer) => log::info!("[AUTOMATION] {} completed: {}", entry.id, answer.trim()),
+            Err(error) => log::error!("[AUTOMATION] {} failed: {error:#}", entry.id),
+        }
 
         entry.last_run = Some(started);
         record_run(&entry.id, started);
@@ -57,49 +99,107 @@ fn next_delay(entry: &Automation) -> Option<StdDuration> {
     (due - now).to_std().ok()
 }
 
-async fn dispatch(entry: &Automation) {
-    let result = smol::process::Command::new(eval_cli_command())
-        .arg("--prompt")
-        .arg(&entry.prompt)
-        .arg("--model")
-        .arg(&entry.model)
-        .arg("--print-response")
-        .output()
-        .await;
+async fn run_prompt(
+    entry: &Automation,
+    fs: Arc<dyn Fs>,
+    node_runtime: NodeRuntime,
+    user_store: Entity<UserStore>,
+    languages: Arc<LanguageRegistry>,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    // Best-effort model selection; fall back to the current default on error.
+    if let Ok(selected) = SelectedModel::from_str(&entry.model) {
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.select_default_model(Some(&selected), cx);
+            });
+        });
+    }
 
-    match result {
-        Ok(output) if output.status.success() => {
-            log::info!(
-                "[AUTOMATION] {} completed: {}",
-                entry.id,
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
+    let workdir = paths::home_dir().clone();
+
+    let project = cx.update(|cx| {
+        Project::local(
+            Client::global(cx),
+            node_runtime,
+            user_store,
+            languages,
+            fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    project
+        .update(cx, |project, cx| project.create_worktree(&workdir, true, cx))
+        .await
+        .context("creating worktree")?;
+
+    let thread_store = cx.update(|cx| ThreadStore::global(cx));
+    let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[workdir]), cx)
+        })
+        .await
+        .context("creating agent session")?;
+
+    let message = vec![acp::ContentBlock::Text(acp::TextContent::new(
+        entry.prompt.clone(),
+    ))];
+    let submission = acp_thread.update(cx, |thread, cx| thread.send(message, cx));
+    let response = submission.await.context("running prompt")?;
+
+    match response {
+        Some(acp_thread::SubmissionResponse::LegacyCompleted(_)) => {
+            Ok(final_response_text(&acp_thread, cx).unwrap_or_default())
         }
-        Ok(output) => {
-            log::error!(
-                "[AUTOMATION] {} exited {}: {}",
-                entry.id,
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        Some(acp_thread::SubmissionResponse::Accepted(_)) => {
+            anyhow::bail!("native agent returned acceptance instead of turn completion")
         }
-        Err(error) => log::error!("[AUTOMATION] {} failed to dispatch: {error}", entry.id),
+        None => Ok(String::new()),
     }
 }
 
-/// Resolves the `eval-cli` binary: the sibling next to this executable first,
-/// then the bare command (PATH).
-fn eval_cli_command() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let name = if cfg!(windows) { "eval-cli.exe" } else { "eval-cli" };
-            let candidate = dir.join(name);
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
+fn final_response_text(
+    acp_thread: &Entity<acp_thread::AcpThread>,
+    cx: &mut AsyncApp,
+) -> Option<String> {
+    cx.update(|cx| {
+        let entries = acp_thread.read(cx).entries();
+        let mut chunks: Vec<String> = Vec::new();
+        for entry in entries.iter().rev() {
+            let acp_thread::AgentThreadEntry::AssistantMessage(message) = entry else {
+                continue;
+            };
+            for chunk in &message.chunks {
+                if let acp_thread::AssistantMessageChunk::Message { block, .. } = chunk {
+                    for markdown in block.markdowns() {
+                        let text = markdown.read(cx).source().to_string();
+                        if !text.is_empty() {
+                            chunks.push(text);
+                        }
+                    }
+                }
+            }
+            if !chunks.is_empty() {
+                break;
             }
         }
-    }
-    "eval-cli".to_string()
+        if chunks.is_empty() {
+            None
+        } else {
+            Some(chunks.join(""))
+        }
+    })
 }
 
 fn record_run(id: &str, at: chrono::DateTime<Utc>) {
