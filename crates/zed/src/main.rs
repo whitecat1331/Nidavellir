@@ -1,6 +1,7 @@
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod automations;
 mod reliability;
 mod zed;
 
@@ -723,6 +724,7 @@ fn main() {
             false,
             cx,
         );
+        automations::init(cx);
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);
