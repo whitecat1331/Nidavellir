@@ -2303,7 +2303,7 @@ impl Thread {
 
         self.add_tool(ThreadSearchTool);
 
-        self.add_tool(WaitForReportTool);
+        self.add_tool(WaitForReportTool::new(self.project.clone()));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -2746,12 +2746,25 @@ impl Thread {
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
 
-        let compaction = self.forced_compaction_target_ix().map(|request_end_ix| {
-            self.advance_prompt_id();
-            let request = self.build_compaction_request(request_end_ix, &model, cx);
-            self.current_request_token_usage = TokenUsage::default();
-            (model.clone(), request)
-        });
+        let compaction = match self.forced_compaction_target_ix() {
+            Some(request_end_ix) => {
+                self.advance_prompt_id();
+                // A thread whose retained history can't be summarized within
+                // the model's context window is unrecoverable in a single pass,
+                // so fail with an actionable error rather than emitting a
+                // request the provider will reject (or one that summarizes
+                // nothing).
+                let Some(request) = self.build_compaction_request(request_end_ix, &model, cx)
+                else {
+                    return Err(anyhow!(
+                        "Thread is too large to summarize. Truncate older messages or start a new thread, then retry."
+                    ));
+                };
+                self.current_request_token_usage = TokenUsage::default();
+                Some((model.clone(), request))
+            }
+            None => None,
+        };
 
         if compaction.is_some() {
             self.pending_compaction_telemetry =
@@ -3323,7 +3336,7 @@ impl Thread {
         let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
             let insertion_ix = this.compaction_message_target_ix(cx)?;
             let model = this.compaction_model(cx)?;
-            let request = this.build_compaction_request(insertion_ix, &model, cx);
+            let request = this.build_compaction_request(insertion_ix, &model, cx)?;
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
@@ -4699,12 +4712,17 @@ impl Thread {
             .or_else(|| self.model().cloned())
     }
 
+    /// Builds a compaction request bounded to the model's input capacity.
+    ///
+    /// Returns `None` when the retained history is so large that, even after
+    /// trimming, no history can be included within the window. Callers should
+    /// surface an actionable error instead of sending a meaningless request.
     fn build_compaction_request(
         &self,
         insertion_ix: usize,
         model: &LanguageModel,
         cx: &App,
-    ) -> LanguageModelRequest {
+    ) -> Option<LanguageModelRequest> {
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_id: Some(self.prompt_id.to_string()),
@@ -4721,7 +4739,23 @@ impl Thread {
             reasoning_details: None,
         });
 
-        request
+        // Bound the request to the model's input ceiling so compaction can
+        // never be rejected for exceeding the context window, even when the
+        // retained history is larger than the window itself.
+        let history_count = request.messages.len().saturating_sub(2);
+        let capacity = compaction_input_capacity(
+            model.max_input_tokens(),
+            model.max_total_tokens(),
+            model.max_output_tokens(),
+        );
+        let (messages, retained_history) =
+            bound_request_messages_to_token_budget(request.messages, capacity);
+        request.messages = messages;
+        if history_count > 0 && retained_history == 0 {
+            return None;
+        }
+
+        Some(request)
     }
 
     pub fn to_markdown(&self) -> String {
@@ -4992,6 +5026,205 @@ fn take_text_within_byte_budget(text: String, remaining_bytes: &mut usize) -> Op
     let text = text[..end].to_string();
 
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// Heuristic bytes-per-token ratio used to bound compaction requests, matching
+/// `COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET`.
+const COMPACTION_BYTES_PER_TOKEN: u64 = 4;
+
+fn request_message_token_count(message: &LanguageModelRequestMessage) -> u64 {
+    let bytes = request_message_byte_len(message) as u64;
+    if bytes == 0 {
+        0
+    } else {
+        // Round up so any non-empty message costs at least one token.
+        bytes.saturating_add(COMPACTION_BYTES_PER_TOKEN - 1) / COMPACTION_BYTES_PER_TOKEN
+    }
+}
+
+fn request_message_byte_len(message: &LanguageModelRequestMessage) -> usize {
+    message.content.iter().map(message_content_byte_len).sum()
+}
+
+fn message_content_byte_len(content: &MessageContent) -> usize {
+    match content {
+        MessageContent::Text(text) => text.len(),
+        MessageContent::Thinking { text, signature } => {
+            text.len() + signature.as_ref().map_or(0, |signature| signature.len())
+        }
+        MessageContent::RedactedThinking(text) => text.len(),
+        MessageContent::Image(image) => image.len(),
+        MessageContent::ToolUse(tool_use) => tool_use.name.len() + tool_use.raw_input.len(),
+        MessageContent::ToolResult(tool_result) => {
+            tool_result.tool_name.len()
+                + tool_result
+                    .content
+                    .iter()
+                    .map(|part| match part {
+                        LanguageModelToolResultContent::Text(text) => text.len(),
+                        LanguageModelToolResultContent::Image(image) => image.len(),
+                    })
+                    .sum::<usize>()
+                + tool_result
+                    .output
+                    .as_ref()
+                    .map_or(0, |output| output.to_string().len())
+        }
+        MessageContent::Compaction(compaction) => match compaction {
+            language_model::CompactedContext::Summary {
+                content,
+                provider_state,
+            } => {
+                content.len()
+                    + provider_state
+                        .as_ref()
+                        .map_or(0, |state| state.format().len() + state.payload().len())
+            }
+            language_model::CompactedContext::ProviderState(state) => {
+                state.format().len() + state.payload().len()
+            }
+        },
+    }
+}
+
+/// Truncates a request message so its content fits within `byte_budget`,
+/// keeping a prefix of each text part. Returns `None` when nothing can be kept.
+fn truncate_request_message_to_byte_budget(
+    mut message: LanguageModelRequestMessage,
+    byte_budget: usize,
+) -> Option<LanguageModelRequestMessage> {
+    let mut remaining_bytes = byte_budget;
+    let mut content = Vec::with_capacity(message.content.len());
+
+    for item in message.content {
+        let whole_len = message_content_byte_len(&item);
+        match item {
+            MessageContent::Text(text) => {
+                if let Some(text) = take_text_within_byte_budget(text, &mut remaining_bytes) {
+                    content.push(MessageContent::Text(text));
+                }
+            }
+            MessageContent::Thinking { text, signature } => {
+                if let Some(text) = take_text_within_byte_budget(text, &mut remaining_bytes) {
+                    content.push(MessageContent::Thinking { text, signature });
+                }
+            }
+            MessageContent::RedactedThinking(text) => {
+                if let Some(text) = take_text_within_byte_budget(text, &mut remaining_bytes) {
+                    content.push(MessageContent::RedactedThinking(text));
+                }
+            }
+            MessageContent::Image(image) => {
+                if whole_len <= remaining_bytes {
+                    remaining_bytes -= whole_len;
+                    content.push(MessageContent::Image(image));
+                }
+            }
+            MessageContent::ToolUse(tool_use) => {
+                if whole_len <= remaining_bytes {
+                    remaining_bytes -= whole_len;
+                    content.push(MessageContent::ToolUse(tool_use));
+                }
+            }
+            MessageContent::ToolResult(mut tool_result) => {
+                let mut kept_parts = Vec::with_capacity(tool_result.content.len());
+                for part in tool_result.content {
+                    match part {
+                        LanguageModelToolResultContent::Text(text) => {
+                            if let Some(text) =
+                                take_text_within_byte_budget(text.to_string(), &mut remaining_bytes)
+                            {
+                                kept_parts.push(LanguageModelToolResultContent::Text(text.into()));
+                            }
+                        }
+                        LanguageModelToolResultContent::Image(image) => {
+                            let byte_len = image.len();
+                            if let Some(bytes) = remaining_bytes.checked_sub(byte_len) {
+                                remaining_bytes = bytes;
+                                kept_parts.push(LanguageModelToolResultContent::Image(image));
+                            }
+                        }
+                    }
+                }
+                // A tool result with no retained content is meaningless (and
+                // providers reject empty results), so drop it. The `output`
+                // field is debugging state and would otherwise eat the budget.
+                if kept_parts.is_empty() {
+                    continue;
+                }
+                tool_result.content = kept_parts;
+                tool_result.output = None;
+                content.push(MessageContent::ToolResult(tool_result));
+            }
+            MessageContent::Compaction(compaction) => {
+                if whole_len <= remaining_bytes {
+                    remaining_bytes -= whole_len;
+                    content.push(MessageContent::Compaction(compaction));
+                }
+            }
+        }
+    }
+
+    if content.is_empty() {
+        None
+    } else {
+        message.content = content;
+        Some(message)
+    }
+}
+
+/// Trims `messages` — a request whose first message is the system prompt and
+/// whose last message is the compaction prompt — so that the estimated token
+/// count fits within `capacity_tokens`, keeping the most recent history.
+///
+/// Returns the trimmed messages and how many history messages were retained.
+fn bound_request_messages_to_token_budget(
+    messages: Vec<LanguageModelRequestMessage>,
+    capacity_tokens: u64,
+) -> (Vec<LanguageModelRequestMessage>, usize) {
+    if messages.len() <= 2 {
+        return (messages, 0);
+    }
+
+    let mut messages = messages;
+    let system = messages.remove(0);
+    let prompt = messages.pop().unwrap();
+    let history = messages;
+
+    let fixed_tokens =
+        request_message_token_count(&system).saturating_add(request_message_token_count(&prompt));
+    let mut budget = capacity_tokens.saturating_sub(fixed_tokens);
+
+    // Walk the history newest-first, keeping each message that fits and
+    // truncating the first oversized one. Anything older is dropped.
+    let mut kept_rev = Vec::new();
+    for message in history.into_iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        let message_tokens = request_message_token_count(&message);
+        if message_tokens <= budget {
+            budget -= message_tokens;
+            kept_rev.push(message);
+        } else if let Some(truncated) = truncate_request_message_to_byte_budget(
+            message,
+            budget.saturating_mul(COMPACTION_BYTES_PER_TOKEN) as usize,
+        ) {
+            budget = 0;
+            kept_rev.push(truncated);
+        } else {
+            break;
+        }
+    }
+
+    let retained_history = kept_rev.len();
+    kept_rev.reverse();
+
+    let mut trimmed = Vec::with_capacity(kept_rev.len() + 2);
+    trimmed.push(system);
+    trimmed.extend(kept_rev);
+    trimmed.push(prompt);
+    (trimmed, retained_history)
 }
 
 /// Describes where a streamed compaction summary should land in the thread
@@ -7844,6 +8077,91 @@ mod tests {
                 assert_eq!(thread.messages.len(), 2);
                 assert!(matches!(&*thread.messages[0], Message::User(_)));
                 assert!(matches!(&*thread.messages[1], Message::Agent(_)));
+            });
+        });
+    }
+
+    /// A compaction request must never exceed the model's input capacity, even
+    /// when the retained history is far larger than the context window. Older
+    /// history is trimmed, while the most recent turn is kept intact.
+    #[gpui::test]
+    async fn test_compaction_request_is_bounded_to_input_capacity(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 10_000;
+            model.max_input_tokens = 10_000;
+            model.max_output_tokens = None;
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                // Two oversized assistant replies that must be trimmed/dropped
+                // to make the request fit, plus a recent turn that must survive.
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "old task"));
+                thread
+                    .messages
+                    .push(agent_text_message(&"old output".repeat(10_000)));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "recent task"));
+                thread
+                    .messages
+                    .push(agent_text_message("recent answer"));
+
+                let request = thread
+                    .build_compaction_request(thread.messages.len(), &model, cx)
+                    .expect("a bounded request should be buildable");
+                let estimated_tokens: u64 = request
+                    .messages
+                    .iter()
+                    .map(request_message_token_count)
+                    .sum();
+                assert!(
+                    estimated_tokens <= 10_000,
+                    "compaction request estimated {estimated_tokens} tokens, over the 10_000 capacity"
+                );
+
+                let texts = request_texts_after_system(&request.messages);
+                assert!(
+                    texts.iter().any(|text| text.contains("recent task")),
+                    "the most recent user turn must be retained"
+                );
+                assert!(
+                    texts.iter().any(|text| text.contains("recent answer")),
+                    "the most recent assistant reply must be retained"
+                );
+            });
+        });
+    }
+
+    /// When the window can't even hold the system and compaction prompts, a
+    /// manual `/compact` fails with an actionable error instead of emitting a
+    /// request that would be rejected or that summarizes nothing.
+    #[gpui::test]
+    async fn test_manual_compact_errors_when_thread_cannot_be_summarized(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 32;
+            model.max_input_tokens = 32;
+            model.max_output_tokens = None;
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "some history",
+                ));
+
+                let result = thread.compact(ClientUserMessageId::new(), cx);
+                assert!(
+                    result.is_err(),
+                    "oversized thread should fail with an actionable error"
+                );
             });
         });
     }
