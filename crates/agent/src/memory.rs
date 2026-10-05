@@ -142,7 +142,7 @@ impl MemoryStore {
 
 /// Writes `contents` to `path` via a temp file in the same directory followed
 /// by an atomic rename, so readers never observe a partially-written file.
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
