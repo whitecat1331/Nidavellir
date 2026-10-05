@@ -74,7 +74,7 @@ struct Args {
     workdir: PathBuf,
 
     /// Instruction/prompt text. If omitted, read from stdin.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, visible_alias = "prompt", allow_hyphen_values = true)]
     instruction: Option<String>,
 
     /// File containing additional instruction text appended after the task prompt.
@@ -105,6 +105,10 @@ struct Args {
     /// Enable or disable extended thinking. Defaults to model auto-detection if omitted.
     #[arg(long)]
     thinking: Option<bool>,
+
+    /// Print the agent's final response text to stdout on completion.
+    #[arg(long)]
+    print_response: bool,
 }
 
 enum AgentOutcome {
@@ -225,6 +229,7 @@ fn main() {
         let timeout = args.timeout;
         let thinking_override = args.thinking;
         let reasoning_effort = args.reasoning_effort.clone();
+        let print_response = args.print_response;
 
         cx.spawn(async move |cx| {
             // Each settings change below is applied in its own `cx.update` call (rather than
@@ -264,7 +269,7 @@ fn main() {
 
             let start = Instant::now();
 
-            let (outcome, stats) = run_agent(
+            let (outcome, stats, final_response) = run_agent(
                 &app_state,
                 &workdir,
                 &instruction,
@@ -327,6 +332,12 @@ fn main() {
                     eprintln!("[eval-cli] result: {json}");
                 }
                 Err(e) => eprintln!("Error serializing result: {e:#}"),
+            }
+
+            if print_response {
+                if let Some(text) = &final_response {
+                    println!("{text}");
+                }
             }
 
             cx.update(|cx| cx.quit());
@@ -602,14 +613,14 @@ async fn run_agent(
     openai_compatible_providers_json: Option<&str>,
     anthropic_available_models_json: Option<&str>,
     cx: &mut AsyncApp,
-) -> (Result<AgentOutcome>, RunStats) {
+) -> (Result<AgentOutcome>, RunStats, Option<String>) {
     let selected = match SelectedModel::from_str(model_name).map_err(|e| anyhow::anyhow!("{e}")) {
         Ok(selected) => selected,
-        Err(e) => return (Err(e), RunStats::default()),
+        Err(e) => return (Err(e), RunStats::default(), None),
     };
 
     if let Err(e) = wait_for_model(&selected, cx).await {
-        return (Err(e), RunStats::default());
+        return (Err(e), RunStats::default(), None);
     }
 
     let setup_result: Result<()> = cx.update(|cx| {
@@ -728,7 +739,7 @@ async fn run_agent(
     });
 
     if let Err(e) = setup_result {
-        return (Err(e), RunStats::default());
+        return (Err(e), RunStats::default(), None);
     }
 
     let project = cx.update(|cx| {
@@ -750,7 +761,7 @@ async fn run_agent(
     let worktree = project.update(cx, |project, cx| project.create_worktree(workdir, true, cx));
     let worktree = match worktree.await {
         Ok(w) => w,
-        Err(e) => return (Err(e).context("creating worktree"), RunStats::default()),
+        Err(e) => return (Err(e).context("creating worktree"), RunStats::default(), None),
     };
 
     let scan_result = worktree.update(cx, |tree, _cx| {
@@ -760,7 +771,7 @@ async fn run_agent(
     });
     match scan_result {
         Ok(future) => future.await,
-        Err(e) => return (Err(e), RunStats::default()),
+        Err(e) => return (Err(e), RunStats::default(), None),
     };
 
     let output_worktree = match output_dir {
@@ -774,6 +785,7 @@ async fn run_agent(
                     return (
                         Err(e).context("creating output worktree"),
                         RunStats::default(),
+                        None,
                     );
                 }
             }
@@ -789,7 +801,7 @@ async fn run_agent(
         });
         match scan_result {
             Ok(future) => future.await,
-            Err(e) => return (Err(e), RunStats::default()),
+            Err(e) => return (Err(e), RunStats::default(), None),
         };
     }
 
@@ -808,7 +820,7 @@ async fn run_agent(
         .await
     {
         Ok(t) => t,
-        Err(e) => return (Err(e).context("creating ACP session"), RunStats::default()),
+        Err(e) => return (Err(e).context("creating ACP session"), RunStats::default(), None),
     };
 
     let _subscription = cx.subscribe(&acp_thread, |acp_thread, event, cx| {
@@ -941,6 +953,8 @@ async fn run_agent(
         }
     }
 
+    let final_response = final_response_text(&acp_thread, cx);
+
     (
         outcome,
         RunStats {
@@ -949,7 +963,44 @@ async fn run_agent(
             tool_call_count,
             tool_calls,
         },
+        final_response,
     )
+}
+
+/// Returns the text of the final assistant message in the thread, if any.
+/// Mirrors the markdown-source walk in `log_acp_thread_event`, but collects
+/// the complete final response (rather than streaming) so callers can print it.
+fn final_response_text(
+    acp_thread: &Entity<acp_thread::AcpThread>,
+    cx: &mut AsyncApp,
+) -> Option<String> {
+    cx.update(|cx| {
+        let entries = acp_thread.read(cx).entries();
+        let mut chunks: Vec<String> = Vec::new();
+        for entry in entries.iter().rev() {
+            let acp_thread::AgentThreadEntry::AssistantMessage(message) = entry else {
+                continue;
+            };
+            for chunk in &message.chunks {
+                if let acp_thread::AssistantMessageChunk::Message { block, .. } = chunk {
+                    for markdown in block.markdowns() {
+                        let text = markdown.read(cx).source().to_string();
+                        if !text.is_empty() {
+                            chunks.push(text);
+                        }
+                    }
+                }
+            }
+            if !chunks.is_empty() {
+                break;
+            }
+        }
+        if chunks.is_empty() {
+            None
+        } else {
+            Some(chunks.join(""))
+        }
+    })
 }
 
 fn log_acp_thread_event(
