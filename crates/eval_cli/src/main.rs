@@ -565,6 +565,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthesized_settings_json_is_valid() {
+        let settings = synthesized_settings_json(
+            "{}",
+            "deepseek",
+            "deepseek-v4-pro",
+            true,
+            "\"high\"",
+            "",
+        );
+        serde_json::from_str::<serde_json::Value>(&settings)
+            .expect("synthesized settings must be valid JSON");
+    }
+
+    #[test]
     fn anthropic_latest_alias_matches_listed_base_model() {
         assert!(model_id_matches_selected(
             &ANTHROPIC_PROVIDER_ID,
@@ -599,6 +613,37 @@ mod tests {
             &LanguageModelId("claude-sonnet-4-6-latest".into()),
         ));
     }
+}
+
+/// Builds the user-settings JSON `run_agent` applies before creating the
+/// agent session. Kept as a free function so the output can be validated
+/// by a unit test — a stray quote here would be rejected by the settings
+/// migration.
+fn synthesized_settings_json(
+    language_models_settings: &str,
+    provider_id: &str,
+    model_id: &str,
+    enable_thinking: bool,
+    effort: &str,
+    profile_field: &str,
+) -> String {
+    format!(
+        r#"{{
+                    "language_models": {language_models_settings},
+                    "agent": {{
+                        "tool_permissions": {{"default": "allow"}},
+                        "default_model": {{
+                            "provider": "{provider_id}",
+                            "model": "{model_id}",
+                            "enable_thinking": {enable_thinking},
+                            "effort": {effort}
+                        }}{profile_field}
+                    }},
+                    "autosave": "off",
+                    "format_on_save": "off"
+                }}
+                "#
+    )
 }
 
 async fn run_agent(
@@ -714,22 +759,13 @@ async fn run_agent(
             }
         };
         SettingsStore::update_global(cx, |store, cx| {
-            let settings = format!(
-                r#"{{
-                    "language_models": {language_models_settings},
-                    "agent": {{
-                        "tool_permissions": {{"default": "allow"}},
-                        "default_model": {{
-                            "provider": "{provider_id}",
-                            "model": "{model_id}",
-                            "enable_thinking": {enable_thinking},
-                            "effort": {effort}
-                        }}{profile_field}
-                    }},
-                    "autosave": "off",
-                    "format_on_save": "off"
-                }}
-                "#
+            let settings = synthesized_settings_json(
+                &language_models_settings,
+                &provider_id,
+                &model_id,
+                enable_thinking,
+                &effort,
+                &profile_field,
             );
             store.set_user_settings(&settings, cx).result()
         })
