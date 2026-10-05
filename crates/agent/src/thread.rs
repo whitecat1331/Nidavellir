@@ -5,7 +5,7 @@ use crate::{
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
     MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot, ReadFileTool, RenameTool,
     SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ThreadSearchTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
+    ThreadSearchTool, ToolPermissionDecision, WaitForReportTool, WebSearchTool, WriteFileTool,
     decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
@@ -2303,6 +2303,8 @@ impl Thread {
 
         self.add_tool(ThreadSearchTool);
 
+        self.add_tool(WaitForReportTool);
+
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
         let code_action_store: CodeActionStore = cx.new(|_cx| None);
@@ -2991,7 +2993,9 @@ impl Thread {
                                             Some(error_message),
                                         )
                                     })?;
-                                    return Err(retry_error.context("Automatic context compaction failed"));
+                                    return Err(
+                                        retry_error.context("Automatic context compaction failed")
+                                    );
                                 }
                             }
                         }

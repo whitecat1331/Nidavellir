@@ -1424,6 +1424,10 @@ mod tests {
             // Persistent key → value facts in the user data dir; no project or
             // command access, so no permission checks.
             "memory",
+            // Read-only past-thread store access; no project or command access.
+            "thread_search",
+            // Read-only report-file polling; no project or command access.
+            "wait_for_report",
             "open",
             "read_file",
             "rename_symbol",
