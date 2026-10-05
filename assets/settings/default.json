@@ -1266,6 +1266,7 @@
         "tools": {
           "memory": true,
           "thread_search": true,
+          "wait_for_report": true,
           "browser": true,
           "network": true,
           "create_thread": true,
@@ -1293,6 +1294,7 @@
         "tools": {
           "memory": true,
           "thread_search": true,
+          "wait_for_report": true,
           "browser": true,
           "network": true,
           "copy_path": true,
@@ -1326,6 +1328,7 @@
         "tools": {
           "memory": true,
           "thread_search": true,
+          "wait_for_report": true,
           "browser": true,
           "network": true,
           "copy_path": true,
@@ -1361,6 +1364,7 @@
         "tools": {
           "memory": true,
           "thread_search": true,
+          "wait_for_report": true,
           "browser": true,
           "network": true,
           "copy_path": true,
