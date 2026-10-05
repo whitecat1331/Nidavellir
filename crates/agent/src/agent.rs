@@ -1,3 +1,4 @@
+pub mod automations;
 mod db;
 mod legacy_thread;
 mod memory;
