@@ -2303,7 +2303,7 @@ impl Thread {
 
         self.add_tool(ThreadSearchTool);
 
-        self.add_tool(WaitForReportTool);
+        self.add_tool(WaitForReportTool::new(self.project.clone()));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 

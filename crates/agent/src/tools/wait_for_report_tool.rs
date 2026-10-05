@@ -1,11 +1,13 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
-use gpui::{App, AppContext as _, BackgroundExecutor, SharedString, Task};
+use gpui::{App, AppContext, BackgroundExecutor, Entity, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
+use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +24,8 @@ const DEFAULT_POLL_SECONDS: u64 = 10;
 /// continue without a human relaying the result.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WaitForReportToolInput {
-    /// Path to the `VERIFY_*.md` report to wait on.
+    /// Path to the `VERIFY_*.md` report to wait on (absolute, or relative to a
+    /// worktree root).
     pub report_path: String,
     /// Maximum seconds to wait before returning a timeout result. Default 1800.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +51,15 @@ impl From<WaitForReportToolOutput> for LanguageModelToolResultContent {
     }
 }
 
-pub struct WaitForReportTool;
+pub struct WaitForReportTool {
+    project: Entity<Project>,
+}
+
+impl WaitForReportTool {
+    pub fn new(project: Entity<Project>) -> Self {
+        Self { project }
+    }
+}
 
 impl AgentTool for WaitForReportTool {
     type Input = WaitForReportToolInput;
@@ -77,21 +88,41 @@ impl AgentTool for WaitForReportTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
+        let project = self.project.clone();
         let background_executor: BackgroundExecutor = cx.background_executor().clone();
-        cx.background_spawn(async move {
+        cx.spawn(async move |cx| {
             let input = input
                 .recv()
                 .await
                 .map_err(|error| WaitForReportToolOutput::Error {
                     error: format!("Failed to receive wait_for_report tool input: {error}"),
                 })?;
-            wait_for_report(input, &background_executor).await
+            let report_path = resolve_report_path(&project, &input.report_path, cx);
+            wait_for_report(input, report_path, &background_executor).await
         })
     }
 }
 
+/// Resolves the report path to an absolute path. Absolute paths pass through
+/// untouched; relative paths resolve against a worktree root so they are not
+/// interpreted relative to the process working directory.
+fn resolve_report_path<C: AppContext>(project: &Entity<Project>, path: &str, cx: &C) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    project
+        .read_with(cx, |project, cx| {
+            project
+                .find_project_path(path, cx)
+                .and_then(|project_path| project.absolute_path(&project_path, cx))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 async fn wait_for_report(
     input: WaitForReportToolInput,
+    report_path: PathBuf,
     background_executor: &BackgroundExecutor,
 ) -> Result<WaitForReportToolOutput, WaitForReportToolOutput> {
     let timeout = Duration::from_secs(
@@ -111,7 +142,7 @@ async fn wait_for_report(
     loop {
         // The report may not exist yet right after launch; an empty read just
         // keeps the loop waiting until the timeout.
-        let text = std::fs::read_to_string(&input.report_path).unwrap_or_default();
+        let text = std::fs::read_to_string(&report_path).unwrap_or_default();
         let (state, verdict) = parse_state(&text);
 
         if state == "complete" || state == "rejected" {
@@ -126,7 +157,7 @@ async fn wait_for_report(
                     "wait_for_report: TIMEOUT after {}s — no terminal marker in \"{}\". \
                      Escalate with the report below; do not auto-verdict.\n\n{}",
                     timeout.as_secs(),
-                    input.report_path,
+                    report_path.display(),
                     extract_report(&text),
                 ),
             });
