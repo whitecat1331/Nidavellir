@@ -728,7 +728,7 @@ async fn run_agent(
                     }},
                     "autosave": "off",
                     "format_on_save": "off"
-                }}"
+                }}
                 "#
             );
             store.set_user_settings(&settings, cx).result()
