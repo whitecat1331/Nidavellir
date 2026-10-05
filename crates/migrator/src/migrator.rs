@@ -76,7 +76,8 @@ fn run_migrations(text: &str, migrations: &[MigrationType]) -> Result<Option<Str
     let mut current_text = text.to_string();
     let mut result: Option<String> = None;
     let json_indent_size = infer_json_indent_size(&current_text);
-    for migration in migrations.iter() {
+    for (idx, migration) in migrations.iter().enumerate() {
+        eprintln!("[migrator-debug] step {idx}: {} bytes\n{current_text}\n-----", current_text.len());
         let migrated_text = match migration {
             MigrationType::TreeSitter(patterns, query) => migrate(&current_text, patterns, query)?,
             MigrationType::Json(callback) => {
@@ -5737,5 +5738,40 @@ mod tests {
                 .unindent(),
             ),
         );
+    }
+}
+
+
+#[cfg(test)]
+mod eval_cli_repro {
+    use super::migrate_settings;
+
+    #[test]
+    fn reproduce_eval_cli_settings_migration() {
+        let language_models_settings = "{}";
+        let provider_id = "deepseek";
+        let model_id = "deepseek-v4-pro";
+        let enable_thinking = true;
+        let effort = "\"high\"";
+        let profile_field = "";
+        let settings = format!(
+            r#"{{
+                    "language_models": {language_models_settings},
+                    "agent": {{
+                        "tool_permissions": {{"default": "allow"}},
+                        "default_model": {{
+                            "provider": "{provider_id}",
+                            "model": "{model_id}",
+                            "enable_thinking": {enable_thinking},
+                            "effort": {effort}
+                        }}{profile_field}
+                    }},
+                    "autosave": "off",
+                    "format_on_save": "off"
+                }}"#
+        );
+        eprintln!("=== settings ===\n{settings}\n=== end ===");
+        let result = migrate_settings(&settings);
+        eprintln!("=== result ===\n{result:?}");
     }
 }
