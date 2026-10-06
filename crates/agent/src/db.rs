@@ -191,8 +191,100 @@ impl SharedThread {
     }
 }
 
+/// A projection of a [`DbThread`] with the (potentially huge) message bodies
+/// omitted, so it can be serialized cheaply when comparing a thread against the
+/// content last written to the database.
+#[derive(Serialize)]
+struct DbThreadContentProjection<'a> {
+    title: &'a SharedString,
+    updated_at: &'a DateTime<Utc>,
+    detailed_summary: &'a Option<SharedString>,
+    cumulative_token_usage: &'a language_model::TokenUsage,
+    request_token_usage: &'a HashMap<ClientUserMessageId, language_model::TokenUsage>,
+    model: &'a Option<DbLanguageModel>,
+    profile: &'a Option<AgentProfileId>,
+    planning: bool,
+    subagent_context: &'a Option<crate::SubagentContext>,
+    speed: &'a Option<Speed>,
+    thinking_enabled: bool,
+    thinking_effort: &'a Option<String>,
+    draft_prompt: &'a Option<Vec<acp::ContentBlock>>,
+    sandboxed_terminal_temp_dir: &'a Option<PathBuf>,
+    sandbox_grants: &'a DbSandboxGrants,
+    initial_project_snapshot: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ui_scroll_position: Option<&'a SerializedScrollPosition>,
+}
+
 impl DbThread {
     pub const VERSION: &'static str = "0.3.0";
+
+    /// A cheap identity of the content that `save_thread` would persist, used to
+    /// skip re-serializing and re-compressing the whole thread when nothing the
+    /// database stores has changed.
+    ///
+    /// Message bodies participate by `Arc` pointer rather than by value —
+    /// messages are immutable once stored in a thread, so a stable pointer means
+    /// an unchanged body — which keeps this O(message count) in pointer
+    /// comparisons instead of serializing tens of megabytes.
+    ///
+    /// `include_scroll` controls whether the UI scroll offset participates.
+    /// Passing `false` yields the identity of the conversation content alone, so
+    /// a scroll-offset-only change can be told apart from a content change.
+    pub(crate) fn save_fingerprint(
+        &self,
+        folder_paths: &PathList,
+        workspace_id: Option<&str>,
+        include_scroll: bool,
+    ) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.messages.len().hash(&mut hasher);
+        for message in &self.messages {
+            (Arc::as_ptr(message) as usize).hash(&mut hasher);
+        }
+        let serialized_folder_paths = folder_paths.serialize();
+        serialized_folder_paths.paths.hash(&mut hasher);
+        serialized_folder_paths.order.hash(&mut hasher);
+        workspace_id.hash(&mut hasher);
+
+        let projection = DbThreadContentProjection {
+            title: &self.title,
+            updated_at: &self.updated_at,
+            detailed_summary: &self.detailed_summary,
+            cumulative_token_usage: &self.cumulative_token_usage,
+            request_token_usage: &self.request_token_usage,
+            model: &self.model,
+            profile: &self.profile,
+            planning: self.planning,
+            subagent_context: &self.subagent_context,
+            speed: &self.speed,
+            thinking_enabled: self.thinking_enabled,
+            thinking_effort: &self.thinking_effort,
+            draft_prompt: &self.draft_prompt,
+            sandboxed_terminal_temp_dir: &self.sandboxed_terminal_temp_dir,
+            sandbox_grants: &self.sandbox_grants,
+            initial_project_snapshot: self
+                .initial_project_snapshot
+                .as_ref()
+                .map(|snapshot| Arc::as_ptr(snapshot) as usize),
+            ui_scroll_position: include_scroll
+                .then_some(self.ui_scroll_position.as_ref())
+                .flatten(),
+        };
+        match serde_json::to_vec(&projection) {
+            Ok(bytes) => bytes.hash(&mut hasher),
+            Err(error) => {
+                // Projection serialization can't realistically fail; if it does,
+                // fold in a value that forces a real save rather than skipping.
+                log::error!("failed to fingerprint thread content: {error:#}");
+                u64::MAX.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
 
     pub fn to_markdown(&self) -> String {
         crate::messages_to_markdown(&self.messages)
@@ -567,6 +659,10 @@ pub(crate) struct ThreadsDatabase {
     /// hold a write in flight and interleave more save requests with it.
     #[cfg(test)]
     write_gate: Mutex<Option<Shared<futures::channel::oneshot::Receiver<()>>>>,
+    /// Counts completed writes so a test can assert that a redundant save was
+    /// skipped instead of re-serializing the thread.
+    #[cfg(test)]
+    save_writes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct GlobalThreadsDatabase(Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>);
@@ -706,6 +802,8 @@ impl ThreadsDatabase {
             connection: Arc::new(Mutex::new(connection)),
             #[cfg(test)]
             write_gate: Mutex::new(None),
+            #[cfg(test)]
+            save_writes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         Ok(db)
@@ -717,7 +815,7 @@ impl ThreadsDatabase {
         thread: DbThread,
         folder_paths: &PathList,
         workspace_id: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         const COMPRESSION_LEVEL: i32 = 3;
 
         #[derive(Serialize)]
@@ -794,7 +892,7 @@ impl ThreadsDatabase {
         "})?;
         update_dedup((dedup_key, id_for_dedup))?;
 
-        Ok(())
+        Ok(json_data.len())
     }
 
     pub fn list_threads(&self) -> Task<Result<Vec<DbThreadMetadata>>> {
@@ -899,16 +997,20 @@ impl ThreadsDatabase {
         thread: DbThread,
         folder_paths: PathList,
         workspace_id: Option<String>,
-    ) -> Task<Result<()>> {
+    ) -> Task<Result<usize>> {
         let connection = self.connection.clone();
         #[cfg(test)]
         let write_gate = self.write_gate.lock().clone();
+        #[cfg(test)]
+        let save_writes = self.save_writes.clone();
 
         self.executor.spawn(async move {
             #[cfg(test)]
             if let Some(write_gate) = write_gate {
                 write_gate.await.ok();
             }
+            #[cfg(test)]
+            save_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Self::save_thread_sync(&connection, id, thread, &folder_paths, workspace_id)
         })
     }
@@ -916,6 +1018,13 @@ impl ThreadsDatabase {
     #[cfg(test)]
     pub fn set_write_gate(&self, gate: futures::channel::oneshot::Receiver<()>) {
         *self.write_gate.lock() = Some(gate.shared());
+    }
+
+    /// Number of writes that actually ran, so a test can assert a redundant save
+    /// was skipped before it reached the serializer.
+    #[cfg(test)]
+    pub fn save_write_count(&self) -> usize {
+        self.save_writes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
@@ -1696,6 +1805,52 @@ mod tests {
         assert_eq!(
             thread_dedup_key(None, &PathList::default(), &empty.messages),
             None
+        );
+    }
+
+    #[test]
+    fn test_save_fingerprint_tracks_content_not_scroll() {
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let folder_paths = PathList::default();
+
+        let mut thread = make_thread("thread", timestamp);
+        thread.messages.push(user_message("hello"));
+
+        let content = thread.save_fingerprint(&folder_paths, None, false);
+        let full = thread.save_fingerprint(&folder_paths, None, true);
+        assert_eq!(content, full, "no scroll offset: both identities agree");
+
+        // Moving only the scroll offset changes the full identity but not the
+        // content identity, so a scroll-only save can be skipped on a large
+        // thread.
+        thread.ui_scroll_position = Some(SerializedScrollPosition {
+            item_ix: 3,
+            offset_in_item: 12.5,
+        });
+        assert_eq!(
+            thread.save_fingerprint(&folder_paths, None, false),
+            content,
+            "the content identity must ignore the scroll offset",
+        );
+        assert_ne!(
+            thread.save_fingerprint(&folder_paths, None, true),
+            full,
+            "the full identity must include the scroll offset",
+        );
+
+        // A new message changes the content identity.
+        thread.messages.push(user_message("world"));
+        assert_ne!(
+            thread.save_fingerprint(&folder_paths, None, false),
+            content,
+            "adding a message must change the content identity",
+        );
+
+        // The workspace identity participates too.
+        assert_ne!(
+            thread.save_fingerprint(&folder_paths, Some("ws-1"), false),
+            thread.save_fingerprint(&folder_paths, None, false),
+            "the workspace identity must participate",
         );
     }
 

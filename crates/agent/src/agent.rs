@@ -87,6 +87,13 @@ const MAXIMUM_RETRY_JITTER_FRACTION: f64 = 0.1;
 const THREAD_LOAD_RETRY_ATTEMPTS: usize = 40;
 const THREAD_LOAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// Threads whose serialized JSON exceeds this size will not pay a full
+/// re-serialize + compress just to persist a changed UI scroll offset. The
+/// offset rides along with the next content change (or the release/quit flush)
+/// instead, so scrolling a very large thread can't repeatedly pay its
+/// whole-size persistence cost.
+const LARGE_THREAD_SCROLL_SKIP_BYTES: usize = 1024 * 1024;
+
 pub(crate) fn jitter_retry_delay(delay: Duration) -> Duration {
     let jitter = delay.mul_f64(rand::rng().random_range(0.0..MAXIMUM_RETRY_JITTER_FRACTION));
     delay.checked_add(jitter).unwrap_or(Duration::MAX)
@@ -234,6 +241,23 @@ struct PendingThreadSave {
     folder_paths: PathList,
     workspace_id: Option<String>,
     db_thread: Task<DbThread>,
+    /// Set when the thread is being released, so a scroll-offset-only change is
+    /// still written even on a large thread. A release happens once, unlike the
+    /// throttled scroll notifies this skip exists to avoid.
+    force: bool,
+}
+
+/// The content identity and size of the thread most recently written to the
+/// database, used to skip a redundant whole-thread serialize + compress.
+#[derive(Clone, Copy)]
+struct SavedThreadFingerprint {
+    /// Identity of the full persisted thread, including the UI scroll offset.
+    full: u64,
+    /// Identity of the conversation content alone (scroll offset excluded).
+    content: u64,
+    /// Length of the serialized JSON written by the last save; a proxy for how
+    /// expensive the next serialize would be.
+    serialized_bytes: usize,
 }
 
 /// Holds both the internal Thread and the AcpThread for a session
@@ -903,6 +927,7 @@ impl NativeAgent {
 
         let (save_wake, save_wake_rx) = watch::channel(());
         let pending_save: Arc<Mutex<Option<PendingThreadSave>>> = Arc::new(Mutex::new(None));
+        let last_saved: Arc<Mutex<Option<SavedThreadFingerprint>>> = Arc::new(Mutex::new(None));
         let database_future = ThreadsDatabase::connect(cx);
         let thread_store = self.thread_store.clone();
         let save_worker = cx.spawn({
@@ -913,6 +938,7 @@ impl NativeAgent {
                     session_id,
                     save_wake_rx,
                     pending_save,
+                    last_saved,
                     database_future,
                     thread_store,
                     cx,
@@ -1847,7 +1873,7 @@ impl NativeAgent {
             return;
         }
 
-        self.enqueue_save(session_id, draft_prompt, cx);
+        self.enqueue_save(session_id, draft_prompt, true, cx);
         let Some(session) = self.sessions.remove(session_id) else {
             return;
         };
@@ -1888,13 +1914,14 @@ impl NativeAgent {
             return;
         };
         let draft_prompt = session.draft_prompt(cx);
-        self.enqueue_save(&id, draft_prompt, cx);
+        self.enqueue_save(&id, draft_prompt, false, cx);
     }
 
     fn enqueue_save(
         &mut self,
         id: &acp_v1::SessionId,
         draft_prompt: Option<Vec<acp_v1::ContentBlock>>,
+        force: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.sessions.get(id) else {
@@ -1913,6 +1940,7 @@ impl NativeAgent {
             folder_paths,
             workspace_id,
             db_thread,
+            force,
         });
         session.save_wake.send(()).log_err();
     }
@@ -1921,6 +1949,7 @@ impl NativeAgent {
         id: acp_v1::SessionId,
         mut wake: watch::Receiver<()>,
         pending_save: Arc<Mutex<Option<PendingThreadSave>>>,
+        last_saved: Arc<Mutex<Option<SavedThreadFingerprint>>>,
         database_future: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
         thread_store: Entity<ThreadStore>,
         cx: &mut AsyncApp,
@@ -1932,6 +1961,7 @@ impl NativeAgent {
                 folder_paths,
                 workspace_id,
                 db_thread,
+                force,
             }) = payload
                 && let Some(database) = database_future
                     .clone()
@@ -1940,19 +1970,48 @@ impl NativeAgent {
                     .log_err()
             {
                 let db_thread = db_thread.await;
-                match database
-                    .save_thread(id.clone(), db_thread, folder_paths, workspace_id)
-                    .await
-                {
-                    Ok(()) => {
-                        thread_store.update(cx, |store, cx| store.reload(cx));
-                    }
-                    Err(error) => {
-                        // Don't reload after a failed save: the reload issues
-                        // list queries against the same connection, which
-                        // amplifies transient lock contention into the
-                        // multi-hundred-millisecond stalls seen in the UI.
-                        log::error!("Failed to save thread {id}: {error:#}");
+                // A save costs a full serialize + compress of the thread, so
+                // skip it when the persisted content is unchanged (a redundant
+                // notify) or when only the scroll offset moved on a thread large
+                // enough that the re-serialize is the expensive part. The
+                // pending snapshot is dropped, exactly as a coalesced save is.
+                let content_fingerprint =
+                    db_thread.save_fingerprint(&folder_paths, workspace_id.as_deref(), false);
+                let full_fingerprint =
+                    db_thread.save_fingerprint(&folder_paths, workspace_id.as_deref(), true);
+                let previously_saved = *last_saved.lock();
+                let unchanged =
+                    previously_saved.is_some_and(|saved| saved.full == full_fingerprint);
+                let scroll_only = !force
+                    && previously_saved.is_some_and(|saved| {
+                        saved.content == content_fingerprint
+                            && saved.serialized_bytes >= LARGE_THREAD_SCROLL_SKIP_BYTES
+                    });
+
+                if !unchanged && !scroll_only {
+                    match database
+                        .save_thread(id.clone(), db_thread, folder_paths, workspace_id)
+                        .await
+                    {
+                        Ok(serialized_bytes) => {
+                            *last_saved.lock() = Some(SavedThreadFingerprint {
+                                full: full_fingerprint,
+                                content: content_fingerprint,
+                                serialized_bytes,
+                            });
+                            thread_store.update(cx, |store, cx| store.reload(cx));
+                        }
+                        Err(error) => {
+                            // Clear the fingerprint so a later notify retries
+                            // this content instead of skipping it as saved.
+                            *last_saved.lock() = None;
+                            // Don't reload after a failed save: the reload
+                            // issues list queries against the same connection,
+                            // which amplifies transient lock contention into
+                            // the multi-hundred-millisecond stalls seen in the
+                            // UI.
+                            log::error!("Failed to save thread {id}: {error:#}");
+                        }
                     }
                 }
             }
@@ -6154,7 +6213,8 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx)));
+        let subagent_thread =
+            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx)));
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
@@ -7820,6 +7880,88 @@ mod internal_tests {
             db_thread.draft_prompt,
             Some(third_draft),
             "the save worker must persist the latest snapshot of a burst"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unchanged_save_is_skipped(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "b.md": "Lorem"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+        });
+
+        let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+        let send = cx.foreground_executor().spawn(send);
+        cx.run_until_parked();
+        fake.send_last_text(&model, "world");
+        fake.end_last(&model);
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        let writes_after_content = database.save_write_count();
+        assert!(
+            writes_after_content > 0,
+            "the first content save must write"
+        );
+
+        // Re-notify with nothing persisted changed: the worker must skip the
+        // whole-thread serialize + compress.
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(thread.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            database.save_write_count(),
+            writes_after_content,
+            "a save with unchanged content must be skipped",
+        );
+
+        // A real content change must write again.
+        set_draft_and_save(
+            &agent,
+            &acp_thread,
+            &thread,
+            vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                "draft",
+            ))],
+            cx,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            database.save_write_count(),
+            writes_after_content + 1,
+            "a save with changed content must write",
         );
     }
 
