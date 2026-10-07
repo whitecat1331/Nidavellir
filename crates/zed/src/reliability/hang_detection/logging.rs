@@ -42,12 +42,14 @@ impl Reporter {
         task_stats: &[gpui::ThreadTaskStatistics],
         action_stats: &gpui::ActionStatistics,
     ) -> ReportMade {
-        let mut reported_task_hangs = false;
-        reported_task_hangs |= self.report_hanging_foreground(&task_stats);
-        reported_task_hangs |= self.report_hanging_background(&task_stats);
-
-        self.report_hanging_actions(action_stats);
-        reported_task_hangs
+        let mut reported_hangs = false;
+        reported_hangs |= self.report_hanging_foreground(&task_stats);
+        reported_hangs |= self.report_hanging_background(&task_stats);
+        // A long-running action is a foreground stall too, so it must also
+        // produce a task trace. Otherwise a hang that only surfaces as an
+        // action is logged but never captured on disk.
+        reported_hangs |= self.report_hanging_actions(action_stats);
+        reported_hangs
     }
 
     fn hold_report(&self, issue: PerfIssue) -> bool {
@@ -136,7 +138,7 @@ impl Reporter {
         report_made
     }
 
-    fn report_hanging_actions(&mut self, action_stats: &gpui::ActionStatistics) {
+    fn report_hanging_actions(&mut self, action_stats: &gpui::ActionStatistics) -> ReportMade {
         let hangs: Vec<_> = action_stats
             .longest_runtimes(true)
             .filter(|action| action.runtime() > self.report_longer_then)
@@ -144,9 +146,11 @@ impl Reporter {
             .collect();
 
         self.update_reported(hangs.iter().map(|action| PerfIssue::Action(action.name)));
-        if !hangs.is_empty() {
+        let reported = !hangs.is_empty();
+        if reported {
             info!("Action hang detected:\n{}", DisplayActions(hangs));
         }
+        reported
     }
 }
 
@@ -185,5 +189,53 @@ impl<'a> Display for DisplayTasks<'a> {
             writeln!(f)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reporter(report_longer_then: Duration) -> Reporter {
+        Reporter::new(
+            Duration::from_secs(1),
+            report_longer_then,
+            std::thread::current().id(),
+        )
+    }
+
+    fn action_statistics(
+        action: &'static str,
+        started_at: Instant,
+    ) -> gpui::ActionStatistics {
+        let mut statistics = gpui::ActionStatistics::default();
+        statistics.update_running_action(action, started_at);
+        statistics
+    }
+
+    #[test]
+    fn an_action_hang_requests_a_trace() {
+        let mut reporter = reporter(Duration::from_millis(100));
+        let action_stats =
+            action_statistics("dev::HangForeground", Instant::now() - Duration::from_secs(1));
+
+        // Regression: before the hang detector counted action hangs, a hang
+        // that only surfaced as a long-running action returned `false` here, so
+        // the trace was logged but never written to disk.
+        assert!(
+            reporter.check_and_report(&[], &action_stats),
+            "an action that ran longer than the threshold must request a task trace",
+        );
+    }
+
+    #[test]
+    fn a_fast_action_does_not_request_a_trace() {
+        let mut reporter = reporter(Duration::from_secs(10));
+        let action_stats = action_statistics("dev::HangForeground", Instant::now());
+
+        assert!(
+            !reporter.check_and_report(&[], &action_stats),
+            "an action under the threshold must not request a task trace",
+        );
     }
 }
