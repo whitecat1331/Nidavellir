@@ -202,7 +202,7 @@ impl RetryStrategy {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User(UserMessage),
     Agent(AgentMessage),
@@ -210,7 +210,7 @@ pub enum Message {
     Compaction(CompactionInfo),
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CompactionInfo {
     Summary(SharedString),
     ProviderNative {
@@ -239,6 +239,13 @@ impl CompactionInfo {
 
 impl Message {
     pub fn as_agent_message(&self) -> Option<&AgentMessage> {
+        match self {
+            Message::Agent(agent_message) => Some(agent_message),
+            _ => None,
+        }
+    }
+
+    pub fn as_agent_message_mut(&mut self) -> Option<&mut AgentMessage> {
         match self {
             Message::Agent(agent_message) => Some(agent_message),
             _ => None,
@@ -683,6 +690,14 @@ impl AgentMessage {
             cache: false,
             reasoning_details: self.reasoning_details.clone(),
         };
+        // Tool calls are only emitted when this message also carries their
+        // result, and results are emitted only for the calls collected here.
+        // Emitting `tool_results` wholesale (as this once did) let a result whose
+        // call lived in a different message serialize as a `tool` message with no
+        // matching `tool_calls`, which providers such as DeepSeek reject for the
+        // whole request. See `attach_tool_result` for how a result can end up
+        // detached from its call. Results keep completion order.
+        let mut tool_use_ids_with_results: Vec<LanguageModelToolUseId> = Vec::new();
         for chunk in &self.content {
             match chunk {
                 AgentMessageContent::Text(text) => {
@@ -704,7 +719,10 @@ impl AgentMessage {
                     );
                 }
                 AgentMessageContent::ToolUse(tool_use) => {
-                    if self.tool_results.contains_key(&tool_use.id) {
+                    if self.tool_results.contains_key(&tool_use.id)
+                        && !tool_use_ids_with_results.contains(&tool_use.id)
+                    {
+                        tool_use_ids_with_results.push(tool_use.id.clone());
                         assistant_message
                             .content
                             .push(language_model::MessageContent::ToolUse(tool_use.clone()));
@@ -720,7 +738,13 @@ impl AgentMessage {
             reasoning_details: None,
         };
 
-        for tool_result in self.tool_results.values() {
+        // Emit results in the order the tools finished (the map's insertion
+        // order), skipping any result whose call is not present in this message
+        // (see the note above).
+        for (tool_use_id, tool_result) in &self.tool_results {
+            if !tool_use_ids_with_results.contains(tool_use_id) {
+                continue;
+            }
             let mut tool_result = tool_result.clone();
             // Surprisingly, the API fails if we return an empty string here.
             // It thinks we are sending a tool use without a tool result.
@@ -3488,6 +3512,41 @@ impl Thread {
         result
     }
 
+    /// Files `tool_result` under the message that owns its tool call.
+    ///
+    /// `owning_message_ix` is the `messages` index the pending message held when
+    /// the call was recorded. Usually that message is still pending, but a tool
+    /// can finish after its message was already flushed (for example, a
+    /// cancel-blind tool that keeps running after the turn ended); its result
+    /// must still land on the owning message — replacing the
+    /// "Tool canceled by user" placeholder `flush_pending_message` wrote —
+    /// rather than the now-current pending message, which would orphan the
+    /// result from its call.
+    ///
+    /// Returns `true` when an already-flushed message was mutated, so the caller
+    /// can persist the change.
+    fn attach_tool_result(
+        messages: &mut [Arc<Message>],
+        pending_message: &mut Option<AgentMessage>,
+        owning_message_ix: usize,
+        tool_result: LanguageModelToolResult,
+    ) -> bool {
+        if let Some(owning_message) = messages.get_mut(owning_message_ix) {
+            if let Message::Agent(message) = Arc::make_mut(owning_message) {
+                message
+                    .tool_results
+                    .insert(tool_result.tool_use_id.clone(), tool_result);
+                return true;
+            }
+        }
+
+        pending_message
+            .get_or_insert_default()
+            .tool_results
+            .insert(tool_result.tool_use_id.clone(), tool_result);
+        false
+    }
+
     fn process_tool_result(
         this: &WeakEntity<Thread>,
         event_stream: &ThreadEventStream,
@@ -3508,10 +3567,20 @@ impl Thread {
                 .raw_output(tool_result.output.clone()),
             None,
         );
-        this.update(cx, |this, _cx| {
-            this.pending_message()
-                .tool_results
-                .insert(tool_result.tool_use_id.clone(), tool_result)
+        this.update(cx, |this, cx| {
+            if Self::attach_tool_result(
+                &mut this.messages,
+                &mut this.pending_message,
+                owning_message_ix,
+                tool_result,
+            ) {
+                // The owning message was already flushed to `messages` (the tool
+                // outlived the turn that launched it), so the late result changed
+                // stored history, not the pending message. Bump `updated_at` and
+                // notify so the thread is re-saved with the repaired pairing.
+                this.updated_at = Utc::now();
+                cx.notify();
+            }
         })?;
         Ok(())
     }
@@ -7371,6 +7440,139 @@ mod tests {
     use serde_json::json;
     use settings::LanguageModelProviderSetting;
     use std::sync::Arc;
+
+    // A message must never serialize an unpaired tool call or result. A result
+    // whose call landed in a different message (see `late_tool_result_lands_on_
+    // the_message_that_owns_the_call`) must be dropped, not turned into a `tool`
+    // message the provider cannot match to any `tool_calls` entry.
+    #[test]
+    fn to_request_omits_tool_results_whose_call_is_absent() {
+        let paired_id: LanguageModelToolUseId = "call_paired".into();
+        let orphan_id: LanguageModelToolUseId = "call_orphan".into();
+
+        let message = AgentMessage {
+            content: vec![AgentMessageContent::ToolUse(LanguageModelToolUse {
+                id: paired_id.clone(),
+                name: "paired".into(),
+                raw_input: "{}".into(),
+                input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                is_input_complete: true,
+                thought_signature: None,
+            })],
+            tool_results: [
+                (
+                    paired_id.clone(),
+                    LanguageModelToolResult {
+                        tool_use_id: paired_id.clone(),
+                        tool_name: "paired".into(),
+                        is_error: false,
+                        content: vec![LanguageModelToolResultContent::Text("ok".into())],
+                        output: None,
+                    },
+                ),
+                (
+                    orphan_id.clone(),
+                    LanguageModelToolResult {
+                        tool_use_id: orphan_id,
+                        tool_name: "orphan".into(),
+                        is_error: false,
+                        content: vec![LanguageModelToolResultContent::Text("stale".into())],
+                        output: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            reasoning_details: None,
+        };
+
+        let request = message.to_request();
+        assert_eq!(request.len(), 2, "expected an assistant and a user message");
+        assert_eq!(request[0].content.len(), 1);
+        assert!(matches!(
+            &request[0].content[0],
+            MessageContent::ToolUse(tool_use) if tool_use.id == paired_id
+        ));
+        assert_eq!(
+            request[1].content.len(),
+            1,
+            "the orphan result must be dropped from the request"
+        );
+        assert!(matches!(
+            &request[1].content[0],
+            MessageContent::ToolResult(result) if result.tool_use_id == paired_id
+        ));
+    }
+
+    // A tool that finishes after its message was already flushed (a cancel-blind
+    // tool running past the end of its turn) must have its result filed on that
+    // message, replacing the "canceled" placeholder, not appended to the newer
+    // pending message — which would orphan it from its call.
+    #[test]
+    fn late_tool_result_lands_on_the_message_that_owns_the_call() {
+        let tool_use_id: LanguageModelToolUseId = "call_late".into();
+        let sentinel = LanguageModelToolResult {
+            tool_use_id: tool_use_id.clone(),
+            tool_name: "slow".into(),
+            is_error: true,
+            content: vec![LanguageModelToolResultContent::Text(
+                TOOL_CANCELED_MESSAGE.into(),
+            )],
+            output: None,
+        };
+        let owning_message = AgentMessage {
+            content: vec![AgentMessageContent::ToolUse(LanguageModelToolUse {
+                id: tool_use_id.clone(),
+                name: "slow".into(),
+                raw_input: "{}".into(),
+                input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                is_input_complete: true,
+                thought_signature: None,
+            })],
+            tool_results: [(tool_use_id.clone(), sentinel)].into_iter().collect(),
+            reasoning_details: None,
+        };
+        let mut messages: Vec<Arc<Message>> = vec![Arc::new(Message::Agent(owning_message))];
+        let mut pending_message = Some(AgentMessage::default());
+
+        let mutated = Thread::attach_tool_result(
+            &mut messages,
+            &mut pending_message,
+            0,
+            LanguageModelToolResult {
+                tool_use_id: tool_use_id.clone(),
+                tool_name: "slow".into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text("real output".into())],
+                output: None,
+            },
+        );
+        assert!(
+            mutated,
+            "a late result on an already-flushed message must report a mutation so it is saved"
+        );
+
+        let owning_message = messages[0].as_agent_message().expect("agent message");
+        let stored = owning_message
+            .tool_results
+            .get(&tool_use_id)
+            .expect("stored result");
+        assert!(
+            !Thread::is_canceled_tool_result(stored),
+            "the real result must replace the canceled sentinel"
+        );
+        assert!(matches!(
+            stored.content.as_slice(),
+            [LanguageModelToolResultContent::Text(text)] if text.as_ref() == "real output"
+        ));
+        assert!(
+            pending_message
+                .expect("pending message")
+                .tool_results
+                .is_empty(),
+            "the late result must not be appended to the newer pending message"
+        );
+    }
 
     #[test]
     fn compaction_capacity_respects_prompt_and_combined_limits() {
