@@ -121,6 +121,8 @@ impl HangDetector {
 /// locations as plain data, contributor count capped by the converter.
 #[derive(Debug, Clone, Serialize)]
 pub struct SerializedHangIncident {
+    /// Identifies the rules used to exclude interrupted measurements.
+    pub measurement_version: u32,
     /// `"startup"` when the active window began before the first observed
     /// newly drawn frame finished platform submission (see
     /// [`HangDetector::first_present_at`]), otherwise `"steady"`.
@@ -279,6 +281,7 @@ impl SerializedHangIncident {
                 Some(first_present_at) if active_start >= first_present_at => "steady",
                 _ => "startup",
             },
+            measurement_version: MEASUREMENT_VERSION,
             trigger: incident.trigger,
             start_ms: since_startup(active_start),
             active_ms: as_millis(active),
