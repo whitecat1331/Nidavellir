@@ -81,7 +81,8 @@ fn start_hang_detection(report_longer_then: Duration, client: Arc<Client>, cx: &
     // GPUI's hang monitor observes foreground stalls through its own journal,
     // independently of the reporter loop below. Capture a task trace from that
     // path too, so a hang that starves the loop still lands on disk before the
-    // process can be killed. Rate-limited, and `save_any` caps the trace files.
+    // process can be killed. Rate-limited; `save_incident` bypasses the
+    // profiler gate and caps the trace files.
     let mut last_incident_trace: Option<Instant> = None;
     let telemetry = HangTelemetry::new(startup, telemetry::send_event).with_incident_observer(
         move |incidents| {
@@ -95,7 +96,7 @@ fn start_hang_detection(report_longer_then: Duration, client: Arc<Client>, cx: &
                 return;
             }
             last_incident_trace = Some(now);
-            if let Some(path) = task_traces::save_any(foreground_thread) {
+            if let Some(path) = task_traces::save_incident(foreground_thread) {
                 log::info!("Hang incident trace saved to: {}", path.display());
             }
         },

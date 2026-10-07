@@ -7,7 +7,29 @@ use util::ResultExt;
 
 use crate::STARTUP_TIME;
 
+/// Writes a hang trace unless the performance profiler is enabled or tracing.
+///
+/// Routine hangs (task polls, actions) skip the write while the profiler is on:
+/// the profiler already samples those timings, and on the dev/nightly channels
+/// the profiler is enabled by default, so writing on every routine hang would
+/// churn the three-file trace directory with short-hang noise. Serious hangs
+/// take the [`save_incident`] path instead.
 pub fn save_any(main_thread_id: ThreadId) -> Option<PathBuf> {
+    save(main_thread_id, false)
+}
+
+/// Writes a hang trace even when the performance profiler is enabled or
+/// tracing.
+///
+/// Used by the GPUI hang-incident path: an incident is a foreground stall that
+/// starves the reporter loop, and the in-memory profiler trace is lost if the
+/// process is killed before the user reads it — so the trace must land on disk
+/// regardless of the profiler setting (which is on by default on dev/nightly).
+pub fn save_incident(main_thread_id: ThreadId) -> Option<PathBuf> {
+    save(main_thread_id, true)
+}
+
+fn save(main_thread_id: ThreadId, force: bool) -> Option<PathBuf> {
     cleanup_old_hang_traces();
     let thread_timings = gpui::profiler::get_all_timings(TasksIncluded::CompletedAndRunning);
 
@@ -29,7 +51,7 @@ pub fn save_any(main_thread_id: ThreadId) -> Option<PathBuf> {
         return None;
     };
 
-    if profiler::trace_enabled() {
+    if profiler::trace_enabled() && !force {
         None
     } else {
         cleanup_old_hang_traces();
