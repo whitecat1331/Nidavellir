@@ -6,11 +6,9 @@ use std::{
 
 use collections::HashMap;
 use fs::{FakeFs, Fs};
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use gpui::{Entity, TestAppContext, UpdateGlobal as _};
-use language::{
-    Buffer, CodeLabel, DiagnosticSourceKind, FakeLspAdapter, HighlightId, LocalFile, rust_lang,
-};
+use language::{Buffer, CodeLabel, FakeLspAdapter, HighlightId, LocalFile, rust_lang};
 use lsp::{LanguageServerId, LanguageServerName, Uri};
 use parking_lot::Mutex;
 use project::{
@@ -22,8 +20,7 @@ use project::{
 };
 use serde_json::json;
 use settings::{ScanSymlinksSetting, SettingsStore};
-use unindent::Unindent;
-use util::{path, rel_path::rel_path};
+use util::path;
 
 use crate::init_test;
 
