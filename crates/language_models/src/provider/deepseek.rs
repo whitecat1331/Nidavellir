@@ -697,4 +697,48 @@ mod tests {
         }
         Ok(())
     }
+
+    /// DeepSeek reports `prompt_tokens` as the *total* input (it equals
+    /// `prompt_cache_hit_tokens + prompt_cache_miss_tokens`), so the mapper must
+    /// assign it to `input_tokens` and leave the cache fields at zero. Splitting
+    /// it into the cache fields on top of `input_tokens` would double-count the
+    /// prompt and make the agent's auto-compaction trigger fire on the wrong
+    /// threshold (2a.6's cache-accounting hypothesis).
+    #[test]
+    fn deepseek_usage_maps_prompt_tokens_as_total_input() {
+        let mut mapper = DeepSeekEventMapper::new();
+        let events = mapper.map_event(deepseek::StreamResponse {
+            id: "id".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "deepseek-flash".into(),
+            choices: vec![deepseek::StreamChoice {
+                index: 0,
+                delta: deepseek::StreamDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(deepseek::Usage {
+                prompt_tokens: 16,
+                completion_tokens: 9,
+                total_tokens: 25,
+                prompt_cache_hit_tokens: 0,
+                prompt_cache_miss_tokens: 16,
+            }),
+        });
+
+        let usage = events.into_iter().find_map(|event| match event {
+            Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => Some(usage),
+            _ => None,
+        });
+        let usage = usage.expect("mapper should emit a usage update");
+        assert_eq!(usage.input_tokens, 16);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
 }
