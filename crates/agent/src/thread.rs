@@ -5286,14 +5286,78 @@ fn bound_request_messages_to_token_budget(
         }
     }
 
-    let retained_history = kept_rev.len();
     kept_rev.reverse();
 
     let mut trimmed = Vec::with_capacity(kept_rev.len() + 2);
     trimmed.push(system);
     trimmed.extend(kept_rev);
     trimmed.push(prompt);
+    // Trimming one message at a time can separate an assistant message that
+    // carries `tool_calls` from the message answering them: either side can be
+    // dropped, or the token budget can run out between them. A `tool` message
+    // with no preceding `tool_calls` (or an unanswered `tool_calls` entry) makes
+    // the provider reject the whole request, so drop any call or result that
+    // lost its partner before sending.
+    repair_tool_call_pairing(&mut trimmed);
+    let retained_history = trimmed.len().saturating_sub(2);
     (trimmed, retained_history)
+}
+
+/// Drops tool calls and results that lost their partner when history was
+/// trimmed, so the request never carries a `tool` message without its preceding
+/// `tool_calls` (or a `tool_calls` entry with no answer). Messages left empty --
+/// including an assistant message whose only content was an unanswered call --
+/// are removed.
+///
+/// Pairing is adjacency-based: a call in message `i` is kept only when message
+/// `i + 1` carries its result, and a result in message `i` is kept only when
+/// message `i - 1` carries its call. This matches how `AgentMessage::to_request`
+/// lays a message out -- the assistant `tool_calls` message immediately followed
+/// by the tool-result message.
+fn repair_tool_call_pairing(messages: &mut Vec<LanguageModelRequestMessage>) {
+    let tool_use_ids: Vec<HashSet<LanguageModelToolUseId>> = messages
+        .iter()
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    MessageContent::ToolUse(tool_use) => Some(tool_use.id.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let tool_result_ids: Vec<HashSet<LanguageModelToolUseId>> = messages
+        .iter()
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    MessageContent::ToolResult(tool_result) => {
+                        Some(tool_result.tool_use_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+
+    for (index, message) in messages.iter_mut().enumerate() {
+        let calls_in_previous = index.checked_sub(1).and_then(|ix| tool_use_ids.get(ix));
+        let results_in_next = tool_result_ids.get(index + 1);
+        message.content.retain(|content| match content {
+            MessageContent::ToolUse(tool_use) => {
+                results_in_next.is_some_and(|ids| ids.contains(&tool_use.id))
+            }
+            MessageContent::ToolResult(tool_result) => calls_in_previous
+                .is_some_and(|ids| ids.contains(&tool_result.tool_use_id)),
+            _ => true,
+        });
+    }
+
+    messages.retain(|message| !message.content.is_empty());
 }
 
 /// Describes where a streamed compaction summary should land in the thread
@@ -8337,6 +8401,131 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// A tool result must never outlive the `tool_calls` entry that answers it.
+    /// When the token budget runs out between an assistant tool call and its
+    /// result, the orphaned result is dropped rather than sent (a provider such
+    /// as DeepSeek rejects a `tool` message with no preceding `tool_calls` for
+    /// the whole request).
+    #[test]
+    fn bound_request_drops_orphaned_tool_result() {
+        let system = request_text_message(Role::System, "system");
+        let prompt = request_text_message(Role::User, "summarize");
+        let old_task = request_text_message(Role::User, "old task");
+        let tool_call = request_tool_call_message("call_1", "big");
+        let tool_result = request_tool_result_message("call_1", "big", "tool output");
+        let recent_task = request_text_message(Role::User, "recent task");
+        let recent_answer = request_text_message(Role::Assistant, "recent answer");
+
+        // Retain exactly the newest three history messages, so the reverse walk
+        // exhausts the budget on `tool_result` and breaks before it reaches the
+        // `tool_call` that answers it.
+        let capacity = request_message_token_count(&system)
+            + request_message_token_count(&prompt)
+            + request_message_token_count(&recent_task)
+            + request_message_token_count(&recent_answer)
+            + request_message_token_count(&tool_result);
+
+        let (bounded, retained_history) = bound_request_messages_to_token_budget(
+            vec![
+                system,
+                old_task,
+                tool_call,
+                tool_result,
+                recent_task,
+                recent_answer,
+                prompt,
+            ],
+            capacity,
+        );
+
+        assert_eq!(retained_history, 2);
+        let texts: Vec<String> = bounded
+            .iter()
+            .map(LanguageModelRequestMessage::string_contents)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["system", "recent task", "recent answer", "summarize"],
+            "the orphaned tool result must be dropped; only the recent turn survives"
+        );
+        assert!(
+            bounded
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(content, MessageContent::ToolResult(_))),
+            "no tool result may survive without its preceding tool call"
+        );
+    }
+
+    /// `repair_tool_call_pairing` keeps a call/result only when its partner sits
+    /// in the adjacent message, dropping both an orphaned result and an
+    /// unanswered call, and removing the messages they leave empty.
+    #[test]
+    fn repair_tool_call_pairing_drops_unpaired_calls_and_results() {
+        let mut messages = vec![
+            request_text_message(Role::System, "system"),
+            // An assistant message whose only content is an unanswered call.
+            request_tool_call_message("call_unanswered", "no_reply"),
+            // A user turn in between, then an orphaned result.
+            request_text_message(Role::User, "next task"),
+            request_tool_result_message("call_orphan", "no_call", "stale output"),
+            request_text_message(Role::User, "summarize"),
+        ];
+
+        repair_tool_call_pairing(&mut messages);
+
+        assert_eq!(messages.len(), 3, "both dangling messages are removed");
+        let texts: Vec<String> = messages
+            .iter()
+            .map(LanguageModelRequestMessage::string_contents)
+            .collect();
+        assert_eq!(texts, vec!["system", "next task", "summarize"]);
+    }
+
+    fn request_text_message(role: Role, text: &str) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role,
+            content: vec![MessageContent::Text(text.to_string())],
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    fn request_tool_call_message(id: &str, name: &str) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content: vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: LanguageModelToolUseId::from(id),
+                name: name.into(),
+                raw_input: "{}".into(),
+                input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                is_input_complete: true,
+                thought_signature: None,
+            })],
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    fn request_tool_result_message(
+        id: &str,
+        name: &str,
+        text: &str,
+    ) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: LanguageModelToolUseId::from(id),
+                tool_name: name.into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text(text.into())],
+                output: None,
+            })],
+            cache: false,
+            reasoning_details: None,
+        }
     }
 
     /// When the window can't even hold the system and compaction prompts, a
