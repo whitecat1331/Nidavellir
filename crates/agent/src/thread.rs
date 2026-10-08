@@ -43,11 +43,11 @@ use heck::ToSnakeCase as _;
 use language::Buffer;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
-    LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    LanguageModelCompletionStream, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role,
+    SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, WorktreeId, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -2773,19 +2773,8 @@ impl Thread {
         let compaction = match self.forced_compaction_target_ix() {
             Some(request_end_ix) => {
                 self.advance_prompt_id();
-                // A thread whose retained history can't be summarized within
-                // the model's context window is unrecoverable in a single pass,
-                // so fail with an actionable error rather than emitting a
-                // request the provider will reject (or one that summarizes
-                // nothing).
-                let Some(request) = self.build_compaction_request(request_end_ix, &model, cx)
-                else {
-                    return Err(anyhow!(
-                        "Thread is too large to summarize. Truncate older messages or start a new thread, then retry."
-                    ));
-                };
                 self.current_request_token_usage = TokenUsage::default();
-                Some((model.clone(), request))
+                Some(self.build_compaction_plan(request_end_ix, &model, cx))
             }
             None => None,
         };
@@ -2804,19 +2793,33 @@ impl Thread {
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
-                let result = if let Some((model, request)) = compaction {
-                    Self::stream_compaction(
-                        &this,
-                        &event_stream,
-                        cancellation_rx.clone(),
-                        model,
-                        request,
-                        CompactionInsertion::Manual { marker_id: id },
-                        cx,
-                    )
-                    .await
-                } else {
-                    Ok(ControlFlow::Continue(()))
+                let insertion = CompactionInsertion::Manual { marker_id: id };
+                let result = match compaction {
+                    Some(CompactionPlan::Single { request }) => {
+                        Self::stream_compaction(
+                            &this,
+                            &event_stream,
+                            cancellation_rx.clone(),
+                            model,
+                            request,
+                            insertion,
+                            cx,
+                        )
+                        .await
+                    }
+                    Some(CompactionPlan::MapReduce { chunks }) => {
+                        Self::stream_map_reduce_compaction(
+                            &this,
+                            &event_stream,
+                            cancellation_rx.clone(),
+                            model,
+                            chunks,
+                            insertion,
+                            cx,
+                        )
+                        .await
+                    }
+                    None => Ok(ControlFlow::Continue(())),
                 };
 
                 // If we were cancelled, `cancel()` already took `running_turn`
@@ -3357,10 +3360,10 @@ impl Thread {
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
-        let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
+        let Some((model, plan, insertion_ix)) = this.update(cx, |this, cx| {
             let insertion_ix = this.compaction_message_target_ix(cx)?;
             let model = this.compaction_model(cx)?;
-            let request = this.build_compaction_request(insertion_ix, &model, cx)?;
+            let plan = this.build_compaction_plan(insertion_ix, &model, cx);
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
@@ -3368,22 +3371,38 @@ impl Thread {
                 this.pending_compaction_telemetry =
                     this.build_compaction_telemetry("auto", &model, cx);
             }
-            Some((model, request, insertion_ix))
+            Some((model, plan, insertion_ix))
         })?
         else {
             return Ok(ControlFlow::Continue(()));
         };
 
-        Self::stream_compaction(
-            this,
-            event_stream,
-            cancellation_rx,
-            model,
-            request,
-            CompactionInsertion::Auto { insertion_ix },
-            cx,
-        )
-        .await
+        match plan {
+            CompactionPlan::Single { request } => {
+                Self::stream_compaction(
+                    this,
+                    event_stream,
+                    cancellation_rx,
+                    model,
+                    request,
+                    CompactionInsertion::Auto { insertion_ix },
+                    cx,
+                )
+                .await
+            }
+            CompactionPlan::MapReduce { chunks } => {
+                Self::stream_map_reduce_compaction(
+                    this,
+                    event_stream,
+                    cancellation_rx,
+                    model,
+                    chunks,
+                    CompactionInsertion::Auto { insertion_ix },
+                    cx,
+                )
+                .await
+            }
+        }
     }
 
     async fn stream_compaction(
@@ -3472,6 +3491,128 @@ impl Thread {
             }
 
             log::debug!("Compaction succeeded:\n{summary}");
+            event_stream.update_context_compaction_status(
+                compaction_id.clone(),
+                acp_thread::ContextCompactionStatus::Completed,
+            );
+
+            this.update(cx, |this, cx| {
+                let compaction =
+                    Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
+                match insertion {
+                    CompactionInsertion::Auto { insertion_ix } => {
+                        if insertion_ix <= this.messages.len() {
+                            this.messages.insert(insertion_ix, compaction);
+                        } else {
+                            this.messages.push(compaction);
+                        }
+                    }
+                    CompactionInsertion::Manual { marker_id } => {
+                        this.messages.push(Arc::new(Message::User(UserMessage {
+                            id: marker_id,
+                            content: Arc::from([]),
+                        })));
+                        this.messages.push(compaction);
+                    }
+                }
+                cx.notify();
+            })?;
+
+            Ok(ControlFlow::Continue(()))
+        }
+        .await;
+
+        if result.is_err() {
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Failed,
+            );
+        }
+        result
+    }
+
+    async fn stream_map_reduce_compaction(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        mut cancellation_rx: watch::Receiver<bool>,
+        model: LanguageModel,
+        chunks: Vec<Vec<Arc<Message>>>,
+        insertion: CompactionInsertion,
+        cx: &mut AsyncApp,
+    ) -> Result<ControlFlow<()>> {
+        if *cancellation_rx.borrow() {
+            return Ok(ControlFlow::Break(()));
+        }
+
+        log::debug!("Running map-reduce compaction over {} chunks", chunks.len());
+        let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
+        event_stream.send_context_compaction(
+            compaction_id.clone(),
+            acp_thread::ContextCompactionStatus::InProgress,
+        );
+
+        let result: Result<ControlFlow<()>> = async {
+            let provider =
+                cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
+            let (thread_id, prompt_id, temperature) = this.update(cx, |this, cx| {
+                (
+                    this.id.to_string(),
+                    this.prompt_id.to_string(),
+                    AgentSettings::temperature_for_model(&model, cx),
+                )
+            })?;
+
+            // Condense each chunk independently, with bounded concurrency. The
+            // futures are `'static`, so building them only borrows `cx` for the
+            // synchronous call and releases it before any await.
+            let condense_futures: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    let request = build_chunk_condense_request(
+                        &thread_id,
+                        &prompt_id,
+                        temperature,
+                        chunk,
+                        &model,
+                    );
+                    provider.stream_completion(&model, request, cx)
+                })
+                .collect();
+
+            let stream_results = stream::iter(condense_futures)
+                .buffer_unordered(MAP_REDUCE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+
+            let mut summaries = Vec::with_capacity(stream_results.len());
+            for result in stream_results {
+                summaries.push(collect_summary_text(result).await?);
+            }
+
+            if *cancellation_rx.borrow() {
+                return Ok(ControlFlow::Break(()));
+            }
+
+            let summary = merge_summaries(
+                &model,
+                &thread_id,
+                &prompt_id,
+                temperature,
+                summaries,
+                cancellation_rx.clone(),
+                cx,
+            )
+            .await?;
+
+            let summary = summary.trim().to_string();
+            if summary.is_empty() {
+                log::warn!("Map-reduce compaction produced an empty summary");
+                return Err(anyhow::anyhow!(
+                    "Map-reduce compaction produced an empty summary"
+                ));
+            }
+
+            log::debug!("Map-reduce compaction succeeded:\n{summary}");
             event_stream.update_context_compaction_status(
                 compaction_id.clone(),
                 acp_thread::ContextCompactionStatus::Completed,
@@ -4827,6 +4968,25 @@ impl Thread {
         Some(request)
     }
 
+    /// Chooses how to compact history up to `insertion_ix`: a single bounded
+    /// request when it fits the model's window, otherwise a map-reduce plan
+    /// that condenses window-fitting chunks and merges them back together.
+    fn build_compaction_plan(
+        &self,
+        insertion_ix: usize,
+        model: &LanguageModel,
+        cx: &App,
+    ) -> CompactionPlan {
+        if let Some(request) = self.build_compaction_request(insertion_ix, model, cx) {
+            return CompactionPlan::Single { request };
+        }
+
+        let history_end = insertion_ix.min(self.messages.len());
+        let chunks = ContextChunker::new(map_reduce_chunk_capacity(model))
+            .chunk(&self.messages[..history_end]);
+        CompactionPlan::MapReduce { chunks }
+    }
+
     pub fn to_markdown(&self) -> String {
         let mut markdown = messages_to_markdown(&self.messages);
 
@@ -5351,8 +5511,9 @@ fn repair_tool_call_pairing(messages: &mut Vec<LanguageModelRequestMessage>) {
             MessageContent::ToolUse(tool_use) => {
                 results_in_next.is_some_and(|ids| ids.contains(&tool_use.id))
             }
-            MessageContent::ToolResult(tool_result) => calls_in_previous
-                .is_some_and(|ids| ids.contains(&tool_result.tool_use_id)),
+            MessageContent::ToolResult(tool_result) => {
+                calls_in_previous.is_some_and(|ids| ids.contains(&tool_result.tool_use_id))
+            }
             _ => true,
         });
     }
@@ -5414,6 +5575,230 @@ fn estimate_message_tokens(message: &Message) -> u64 {
     } else {
         bytes.saturating_add(COMPACTION_BYTES_PER_TOKEN - 1) / COMPACTION_BYTES_PER_TOKEN
     }
+}
+
+/// Reserved inside each map-reduce slice for the chunk prompt plus the system
+/// line, so a slice that fits by content still fits once the prompt is appended.
+const MAP_REDUCE_CHUNK_OVERHEAD_TOKENS: u64 = 1_000;
+
+/// How many chunk-condense (or merge) calls run concurrently during map-reduce
+/// compaction. Condense calls are plain summarizations with no side effects, so
+/// they are safe to parallelize within this bound.
+const MAP_REDUCE_CONCURRENCY: usize = 3;
+
+/// Cap on merge levels. The summaries are already condensed by then, so if a
+/// pathological thread still refuses to shrink, the remaining summaries are
+/// concatenated rather than summarized indefinitely.
+const MAP_REDUCE_MAX_MERGE_DEPTH: usize = 3;
+
+const MAP_REDUCE_CHUNK_SYSTEM: &str = "You are a conversation summarizer.";
+
+const MAP_REDUCE_CHUNK_PROMPT: &str = "Condense this slice of a longer conversation into a handoff fragment for another agent. Include, as applicable: the goal; key decisions and constraints; files, code, and artifacts touched; open items; and a short note on what happened in this slice. Be concise and structured. Do not ask questions.";
+
+const MAP_REDUCE_MERGE_PROMPT: &str = "Combine the following partial summaries of the same conversation into a single concise handoff for another agent. Preserve every decision, constraint, fact, file path, and open item — drop nothing important, and remove redundancy. Write it so the next agent can act without re-asking the user. Be concise and well-structured.";
+
+/// Window budget for one map-reduce slice (chunk) request.
+fn map_reduce_chunk_capacity(model: &LanguageModel) -> u64 {
+    compaction_input_capacity(
+        model.max_input_tokens(),
+        model.max_total_tokens(),
+        model.max_output_tokens(),
+    )
+    .saturating_sub(MAP_REDUCE_CHUNK_OVERHEAD_TOKENS)
+}
+
+/// Merge target: the merged handoff should leave headroom in the window for the
+/// verbatim tail and future turns, so aim for ~70% of a chunk's capacity.
+fn map_reduce_merge_capacity(model: &LanguageModel) -> u64 {
+    map_reduce_chunk_capacity(model).saturating_mul(7) / 10
+}
+
+/// Rough token estimate for summary text, matching [`COMPACTION_BYTES_PER_TOKEN`]
+/// (1 token ≈ 4 bytes).
+fn estimate_text_tokens(text: &str) -> u64 {
+    let bytes = text.len() as u64;
+    if bytes == 0 {
+        0
+    } else {
+        bytes.saturating_add(COMPACTION_BYTES_PER_TOKEN - 1) / COMPACTION_BYTES_PER_TOKEN
+    }
+}
+
+/// Packs condensed summaries into window-fitting groups for a merge pass. A
+/// single summary larger than the budget becomes its own group (never dropped).
+fn group_summaries_for_merge(summaries: &[String], capacity_tokens: u64) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_tokens: u64 = 0;
+
+    for summary in summaries {
+        let tokens = estimate_text_tokens(summary);
+        if !current.is_empty() && current_tokens.saturating_add(tokens) > capacity_tokens {
+            groups.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(summary.clone());
+        current_tokens = current_tokens.saturating_add(tokens);
+    }
+
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    groups
+}
+
+fn build_chunk_condense_request(
+    thread_id: &str,
+    prompt_id: &str,
+    temperature: Option<f32>,
+    chunk: &[Arc<Message>],
+    model: &LanguageModel,
+) -> LanguageModelRequest {
+    let mut request = LanguageModelRequest {
+        thread_id: Some(thread_id.to_string()),
+        prompt_id: Some(prompt_id.to_string()),
+        intent: Some(CompletionIntent::ThreadContextSummarization),
+        temperature,
+        ..Default::default()
+    };
+    request.messages.push(LanguageModelRequestMessage {
+        role: Role::System,
+        content: vec![MAP_REDUCE_CHUNK_SYSTEM.into()],
+        cache: false,
+        reasoning_details: None,
+    });
+    for message in chunk {
+        request.messages.extend(message.to_request());
+    }
+    request.messages.push(LanguageModelRequestMessage {
+        role: Role::User,
+        content: vec![MAP_REDUCE_CHUNK_PROMPT.into()],
+        cache: false,
+        reasoning_details: None,
+    });
+    request.messages =
+        bound_request_messages_to_token_budget(request.messages, map_reduce_chunk_capacity(model))
+            .0;
+    repair_tool_call_pairing(&mut request.messages);
+    request
+}
+
+fn build_merge_request(
+    thread_id: &str,
+    prompt_id: &str,
+    temperature: Option<f32>,
+    group: &[String],
+    model: &LanguageModel,
+) -> LanguageModelRequest {
+    let mut request = LanguageModelRequest {
+        thread_id: Some(thread_id.to_string()),
+        prompt_id: Some(prompt_id.to_string()),
+        intent: Some(CompletionIntent::ThreadContextSummarization),
+        temperature,
+        ..Default::default()
+    };
+    request.messages.push(LanguageModelRequestMessage {
+        role: Role::System,
+        content: vec![MAP_REDUCE_CHUNK_SYSTEM.into()],
+        cache: false,
+        reasoning_details: None,
+    });
+    for summary in group {
+        request.messages.push(LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![summary.clone().into()],
+            cache: false,
+            reasoning_details: None,
+        });
+    }
+    request.messages.push(LanguageModelRequestMessage {
+        role: Role::User,
+        content: vec![MAP_REDUCE_MERGE_PROMPT.into()],
+        cache: false,
+        reasoning_details: None,
+    });
+    request.messages =
+        bound_request_messages_to_token_budget(request.messages, map_reduce_chunk_capacity(model))
+            .0;
+    request
+}
+
+/// Drains a single completion stream into its concatenated text, discarding
+/// non-text events (thinking, tool use, usage) that a plain summarization never
+/// needs.
+async fn collect_summary_text(
+    result: Result<LanguageModelCompletionStream, LanguageModelCompletionError>,
+) -> Result<String> {
+    let mut stream = result?;
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        if let LanguageModelCompletionEvent::Text(text_chunk) = event? {
+            text.push_str(&text_chunk);
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
+/// Repeatedly merges condensed summaries (in parallel, bounded) until a single
+/// handoff remains or the depth cap is hit, then concatenates whatever is left.
+async fn merge_summaries(
+    model: &LanguageModel,
+    thread_id: &str,
+    prompt_id: &str,
+    temperature: Option<f32>,
+    mut summaries: Vec<String>,
+    mut cancellation_rx: watch::Receiver<bool>,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    let provider =
+        cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
+    let merge_capacity = map_reduce_merge_capacity(model);
+
+    for _depth in 0..MAP_REDUCE_MAX_MERGE_DEPTH {
+        if summaries.len() <= 1 {
+            break;
+        }
+        let groups = group_summaries_for_merge(&summaries, merge_capacity);
+        if groups.len() >= summaries.len() {
+            // Nothing shrank: the summaries are individually too large to
+            // merge within the budget, so stop instead of looping for nothing.
+            break;
+        }
+
+        let merge_futures: Vec<_> = groups
+            .iter()
+            .map(|group| {
+                let request = build_merge_request(thread_id, prompt_id, temperature, group, model);
+                provider.stream_completion(model, request, cx)
+            })
+            .collect();
+
+        let stream_results = stream::iter(merge_futures)
+            .buffer_unordered(MAP_REDUCE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut merged = Vec::with_capacity(stream_results.len());
+        for result in stream_results {
+            merged.push(collect_summary_text(result).await?);
+        }
+        summaries = merged;
+
+        if *cancellation_rx.borrow() {
+            return Err(anyhow::anyhow!("Map-reduce compaction cancelled"));
+        }
+    }
+
+    Ok(summaries.join("\n\n"))
+}
+
+/// How a compaction pass will be performed for the retained history.
+enum CompactionPlan {
+    /// The retained history fits in one bounded compaction request.
+    Single { request: LanguageModelRequest },
+    /// The retained history must be chunked, condensed, and merged.
+    MapReduce { chunks: Vec<Vec<Arc<Message>>> },
 }
 
 /// Describes where a streamed compaction summary should land in the thread
@@ -7937,6 +8322,33 @@ mod tests {
         assert_eq!(slices[0].len(), 2);
     }
 
+    #[test]
+    fn test_group_summaries_for_merge_packs_to_budget() {
+        let summaries = vec![
+            "a".repeat(400),
+            "b".repeat(400),
+            "c".repeat(400),
+            "d".repeat(400),
+        ];
+
+        // Each summary is ~100 tokens; a 201-token budget fits two per group.
+        let groups = group_summaries_for_merge(&summaries, 201);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 2);
+    }
+
+    #[test]
+    fn test_group_summaries_for_merge_keeps_oversized_summary_whole() {
+        let summaries = vec!["x".repeat(400)];
+
+        let groups = group_summaries_for_merge(&summaries, 1);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+    }
+
     #[gpui::test]
     async fn test_thread_summary_request_uses_compacted_history(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
@@ -8641,7 +9053,7 @@ mod tests {
     /// manual `/compact` fails with an actionable error instead of emitting a
     /// request that would be rejected or that summarizes nothing.
     #[gpui::test]
-    async fn test_manual_compact_errors_when_thread_cannot_be_summarized(cx: &mut TestAppContext) {
+    async fn test_oversized_thread_plans_map_reduce_compaction(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         let model = fake.update_model("fake", |model| {
             model.max_token_count = 32;
@@ -8657,11 +9069,25 @@ mod tests {
                     "some history",
                 ));
 
-                let result = thread.compact(ClientUserMessageId::new(), cx);
+                // A thread that can't be summarized in one pass must fall back
+                // to a map-reduce plan rather than failing outright.
                 assert!(
-                    result.is_err(),
-                    "oversized thread should fail with an actionable error"
+                    thread
+                        .build_compaction_request(thread.messages.len(), &model, cx)
+                        .is_none()
                 );
+
+                match thread.build_compaction_plan(thread.messages.len(), &model, cx) {
+                    CompactionPlan::MapReduce { chunks } => {
+                        assert!(
+                            !chunks.is_empty(),
+                            "history should produce at least one chunk"
+                        );
+                    }
+                    CompactionPlan::Single { .. } => {
+                        panic!("oversized thread should fall back to map-reduce");
+                    }
+                }
             });
         });
     }
