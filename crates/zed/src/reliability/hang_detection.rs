@@ -12,6 +12,10 @@ use crate::STARTUP_TIME;
 mod logging;
 mod task_traces;
 
+/// Minimum spacing between GPUI-incident-triggered trace writes. A burst of
+/// incidents would otherwise write a trace per monitor tick.
+const INCIDENT_TRACE_INTERVAL: Duration = Duration::from_secs(10);
+
 gpui::actions!(
     dev,
     [
@@ -74,7 +78,30 @@ fn start_hang_detection(report_longer_then: Duration, client: Arc<Client>, cx: &
     // GPUI's final `Flush` poll runs during shutdown, concurrently with this
     // handler and within `SHUTDOWN_TIMEOUT`, so the last batch may miss this
     // flush.
-    match HangTelemetry::new(startup, telemetry::send_event).start(cx) {
+    // GPUI's hang monitor observes foreground stalls through its own journal,
+    // independently of the reporter loop below. Capture a task trace from that
+    // path too, so a hang that starves the loop still lands on disk before the
+    // process can be killed. Rate-limited; `save_incident` bypasses the
+    // profiler gate and caps the trace files.
+    let mut last_incident_trace: Option<Instant> = None;
+    let telemetry = HangTelemetry::new(startup, telemetry::send_event).with_incident_observer(
+        move |incidents| {
+            if incidents.is_empty() {
+                return;
+            }
+            let now = Instant::now();
+            if last_incident_trace
+                .is_some_and(|last| now.duration_since(last) < INCIDENT_TRACE_INTERVAL)
+            {
+                return;
+            }
+            last_incident_trace = Some(now);
+            if let Some(path) = task_traces::save_incident(foreground_thread) {
+                log::info!("Hang incident trace saved to: {}", path.display());
+            }
+        },
+    );
+    match telemetry.start(cx) {
         Ok(()) => cx
             .on_app_quit(move |_| client.telemetry().flush_events())
             .detach(),

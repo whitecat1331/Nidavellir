@@ -3299,6 +3299,16 @@ impl ThreadView {
             .detach_and_log_err(cx);
     }
 
+    /// Rewinds the thread to `client_id`, dropping it and every entry after it.
+    /// Used by the token-limit callout to shed an oversized history in place:
+    /// unlike starting a new thread from this thread's summary, it never has to
+    /// summarize the oversized thread, so it always succeeds.
+    pub fn truncate_thread(&mut self, client_id: ClientUserMessageId, cx: &mut Context<Self>) {
+        self.thread
+            .update(cx, |thread, cx| thread.rewind(client_id, cx))
+            .detach_and_log_err(cx);
+    }
+
     pub fn clear_thread_error(&mut self, cx: &mut Context<Self>) {
         self.thread_error = None;
         self.thread_error_markdown = None;
@@ -12682,7 +12692,24 @@ impl ThreadView {
             ),
         };
 
-        let description = "To continue, run /compact or start a new thread and @-mention this one";
+        // Truncation rewinds to the first user message, dropping the whole
+        // accumulated history. It always succeeds, since it never has to
+        // summarize the oversized thread.
+        let truncate_target = if self.thread.read(cx).supports_truncate(cx) {
+            self.thread.read(cx).entries().iter().find_map(|entry| {
+                entry
+                    .user_message()
+                    .and_then(|message| message.client_id.clone())
+            })
+        } else {
+            None
+        };
+
+        let description = if truncate_target.is_some() {
+            "To continue, run /compact, start a new thread and @-mention this one, or truncate this thread's history"
+        } else {
+            "To continue, run /compact or start a new thread and @-mention this one"
+        };
 
         Some(
             Callout::new()
@@ -12692,20 +12719,34 @@ impl ThreadView {
                 .title(title)
                 .description(description)
                 .actions_slot(
-                    h_flex().gap_0p5().child(
-                        Button::new("start-new-thread", "Start New Thread")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let session_id = this.thread.read(cx).session_id().clone();
-                                window.dispatch_action(
-                                    crate::NewNativeAgentThreadFromSummary {
-                                        from_session_id: session_id,
-                                    }
-                                    .boxed_clone(),
-                                    cx,
-                                );
-                            })),
-                    ),
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Button::new("start-new-thread", "Start New Thread")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let session_id = this.thread.read(cx).session_id().clone();
+                                    window.dispatch_action(
+                                        crate::NewNativeAgentThreadFromSummary {
+                                            from_session_id: session_id,
+                                        }
+                                        .boxed_clone(),
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .when_some(truncate_target, |this, client_id| {
+                            this.child(
+                                Button::new("truncate-thread", "Truncate")
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text(
+                                        "Discard this thread's history so it fits the model's context window",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.truncate_thread(client_id.clone(), cx);
+                                    })),
+                            )
+                        }),
                 )
                 .dismiss_action(self.dismiss_error_button(cx)),
         )
