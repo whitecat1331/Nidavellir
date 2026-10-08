@@ -1,12 +1,25 @@
 use std::sync::Arc;
 
-use crate::{AgentTool, DbThreadMetadata, ThreadsDatabase, ToolCallEventStream, ToolInput};
+use crate::db::truncate_at_char_boundary;
+use crate::{
+    AgentTool, DbThreadMetadata, Message, ThreadsDatabase, ToolCallEventStream, ToolInput,
+};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use gpui::{App, AppContext as _, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Default per-call byte budget for `show` transcripts.
+const DEFAULT_SHOW_MAX_BYTES: usize = 64 * 1024;
+/// Hard ceiling on `max_bytes`; larger values are rejected.
+const MAX_SHOW_MAX_BYTES: usize = 256 * 1024;
+/// Per-thread content budget for `search`, so matching against a large store
+/// never renders an oversized thread end to end.
+const SEARCH_CONTENT_BUDGET_BYTES: usize = 64 * 1024;
+/// Preview length for each `outline` entry.
+const OUTLINE_PREVIEW_BYTES: usize = 120;
 
 /// The operation to perform against the persisted agent thread store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -15,10 +28,14 @@ pub enum ThreadSearchAction {
     /// List all past agent threads, newest first.
     #[default]
     List,
-    /// Search thread summaries and full content for a case-insensitive query.
+    /// Search thread summaries and bounded content for a case-insensitive query.
     Search,
-    /// Show the full transcript of a single thread.
+    /// Show a thread's transcript, bounded by `max_bytes` and pageable via
+    /// `offset`.
     Show,
+    /// Outline a thread's messages (role, byte size, preview) without returning
+    /// the full content, so a range can be chosen before fetching.
+    Outline,
 }
 
 /// Search and read past agent conversations stored on this machine.
@@ -26,9 +43,13 @@ pub enum ThreadSearchAction {
 /// Use this to find and read what was discussed or decided in earlier threads —
 /// for example when asked to recall a previous conversation, check another
 /// thread, or remember what was decided. `list` enumerates threads, `search`
-/// finds threads matching a query across summaries and full content, and `show`
-/// returns one thread's full transcript by id (or by the 1-based index printed
-/// by `list`).
+/// finds threads matching a query across summaries and bounded content, `show`
+/// returns one thread's transcript by id (or by the 1-based index printed by
+/// `list`), and `outline` lists a thread's messages without their content.
+///
+/// `show` returns at most `max_bytes` of the transcript (default 65536, hard
+/// ceiling 262144). When the transcript is larger it appends a `truncated`
+/// note with the byte range and the `offset` to pass to continue paging.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadSearchToolInput {
     /// Which operation to perform.
@@ -37,9 +58,17 @@ pub struct ThreadSearchToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     /// Thread id, or the 1-based index shown by `list`. Required for
-    /// `action: "show"`.
+    /// `action: "show"` and `action: "outline"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Maximum bytes of transcript to return for `show`. Defaults to 65536;
+    /// rejected above 262144.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// Byte offset to begin reading the transcript for paged `show`
+    /// (0 = start). Use the `offset` returned by a prior truncated `show`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +109,7 @@ impl AgentTool for ThreadSearchTool {
                 ThreadSearchAction::List => "Listing threads".into(),
                 ThreadSearchAction::Search => "Searching threads".into(),
                 ThreadSearchAction::Show => "Showing thread".into(),
+                ThreadSearchAction::Outline => "Outlining thread".into(),
             },
             Err(_) => "Searching threads".into(),
         }
@@ -140,9 +170,33 @@ async fn run_action(
                     error: "`id` is required for `action: \"show\"`.".to_string(),
                 }
             })?;
-            show_thread(&id, &threads, database).await
+            let max_bytes = match input.max_bytes {
+                Some(value) => Some(
+                    validate_max_bytes(value)
+                        .map_err(|error| ThreadSearchToolOutput::Error { error })?,
+                ),
+                None => None,
+            };
+            show_thread(&id, &threads, database, max_bytes, input.offset).await
+        }
+        ThreadSearchAction::Outline => {
+            let id = input.id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+                ThreadSearchToolOutput::Error {
+                    error: "`id` is required for `action: \"outline\"`.".to_string(),
+                }
+            })?;
+            outline_thread(&id, &threads, database).await
         }
     }
+}
+
+fn validate_max_bytes(value: usize) -> Result<usize, String> {
+    if value > MAX_SHOW_MAX_BYTES {
+        return Err(format!(
+            "`max_bytes` must be at most {MAX_SHOW_MAX_BYTES}, got {value}"
+        ));
+    }
+    Ok(value)
 }
 
 async fn search_threads(
@@ -165,7 +219,20 @@ async fn search_threads(
                 error: format!("Failed to load thread \"{}\": {error}", metadata.id.0),
             })?
         {
-            if matches_query(&thread.to_markdown(), query) {
+            if thread
+                .detailed_summary
+                .as_ref()
+                .is_some_and(|summary| matches_query(summary.as_str(), query))
+            {
+                matches.push(format_match(metadata, "summary"));
+                continue;
+            }
+
+            // Match a bounded prefix of the transcript so one oversized thread
+            // cannot force a full render of the whole store.
+            let content =
+                bounded_messages_to_markdown(&thread.messages, SEARCH_CONTENT_BUDGET_BYTES);
+            if matches_query(&content, query) {
                 matches.push(format_match(metadata, "content"));
             }
         }
@@ -193,6 +260,8 @@ async fn show_thread(
     id: &str,
     threads: &[DbThreadMetadata],
     database: &ThreadsDatabase,
+    max_bytes: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<ThreadSearchToolOutput, ThreadSearchToolOutput> {
     let metadata =
         resolve_thread(id, threads).map_err(|error| ThreadSearchToolOutput::Error { error })?;
@@ -207,9 +276,118 @@ async fn show_thread(
             error: format!("No thread with id \"{}\".", metadata.id.0),
         })?;
 
-    Ok(ThreadSearchToolOutput::Success {
-        message: thread.to_markdown(),
-    })
+    let markdown = thread.to_markdown();
+    let total_bytes = markdown.len();
+    let max_bytes = max_bytes.unwrap_or(DEFAULT_SHOW_MAX_BYTES);
+    let offset = offset.unwrap_or(0).min(total_bytes);
+
+    let start = floor_char_boundary(&markdown, offset);
+    let shown = truncate_at_char_boundary(&markdown[start..], max_bytes);
+    let next_offset = start + shown.len();
+    let truncated = next_offset < total_bytes;
+
+    if shown.is_empty() && total_bytes > 0 {
+        return Ok(ThreadSearchToolOutput::Success {
+            message: format!(
+                "Offset {offset} is past the end of the {total_bytes}-byte transcript."
+            ),
+        });
+    }
+
+    let mut message = shown.to_string();
+    if truncated {
+        message.push_str(&format!(
+            "\n\n[Truncated: bytes {start}-{next_offset} of {total_bytes}. To continue, call show with offset={next_offset}.]"
+        ));
+    }
+    Ok(ThreadSearchToolOutput::Success { message })
+}
+
+async fn outline_thread(
+    id: &str,
+    threads: &[DbThreadMetadata],
+    database: &ThreadsDatabase,
+) -> Result<ThreadSearchToolOutput, ThreadSearchToolOutput> {
+    let metadata =
+        resolve_thread(id, threads).map_err(|error| ThreadSearchToolOutput::Error { error })?;
+
+    let thread = database
+        .load_thread(metadata.id.clone())
+        .await
+        .map_err(|error| ThreadSearchToolOutput::Error {
+            error: format!("Failed to load thread \"{}\": {error}", metadata.id.0),
+        })?
+        .ok_or_else(|| ThreadSearchToolOutput::Error {
+            error: format!("No thread with id \"{}\".", metadata.id.0),
+        })?;
+
+    if thread.messages.is_empty() {
+        return Ok(ThreadSearchToolOutput::Success {
+            message: format!("Thread \"{}\" has no messages.", metadata.title),
+        });
+    }
+
+    let mut message = format!(
+        "{} message(s) in thread \"{}\":\n",
+        thread.messages.len(),
+        metadata.title,
+    );
+    for (index, entry) in thread.messages.iter().enumerate() {
+        let entry = entry.as_ref();
+        let markdown = entry.to_markdown();
+        let preview =
+            truncate_at_char_boundary(&markdown, OUTLINE_PREVIEW_BYTES).replace('\n', " ");
+        message.push_str(&format!(
+            "{}. [{}] {} bytes — {}\n",
+            index + 1,
+            message_role_label(entry),
+            markdown.len(),
+            preview,
+        ));
+    }
+    message.push_str("\nUse `show` with an `offset` to read content past the default byte budget.");
+    Ok(ThreadSearchToolOutput::Success { message })
+}
+
+/// Returns the largest index `<= offset` that is a UTF-8 character boundary.
+fn floor_char_boundary(text: &str, offset: usize) -> usize {
+    let mut index = offset;
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn message_role_label(message: &Message) -> &'static str {
+    match message {
+        Message::User(_) => "user",
+        Message::Agent(_) => "assistant",
+        Message::Resume => "resume",
+        Message::Compaction(_) => "compaction",
+    }
+}
+
+/// Renders messages into markdown the same way `messages_to_markdown` does, but
+/// stops once `max_bytes` of output has accumulated so an oversized thread never
+/// renders end to end.
+fn bounded_messages_to_markdown(messages: &[Arc<Message>], max_bytes: usize) -> String {
+    let mut markdown = String::new();
+    for (index, message) in messages.iter().enumerate() {
+        let message = message.as_ref();
+        if index > 0 {
+            markdown.push('\n');
+        }
+        match message {
+            Message::User(_) => markdown.push_str("## User\n\n"),
+            Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
+            Message::Resume | Message::Compaction(_) => {}
+        }
+        markdown.push_str(&message.to_markdown());
+        if markdown.len() >= max_bytes {
+            break;
+        }
+    }
+    markdown
 }
 
 fn format_list(threads: &[DbThreadMetadata]) -> String {
@@ -265,7 +443,7 @@ fn matches_query(haystack: &str, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DbSandboxGrants, DbThread, Message, UserMessage, UserMessageContent};
+    use crate::{DbSandboxGrants, DbThread, UserMessage, UserMessageContent};
     use acp_thread::ClientUserMessageId;
     use chrono::{DateTime, TimeZone, Utc};
     use collections::HashMap;
@@ -370,6 +548,16 @@ mod tests {
         assert!(!matches_query("Hello World", "nope"));
     }
 
+    #[test]
+    fn floor_char_boundary_respects_utf8() {
+        let text = "héllo";
+        // 'h' = 1 byte, 'é' spans bytes 1..=2, so byte 2 is not a boundary.
+        assert_eq!(floor_char_boundary(text, 1), 1);
+        assert_eq!(floor_char_boundary(text, 2), 1);
+        assert_eq!(floor_char_boundary(text, 3), 3);
+        assert_eq!(floor_char_boundary(text, 100), text.len());
+    }
+
     #[gpui::test]
     async fn list_search_and_show_round_trip(cx: &mut gpui::TestAppContext) {
         let database = ThreadsDatabase::new(cx.executor()).unwrap();
@@ -397,6 +585,8 @@ mod tests {
                 action: ThreadSearchAction::List,
                 query: None,
                 id: None,
+                max_bytes: None,
+                offset: None,
             },
             &database,
         )
@@ -414,6 +604,8 @@ mod tests {
                 action: ThreadSearchAction::Search,
                 query: Some("ALPHA".to_string()),
                 id: None,
+                max_bytes: None,
+                offset: None,
             },
             &database,
         )
@@ -431,6 +623,8 @@ mod tests {
                 action: ThreadSearchAction::Search,
                 query: Some("goodbye".to_string()),
                 id: None,
+                max_bytes: None,
+                offset: None,
             },
             &database,
         )
@@ -448,6 +642,8 @@ mod tests {
                 action: ThreadSearchAction::Show,
                 query: None,
                 id: Some("thread-a".to_string()),
+                max_bytes: None,
+                offset: None,
             },
             &database,
         )
@@ -464,6 +660,8 @@ mod tests {
                 action: ThreadSearchAction::Show,
                 query: None,
                 id: Some("1".to_string()),
+                max_bytes: None,
+                offset: None,
             },
             &database,
         )
@@ -480,6 +678,8 @@ mod tests {
                 action: ThreadSearchAction::Show,
                 query: None,
                 id: Some("missing".to_string()),
+                max_bytes: None,
+                offset: None,
             },
             &database,
         )
@@ -488,5 +688,131 @@ mod tests {
             missing,
             Err(ThreadSearchToolOutput::Error { error }) if error.contains("No thread with id")
         ));
+    }
+
+    #[gpui::test]
+    async fn show_bounds_and_pages_large_transcripts(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let mut thread = make_thread("Big", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
+        thread.messages.push(user_message(&"a".repeat(8 * 1024)));
+        database
+            .save_thread(session_id("thread-big"), thread, PathList::default(), None)
+            .await
+            .unwrap();
+
+        // First page: a small budget truncates and reports the next offset.
+        let first = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-big".to_string()),
+                max_bytes: Some(64),
+                offset: None,
+            },
+            &database,
+        )
+        .await
+        .unwrap();
+        let ThreadSearchToolOutput::Success { message } = first else {
+            panic!("show should succeed");
+        };
+        assert!(
+            message.contains("[Truncated:"),
+            "large thread should be truncated, got: {message}"
+        );
+        assert!(
+            message.contains("offset="),
+            "truncated note should carry the continuation offset, got: {message}"
+        );
+
+        // Paging past the "## User" header (10 bytes) lands in the content.
+        let paged = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-big".to_string()),
+                max_bytes: Some(16),
+                offset: Some(10),
+            },
+            &database,
+        )
+        .await
+        .unwrap();
+        let ThreadSearchToolOutput::Success { message } = paged else {
+            panic!("paged show should succeed");
+        };
+        assert!(
+            message.starts_with("aaaaaaaaaaaaaaaa"),
+            "paged show should start at the content, got: {message}"
+        );
+    }
+
+    #[gpui::test]
+    async fn show_rejects_excessive_max_bytes(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let mut thread = make_thread("T", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
+        thread.messages.push(user_message("hi"));
+        database
+            .save_thread(session_id("thread-t"), thread, PathList::default(), None)
+            .await
+            .unwrap();
+
+        let result = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-t".to_string()),
+                max_bytes: Some(MAX_SHOW_MAX_BYTES + 1),
+                offset: None,
+            },
+            &database,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ThreadSearchToolOutput::Error { error }) if error.contains("max_bytes")
+        ));
+    }
+
+    #[gpui::test]
+    async fn outline_lists_messages_without_content(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let mut thread = make_thread(
+            "Outline",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.messages.push(user_message("first message"));
+        thread.messages.push(user_message("second message"));
+        database
+            .save_thread(
+                session_id("thread-outline"),
+                thread,
+                PathList::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let outlined = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Outline,
+                query: None,
+                id: Some("thread-outline".to_string()),
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+        )
+        .await
+        .unwrap();
+        let ThreadSearchToolOutput::Success { message } = outlined else {
+            panic!("outline should succeed");
+        };
+        assert!(message.contains("2 message(s)"));
+        assert!(message.contains("[user]"));
+        assert!(message.contains("first message"));
     }
 }

@@ -620,7 +620,7 @@ pub struct DbReviewComment {
     pub updated_at: DateTime<Utc>,
 }
 
-fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }
