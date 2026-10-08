@@ -43,11 +43,12 @@ use heck::ToSnakeCase as _;
 use language::Buffer;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelCompletionStream, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
-    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
-    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role,
-    SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    LanguageModelCompletionStream, LanguageModelId, LanguageModelImage, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
+    LanguageModelToolResultContent, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
+    ProviderErrorCategory, Role, SelectedModel, Speed, StopReason, TokenUsage,
+    ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, WorktreeId, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -3562,43 +3563,13 @@ impl Thread {
                 )
             })?;
 
-            // Condense each chunk independently, with bounded concurrency. The
-            // futures are `'static`, so building them only borrows `cx` for the
-            // synchronous call and releases it before any await.
-            let condense_futures: Vec<_> = chunks
-                .iter()
-                .map(|chunk| {
-                    let request = build_chunk_condense_request(
-                        &thread_id,
-                        &prompt_id,
-                        temperature,
-                        chunk,
-                        &model,
-                    );
-                    provider.stream_completion(&model, request, cx)
-                })
-                .collect();
-
-            let stream_results = stream::iter(condense_futures)
-                .buffer_unordered(MAP_REDUCE_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-
-            let mut summaries = Vec::with_capacity(stream_results.len());
-            for result in stream_results {
-                summaries.push(collect_summary_text(result).await?);
-            }
-
-            if *cancellation_rx.borrow() {
-                return Ok(ControlFlow::Break(()));
-            }
-
-            let summary = merge_summaries(
+            let summary = map_reduce_summaries(
+                provider,
                 &model,
                 &thread_id,
                 &prompt_id,
                 temperature,
-                summaries,
+                &chunks,
                 cancellation_rx.clone(),
                 cx,
             )
@@ -4323,6 +4294,50 @@ impl Thread {
             .shared();
         self.pending_summary_generation = Some(task.clone());
         task
+    }
+
+    /// Computes a full-handoff summary of the entire history using map-reduce
+    /// compaction (chunk → condense → merge), so it works even when the history
+    /// exceeds the model's context window. Unlike [`Thread::summary`], this
+    /// never caches and never mutates the thread.
+    pub fn map_reduce_summary(&mut self, cx: &mut Context<Self>) -> Task<Option<SharedString>> {
+        let Some(model) = self.compaction_model(cx).or_else(|| self.model().cloned()) else {
+            log::error!("No model available for map-reduce summary");
+            return Task::ready(None);
+        };
+        let chunks = ContextChunker::new(map_reduce_chunk_capacity(&model)).chunk(&self.messages);
+        if chunks.is_empty() {
+            return Task::ready(None);
+        }
+
+        let thread_id = self.id.to_string();
+        let prompt_id = self.prompt_id.to_string();
+        let temperature = AgentSettings::temperature_for_model(&model, cx);
+
+        cx.spawn(async move |_this, cx| {
+            let provider = cx
+                .update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))
+                .log_err()?;
+            let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+            let summary = map_reduce_summaries(
+                provider,
+                &model,
+                &thread_id,
+                &prompt_id,
+                temperature,
+                &chunks,
+                cancellation_rx,
+                cx,
+            )
+            .await
+            .log_err()?;
+            let summary = summary.trim().to_string();
+            if summary.is_empty() {
+                None
+            } else {
+                Some(SharedString::from(summary))
+            }
+        })
     }
 
     pub fn generate_title(&mut self, cx: &mut Context<Self>) {
@@ -5791,6 +5806,57 @@ async fn merge_summaries(
     }
 
     Ok(summaries.join("\n\n"))
+}
+
+/// Condenses each chunk with a plain model call, then merges the chunk
+/// summaries into a single handoff. Shared by in-place compaction and the
+/// fork-and-continue summary path. Returns an error if cancelled mid-flight.
+async fn map_reduce_summaries(
+    provider: Arc<dyn LanguageModelProvider>,
+    model: &LanguageModel,
+    thread_id: &str,
+    prompt_id: &str,
+    temperature: Option<f32>,
+    chunks: &[Vec<Arc<Message>>],
+    mut cancellation_rx: watch::Receiver<bool>,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    // Condense each chunk independently, with bounded concurrency. The futures
+    // are `'static`, so building them only borrows `cx` for the synchronous
+    // call and releases it before any await.
+    let condense_futures: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            let request =
+                build_chunk_condense_request(thread_id, prompt_id, temperature, chunk, model);
+            provider.stream_completion(model, request, cx)
+        })
+        .collect();
+
+    let stream_results = stream::iter(condense_futures)
+        .buffer_unordered(MAP_REDUCE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut summaries = Vec::with_capacity(stream_results.len());
+    for result in stream_results {
+        summaries.push(collect_summary_text(result).await?);
+    }
+
+    if *cancellation_rx.borrow() {
+        return Err(anyhow::anyhow!("Map-reduce compaction cancelled"));
+    }
+
+    merge_summaries(
+        model,
+        thread_id,
+        prompt_id,
+        temperature,
+        summaries,
+        cancellation_rx,
+        cx,
+    )
+    .await
 }
 
 /// How a compaction pass will be performed for the retained history.
