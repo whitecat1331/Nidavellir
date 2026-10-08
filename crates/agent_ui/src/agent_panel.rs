@@ -46,7 +46,7 @@ use crate::terminal_thread_metadata_store::{
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    NewNativeAgentThreadFromSummary, NewNativeAgentThreadFromTruncate,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -404,6 +404,16 @@ pub fn init(cx: &mut App) {
                         if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                             panel.update(cx, |panel, cx| {
                                 panel.new_native_agent_thread_from_summary(action, window, cx)
+                            });
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        }
+                    },
+                )
+                .register_action(
+                    |workspace, action: &NewNativeAgentThreadFromTruncate, window, cx| {
+                        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.new_native_agent_thread_from_truncate(action, window, cx)
                             });
                             workspace.focus_panel::<AgentPanel>(window, cx);
                         }
@@ -3556,6 +3566,69 @@ impl AgentPanel {
                     None,
                     None,
                     Some(content),
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                anyhow::Ok(())
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn new_native_agent_thread_from_truncate(
+        &mut self,
+        action: &NewNativeAgentThreadFromTruncate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = action.from_session_id.clone();
+
+        self.ensure_native_agent_connection(cx);
+        let Some(connect_task) = self.connection_store.update(cx, |store, cx| {
+            store
+                .entry(&Agent::NativeAgent)
+                .map(|entry| entry.read(cx).wait_for_connection())
+        }) else {
+            return;
+        };
+        let title = self
+            .thread_store
+            .read(cx)
+            .entries()
+            .find(|t| t.id == session_id)
+            .map(|t| t.title)
+            .unwrap_or_else(|| SharedString::new_static("previous thread"));
+
+        cx.spawn_in(window, async move |this, cx| {
+            let connected = connect_task.await?;
+            let native_connection = connected
+                .connection
+                .downcast::<agent::NativeAgentConnection>()
+                .ok_or_else(|| anyhow!("native agent connection missing"))?;
+            let summary = cx
+                .update(|_window, cx| {
+                    native_connection
+                        .thread(&session_id, cx)
+                        .map(|thread| thread.update(cx, |thread, cx| thread.map_reduce_summary(cx)))
+                })?
+                .context("source thread not loaded")?
+                .await
+                .context("map-reduce summary failed")?;
+            let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+                "Continued from thread \"{title}\":\n\n{summary}"
+            )))];
+            this.update_in(cx, |this, window, cx| {
+                this.external_thread(
+                    Some(Agent::NativeAgent),
+                    None,
+                    None,
+                    None,
+                    Some(AgentInitialContent::ContentBlock {
+                        blocks,
+                        auto_submit: false,
+                    }),
                     true,
                     AgentThreadSource::AgentPanel,
                     window,
