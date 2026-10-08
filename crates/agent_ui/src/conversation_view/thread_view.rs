@@ -56,6 +56,13 @@ use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
+/// Tool outputs larger than this are collapsed to a preview instead of being
+/// rendered inline, so an oversized result never lays out and text-shapes the
+/// whole document at once (~1 ms per rendered line).
+const MAX_INLINE_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+/// How much of a collapsed tool output to show as a plain-text preview.
+const MAX_INLINE_TOOL_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
+
 #[derive(Default)]
 struct ThreadFeedbackState {
     feedback: Option<ThreadFeedback>,
@@ -594,6 +601,7 @@ pub struct ThreadView {
     current_prompt_ix: Option<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
+    expanded_large_tool_outputs: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v1::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -1017,6 +1025,7 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            expanded_large_tool_outputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -11197,6 +11206,20 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let source = markdown.read(cx).source();
+        if source.len() > MAX_INLINE_TOOL_OUTPUT_BYTES
+            && !self.expanded_large_tool_outputs.contains(&tool_call.id)
+        {
+            return self.render_collapsed_markdown_output(
+                source.clone(),
+                tool_call,
+                entry_ix,
+                context_ix,
+                card_layout,
+                cx,
+            );
+        }
+
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let output = self
             .render_numbered_read_file_output(
@@ -11230,6 +11253,57 @@ impl ThreadView {
             .text_xs()
             .text_color(cx.theme().colors().text_muted)
             .child(output)
+            .into_any_element()
+    }
+
+    /// Renders a collapsed preview of a tool output that exceeds
+    /// [`MAX_INLINE_TOOL_OUTPUT_BYTES`], so an oversized result never lays out
+    /// and text-shapes the whole document at once. Expanding is opt-in via the
+    /// button, which inserts the tool call into `expanded_large_tool_outputs`
+    /// and re-renders the full output.
+    fn render_collapsed_markdown_output(
+        &self,
+        source: SharedString,
+        tool_call: &ToolCall,
+        entry_ix: usize,
+        context_ix: usize,
+        card_layout: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let total_bytes = source.len();
+        let preview =
+            util::truncate_lines_to_byte_limit(&source, MAX_INLINE_TOOL_OUTPUT_PREVIEW_BYTES);
+        let tool_call_id = tool_call.id.clone();
+
+        v_flex()
+            .gap_2()
+            .map(|this| {
+                if card_layout {
+                    this.p_2().when(context_ix > 0, |this| {
+                        this.border_t_1()
+                            .border_color(self.tool_card_border_color(cx))
+                    })
+                } else {
+                    this.ml(rems(0.4))
+                        .px_3p5()
+                        .border_l_1()
+                        .border_color(self.tool_card_border_color(cx))
+                }
+            })
+            .text_xs()
+            .text_color(cx.theme().colors().text_muted)
+            .child(Label::new(preview))
+            .child(
+                Button::new(
+                    ("show-full-output", entry_ix),
+                    format!("Show full output ({total_bytes} bytes)"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.expanded_large_tool_outputs
+                        .insert(tool_call_id.clone());
+                    cx.notify();
+                })),
+            )
             .into_any_element()
     }
 
