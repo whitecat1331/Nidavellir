@@ -191,6 +191,9 @@ async fn run_action(
 }
 
 fn validate_max_bytes(value: usize) -> Result<usize, String> {
+    if value == 0 {
+        return Err("`max_bytes` must be at least 1.".to_string());
+    }
     if value > MAX_SHOW_MAX_BYTES {
         return Err(format!(
             "`max_bytes` must be at most {MAX_SHOW_MAX_BYTES}, got {value}"
@@ -774,6 +777,22 @@ mod tests {
         .await;
         assert!(matches!(
             result,
+            Err(ThreadSearchToolOutput::Error { error }) if error.contains("max_bytes")
+        ));
+
+        let zero = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-t".to_string()),
+                max_bytes: Some(0),
+                offset: None,
+            },
+            &database,
+        )
+        .await;
+        assert!(matches!(
+            zero,
             Err(ThreadSearchToolOutput::Error { error }) if error.contains("max_bytes")
         ));
     }
