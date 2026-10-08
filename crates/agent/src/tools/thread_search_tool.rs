@@ -369,7 +369,8 @@ fn message_role_label(message: &Message) -> &'static str {
 
 /// Renders messages into markdown the same way `messages_to_markdown` does, but
 /// stops once `max_bytes` of output has accumulated so an oversized thread never
-/// renders end to end.
+/// renders end to end. The result is truncated to `max_bytes` even when a single
+/// message alone exceeds it.
 fn bounded_messages_to_markdown(messages: &[Arc<Message>], max_bytes: usize) -> String {
     let mut markdown = String::new();
     for (index, message) in messages.iter().enumerate() {
@@ -384,6 +385,7 @@ fn bounded_messages_to_markdown(messages: &[Arc<Message>], max_bytes: usize) -> 
         }
         markdown.push_str(&message.to_markdown());
         if markdown.len() >= max_bytes {
+            markdown.truncate(floor_char_boundary(&markdown, max_bytes));
             break;
         }
     }
@@ -814,5 +816,120 @@ mod tests {
         assert!(message.contains("2 message(s)"));
         assert!(message.contains("[user]"));
         assert!(message.contains("first message"));
+    }
+
+    #[gpui::test]
+    async fn show_defaults_to_bounded_budget(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let mut thread = make_thread(
+            "Default",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.messages.push(user_message(&"b".repeat(80 * 1024)));
+        database
+            .save_thread(
+                session_id("thread-default"),
+                thread,
+                PathList::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let shown = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-default".to_string()),
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+        )
+        .await
+        .unwrap();
+        let ThreadSearchToolOutput::Success { message } = shown else {
+            panic!("show should succeed");
+        };
+        assert!(
+            message.contains("[Truncated:"),
+            "an 80 KiB thread should be truncated at the default budget, got: {message}"
+        );
+        assert!(
+            message.contains("65536"),
+            "the default budget is 64 KiB (65536 bytes), got: {message}"
+        );
+    }
+
+    #[gpui::test]
+    async fn search_bounds_content_scan(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        // A term within the first 64 KiB of content is matched.
+        let mut within = make_thread("Within", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
+        within.messages.push(user_message("needle-in-prefix"));
+        database
+            .save_thread(
+                session_id("thread-within"),
+                within,
+                PathList::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A term pushed past the 64 KiB content budget is not matched.
+        let mut beyond = make_thread("Beyond", Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap());
+        let mut tail = "a".repeat(70 * 1024);
+        tail.push_str(" needle-in-tail");
+        beyond.messages.push(user_message(&tail));
+        database
+            .save_thread(
+                session_id("thread-beyond"),
+                beyond,
+                PathList::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let hit = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Search,
+                query: Some("needle-in-prefix".to_string()),
+                id: None,
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+        )
+        .await
+        .unwrap();
+        let ThreadSearchToolOutput::Success { message } = hit else {
+            panic!("search should succeed");
+        };
+        assert!(message.contains("Within"));
+        assert!(message.contains("(matched in content)"));
+
+        let miss = run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Search,
+                query: Some("needle-in-tail".to_string()),
+                id: None,
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+        )
+        .await
+        .unwrap();
+        let ThreadSearchToolOutput::Success { message } = miss else {
+            panic!("search should succeed");
+        };
+        assert!(
+            message.contains("No threads matched"),
+            "a term beyond the 64 KiB content budget should not match, got: {message}"
+        );
     }
 }
