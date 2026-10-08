@@ -63,6 +63,13 @@ const MAX_INLINE_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 /// How much of a collapsed tool output to show as a plain-text preview.
 const MAX_INLINE_TOOL_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
 
+/// Whether a tool output should be collapsed to a preview instead of rendered
+/// inline. Collapse when it exceeds [`MAX_INLINE_TOOL_OUTPUT_BYTES`] unless the
+/// user has explicitly expanded it.
+fn should_collapse_tool_output(source: &str, is_expanded: bool) -> bool {
+    source.len() > MAX_INLINE_TOOL_OUTPUT_BYTES && !is_expanded
+}
+
 #[derive(Default)]
 struct ThreadFeedbackState {
     feedback: Option<ThreadFeedback>,
@@ -11207,9 +11214,10 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let source = markdown.read(cx).source();
-        if source.len() > MAX_INLINE_TOOL_OUTPUT_BYTES
-            && !self.expanded_large_tool_outputs.contains(&tool_call.id)
-        {
+        if should_collapse_tool_output(
+            source,
+            self.expanded_large_tool_outputs.contains(&tool_call.id),
+        ) {
             return self.render_collapsed_markdown_output(
                 source.clone(),
                 tool_call,
@@ -11274,6 +11282,12 @@ impl ThreadView {
         let preview =
             util::truncate_lines_to_byte_limit(&source, MAX_INLINE_TOOL_OUTPUT_PREVIEW_BYTES);
         let tool_call_id = tool_call.id.clone();
+        let title = tool_call
+            .name
+            .clone()
+            .unwrap_or_else(|| SharedString::from("Tool output"));
+        let open_markdown = source.clone();
+        let workspace = self.workspace.clone();
 
         v_flex()
             .gap_2()
@@ -11294,15 +11308,36 @@ impl ThreadView {
             .text_color(cx.theme().colors().text_muted)
             .child(Label::new(preview))
             .child(
-                Button::new(
-                    ("show-full-output", entry_ix),
-                    format!("Show full output ({total_bytes} bytes)"),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.expanded_large_tool_outputs
-                        .insert(tool_call_id.clone());
-                    cx.notify();
-                })),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(
+                            ("show-full-output", entry_ix),
+                            format!("Show full output ({total_bytes} bytes)"),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.expanded_large_tool_outputs
+                                .insert(tool_call_id.clone());
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(("open-in-buffer", entry_ix), "Open in buffer").on_click(
+                            cx.listener(move |_, _, window, cx| {
+                                let Some(workspace) = workspace.upgrade() else {
+                                    return;
+                                };
+                                open_markdown_in_workspace(
+                                    title.to_string(),
+                                    open_markdown.to_string(),
+                                    workspace,
+                                    window,
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                            }),
+                        ),
+                    ),
             )
             .into_any_element()
     }
@@ -13629,6 +13664,16 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_should_collapse_tool_output() {
+        let small = "x".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES);
+        let large = "x".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 1);
+
+        assert!(!should_collapse_tool_output(&small, false));
+        assert!(should_collapse_tool_output(&large, false));
+        assert!(!should_collapse_tool_output(&large, true));
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {
