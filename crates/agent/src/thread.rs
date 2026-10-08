@@ -5360,6 +5360,62 @@ fn repair_tool_call_pairing(messages: &mut Vec<LanguageModelRequestMessage>) {
     messages.retain(|message| !message.content.is_empty());
 }
 
+/// Splits a thread's history into window-fitting slices for map-reduce
+/// compaction. Each slice fits within `capacity_tokens` and cuts on **turn
+/// boundaries** (before a user message), so an assistant message's tool calls
+/// stay with their results. A turn larger than the budget becomes its own
+/// oversized slice rather than being split mid-turn.
+pub(crate) struct ContextChunker {
+    capacity_tokens: u64,
+}
+
+impl ContextChunker {
+    pub(crate) fn new(capacity_tokens: u64) -> Self {
+        Self { capacity_tokens }
+    }
+
+    pub(crate) fn chunk(&self, messages: &[Arc<Message>]) -> Vec<Vec<Arc<Message>>> {
+        let mut slices: Vec<Vec<Arc<Message>>> = Vec::new();
+        let mut current: Vec<Arc<Message>> = Vec::new();
+        let mut current_tokens: u64 = 0;
+
+        for message in messages {
+            let is_turn_start = matches!(message.as_ref(), Message::User(_));
+            let message_tokens = estimate_message_tokens(message.as_ref());
+
+            // Cut before a new turn when adding it would overflow the slice.
+            if is_turn_start
+                && !current.is_empty()
+                && current_tokens.saturating_add(message_tokens) > self.capacity_tokens
+            {
+                slices.push(std::mem::take(&mut current));
+                current_tokens = 0;
+            }
+
+            current.push(message.clone());
+            current_tokens = current_tokens.saturating_add(message_tokens);
+        }
+
+        if !current.is_empty() {
+            slices.push(current);
+        }
+
+        slices
+    }
+}
+
+/// Rough token estimate for a single message, matching
+/// [`COMPACTION_BYTES_PER_TOKEN`] (1 token ≈ 4 bytes). Rendered markdown is a
+/// cheap, content-complete proxy for the request-message size.
+fn estimate_message_tokens(message: &Message) -> u64 {
+    let bytes = message.to_markdown().len() as u64;
+    if bytes == 0 {
+        0
+    } else {
+        bytes.saturating_add(COMPACTION_BYTES_PER_TOKEN - 1) / COMPACTION_BYTES_PER_TOKEN
+    }
+}
+
 /// Describes where a streamed compaction summary should land in the thread
 /// once it completes successfully.
 enum CompactionInsertion {
@@ -7826,6 +7882,59 @@ mod tests {
             .iter()
             .map(LanguageModelRequestMessage::string_contents)
             .collect()
+    }
+
+    #[test]
+    fn test_context_chunker_splits_at_turn_boundaries() {
+        let messages = vec![
+            user_text_message(ClientUserMessageId::new(), "turn one"),
+            agent_text_message("answer one"),
+            user_text_message(ClientUserMessageId::new(), "turn two"),
+            agent_text_message("answer two"),
+            user_text_message(ClientUserMessageId::new(), "turn three"),
+            agent_text_message("answer three"),
+        ];
+
+        let one_turn_tokens = estimate_message_tokens(messages[0].as_ref())
+            + estimate_message_tokens(messages[1].as_ref());
+        let slices = ContextChunker::new(one_turn_tokens).chunk(&messages);
+
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].len(), 2);
+        assert_eq!(slices[1].len(), 2);
+        assert_eq!(slices[2].len(), 2);
+    }
+
+    #[test]
+    fn test_context_chunker_keeps_agent_with_its_user_turn() {
+        let messages = vec![
+            user_text_message(ClientUserMessageId::new(), "one"),
+            agent_text_message("a"),
+            agent_text_message("b"),
+            user_text_message(ClientUserMessageId::new(), "two"),
+        ];
+
+        let first_turn_tokens = estimate_message_tokens(messages[0].as_ref())
+            + estimate_message_tokens(messages[1].as_ref())
+            + estimate_message_tokens(messages[2].as_ref());
+        let slices = ContextChunker::new(first_turn_tokens).chunk(&messages);
+
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].len(), 3);
+        assert_eq!(slices[1].len(), 1);
+    }
+
+    #[test]
+    fn test_context_chunker_oversized_turn_stays_whole() {
+        let messages = vec![
+            user_text_message(ClientUserMessageId::new(), &"x".repeat(400)),
+            agent_text_message("tail"),
+        ];
+
+        let slices = ContextChunker::new(1).chunk(&messages);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].len(), 2);
     }
 
     #[gpui::test]
