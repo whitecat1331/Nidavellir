@@ -2287,6 +2287,7 @@ impl NativeAgent {
                         title: format!("{title} (continued)").into(),
                         prompt: format!("Continued from thread \"{title}\":\n\n{summary}"),
                         auto_submit: false,
+                        focus: true,
                         agent_id: None,
                         model: None,
                         use_new_worktree: false,

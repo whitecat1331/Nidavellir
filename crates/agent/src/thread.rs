@@ -893,6 +893,11 @@ pub struct SiblingThreadRequest {
     pub prompt: String,
     /// Whether to submit `prompt` automatically once the new thread opens.
     pub auto_submit: bool,
+    /// Whether to switch the UI to the new thread once it is created.
+    /// Fork-and-continue sets this so the user lands in the continuation;
+    /// the `create_thread` tool leaves it `false` so spawning a sibling can't
+    /// steal focus from an in-progress turn.
+    pub focus: bool,
     /// Optional agent ID to use. Defaults to the native Zed agent.
     pub agent_id: Option<String>,
     /// Optional model override, as `provider/model-id`.
@@ -3703,6 +3708,7 @@ impl Thread {
                         title: format!("{title} (continued)").into(),
                         prompt: build_fork_continuation_prompt(&title, &summary, &tail),
                         auto_submit: true,
+                        focus: true,
                         agent_id: None,
                         model: None,
                         use_new_worktree: false,

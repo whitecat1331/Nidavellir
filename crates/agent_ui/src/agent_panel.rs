@@ -1011,6 +1011,11 @@ pub struct CreateThreadOptions {
     /// freshly-created sibling worktree). When `None`, the thread inherits
     /// the project's default path list.
     pub work_dirs: Option<PathList>,
+    /// Whether to switch the panel to the new thread once it is created.
+    /// `create_thread` (the agent tool) leaves this `false` so spawning a
+    /// sibling can't yank focus out from under an in-progress turn; the
+    /// fork-and-continue paths set it so the user lands in the continuation.
+    pub focus: bool,
 }
 
 pub(crate) struct AgentThread {
@@ -3258,10 +3263,11 @@ impl AgentPanel {
         self.serialize(cx);
     }
 
-    /// Creates a new retained thread and inserts it into the sidebar without
-    /// switching the active view to it. Used by the `create_thread` agent tool,
-    /// which passes an initial prompt, and optionally an agent and model
-    /// override.
+    /// Creates a new retained thread and inserts it into the sidebar. The
+    /// active view is left on the current thread unless `options.focus` is set
+    /// (used by the fork-and-continue paths so the user lands in the new
+    /// thread). Used by the `create_thread` agent tool, which passes an initial
+    /// prompt, and optionally an agent and model override.
     pub fn create_thread_with_options(
         &mut self,
         options: CreateThreadOptions,
@@ -3281,6 +3287,17 @@ impl AgentPanel {
         // shouldn't let that change the panel's selected_agent or the
         // last-used-agent preference. Snapshot and restore both.
         let saved_selected_agent = override_used.then(|| self.selected_agent.clone());
+        // A non-auto-submitted seed is written into the message editor, but the
+        // editor's draft-persist observer only subscribes *after* that write, so
+        // the seed would be lost on restart. Persist it here so
+        // `open_fresh_thread`'s draft-store restore path can find it.
+        let seed_draft = match &options.initial_content {
+            Some(AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: false,
+            }) => Some(blocks.clone()),
+            _ => None,
+        };
         let thread = self.create_agent_thread_with_server(
             agent,
             None,
@@ -3296,8 +3313,20 @@ impl AgentPanel {
         if let Some(original) = saved_selected_agent {
             self.set_selected_agent_and_persist(original, cx);
         }
-        let thread_id = thread.conversation_view.read(cx).thread_id;
-        self.insert_retained_thread(thread_id, thread.conversation_view, cx);
+        let conversation_view = thread.conversation_view;
+        let thread_id = conversation_view.read(cx).thread_id;
+        self.insert_retained_thread(thread_id, conversation_view.clone(), cx);
+        if let Some(blocks) = seed_draft {
+            crate::draft_prompt_store::write(thread_id, &blocks, cx).detach_and_log_err(cx);
+        }
+        if options.focus {
+            self.set_base_view(
+                BaseView::AgentThread { conversation_view },
+                true,
+                window,
+                cx,
+            );
+        }
         thread_id
     }
 
@@ -3331,6 +3360,7 @@ impl AgentPanel {
             worktree_name: None,
             base_ref: None,
             auto_submit: false,
+            focus: true,
         };
 
         let host = AgentPanelSiblingHost::new(cx.entity().downgrade(), window.window_handle());
@@ -5561,6 +5591,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 agent: agent_choice.clone(),
                 model: request.model.clone(),
                 work_dirs: None,
+                focus: request.focus,
             };
 
             // If the caller asked for a fresh worktree, open a new workspace
@@ -15003,6 +15034,41 @@ mod tests {
                 panel.selected_agent,
                 Agent::Stub,
                 "selected_agent should be restored to the original after an agent override"
+            );
+        });
+
+        // Case 3: `focus` switches the active view to the new thread; the
+        // default (`focus: false`) must leave it where it was, since the
+        // `create_thread` tool relies on not stealing focus.
+        panel.read_with(&cx, |panel, cx| {
+            assert_ne!(
+                panel.active_thread_id(cx),
+                Some(no_override_id),
+                "a thread created without `focus` must not steal the active view"
+            );
+        });
+
+        let focused_id = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.create_thread_with_options(
+                CreateThreadOptions {
+                    focus: true,
+                    ..CreateThreadOptions::default()
+                },
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel.retained_threads.contains_key(&focused_id),
+                "a focused thread should still be retained"
+            );
+            assert_eq!(
+                panel.active_thread_id(cx),
+                Some(focused_id),
+                "`focus: true` should switch the active view to the new thread"
             );
         });
     }
