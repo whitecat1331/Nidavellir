@@ -22,17 +22,40 @@ const DEFAULT_POLL_SECONDS: u64 = 10;
 /// (or flips `## Status` to `complete`/`rejected`). The tool polls the file and
 /// returns the verdict plus the report text, so the originating agent can
 /// continue without a human relaying the result.
+///
+/// When the plan has `[agent-origin]` GUI steps it ends its headless half with a
+/// `Handoff: READY-FOR-GUI` line instead (leaving `## Status` `open`); pass
+/// `phase: "handoff"` to return as soon as that line appears, so the originating
+/// agent can drive the window. A terminal `Result`/`Status` always wins over the
+/// handoff, so the originator's final verdict supersedes it.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WaitForReportToolInput {
     /// Path to the `VERIFY_*.md` report to wait on (absolute, or relative to a
     /// worktree root).
     pub report_path: String,
+    /// How to end the wait. `final` (default) blocks until the terminal
+    /// `Result`/`Status` marker; `handoff` also returns on a
+    /// `Handoff: READY-FOR-GUI` line.
+    #[serde(default)]
+    pub phase: WaitPhase,
     /// Maximum seconds to wait before returning a timeout result. Default 1800.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
     /// Seconds between re-reads of the report. Default 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_seconds: Option<u64>,
+}
+
+/// Whether the wait stops at the one-spawn `READY-FOR-GUI` handoff or runs
+/// through to the terminal verdict. Mirrors `wait-for-report.py --phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitPhase {
+    /// Block until the terminal `Result`/`Status` marker.
+    #[default]
+    Final,
+    /// Also return as soon as a `Handoff: READY-FOR-GUI` line appears.
+    Handoff,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +161,7 @@ async fn wait_for_report(
             .clamp(1, 60),
     );
     let deadline = Instant::now() + timeout;
+    let phase = input.phase;
 
     loop {
         // The report may not exist yet right after launch; an empty read just
@@ -148,6 +172,16 @@ async fn wait_for_report(
         if state == "complete" || state == "rejected" {
             return Ok(WaitForReportToolOutput::Success {
                 message: format_terminal(&state, verdict.as_deref(), &text),
+            });
+        }
+
+        if phase == WaitPhase::Handoff && state == "handoff" {
+            return Ok(WaitForReportToolOutput::Success {
+                message: format!(
+                    "wait_for_report: READY — handoff reached; drive the GUI against the \
+                     launched window now.\n\n{}",
+                    extract_report(&text),
+                ),
             });
         }
 
@@ -167,9 +201,12 @@ async fn wait_for_report(
     }
 }
 
-/// Parses the report's terminal marker. A `Result: PASS`/`FAIL` line anywhere
-/// is authoritative; otherwise the first non-empty line under `## Status`
-/// decides `complete`/`rejected`/`open`. Returns `(state, verdict)`.
+/// Parses the report's state. A `Result: PASS`/`FAIL` line anywhere is
+/// authoritative; then the first non-empty line under `## Status`
+/// (`complete`/`rejected`); then a `Handoff: READY-FOR-GUI` line (a
+/// non-terminal `handoff`); then `open`. A terminal Result/Status always wins
+/// over the handoff, so the originator's final verdict supersedes it. Returns
+/// `(state, verdict)`.
 fn parse_state(text: &str) -> (String, Option<String>) {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -184,6 +221,7 @@ fn parse_state(text: &str) -> (String, Option<String>) {
         }
     }
 
+    let mut status_value: Option<String> = None;
     let mut in_status = false;
     for line in text.lines() {
         if is_status_heading(line) {
@@ -198,20 +236,43 @@ fn parse_state(text: &str) -> (String, Option<String>) {
         }
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let low = trimmed.to_lowercase();
-            if low.contains("complete") {
-                return ("complete".to_string(), None);
-            }
-            if low.contains("rejected") {
-                return ("rejected".to_string(), None);
-            }
-            if low.contains("open") {
-                return ("open".to_string(), None);
-            }
+            status_value = Some(trimmed.to_lowercase());
             break;
         }
     }
+
+    if let Some(value) = &status_value {
+        if value.contains("complete") {
+            return ("complete".to_string(), None);
+        }
+        if value.contains("rejected") {
+            return ("rejected".to_string(), None);
+        }
+    }
+
+    if has_handoff(text) {
+        return ("handoff".to_string(), None);
+    }
+
+    if let Some(value) = &status_value {
+        if value.contains("open") {
+            return ("open".to_string(), None);
+        }
+    }
+
     ("unknown".to_string(), None)
+}
+
+/// True when the report carries the one-spawn handoff sentinel on its own line —
+/// `Handoff: READY-FOR-GUI` — the same signal `wait-for-report.py --phase handoff`
+/// returns on.
+fn has_handoff(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix("Handoff:")
+            .map(|rest| rest.trim().eq_ignore_ascii_case("READY-FOR-GUI"))
+            .unwrap_or(false)
+    })
 }
 
 fn format_terminal(state: &str, verdict: Option<&str>, text: &str) -> String {
@@ -304,6 +365,53 @@ mod tests {
     fn parse_state_unknown_without_marker() {
         let (state, _) = parse_state("## Status\n\n\n");
         assert_eq!(state, "unknown");
+    }
+
+    #[test]
+    fn parse_state_detects_handoff() {
+        let text = "## Report back\n\n- [x] Step 1 — ✅\n\n## Status\n\nopen — awaiting handoff\n\nHandoff: READY-FOR-GUI\n";
+        let (state, verdict) = parse_state(text);
+        assert_eq!(state, "handoff");
+        assert_eq!(verdict, None);
+    }
+
+    #[test]
+    fn parse_state_terminal_result_beats_handoff() {
+        let text = "## Status\n\nopen\n\nHandoff: READY-FOR-GUI\n\nResult: PASS\n";
+        let (state, verdict) = parse_state(text);
+        assert_eq!(state, "complete");
+        assert_eq!(verdict.as_deref(), Some("PASS"));
+    }
+
+    #[test]
+    fn parse_state_status_complete_beats_handoff() {
+        let text = "## Status\n\ncomplete\n\nHandoff: READY-FOR-GUI\n";
+        let (state, _) = parse_state(text);
+        assert_eq!(state, "complete");
+    }
+
+    #[test]
+    fn parse_state_handoff_requires_exact_sentinel() {
+        // The plan template's placeholder line must not read as a real handoff.
+        let text =
+            "## Status\n\nopen\n\nHandoff: (agent-test writes `READY-FOR-GUI` here, then stops)\n";
+        let (state, _) = parse_state(text);
+        assert_eq!(state, "open");
+    }
+
+    #[test]
+    fn wait_phase_defaults_to_final() {
+        let input: WaitForReportToolInput =
+            serde_json::from_str(r#"{"report_path":"x.md"}"#).expect("input deserializes");
+        assert_eq!(input.phase, WaitPhase::Final);
+    }
+
+    #[test]
+    fn wait_phase_parses_handoff() {
+        let input: WaitForReportToolInput =
+            serde_json::from_str(r#"{"report_path":"x.md","phase":"handoff"}"#)
+                .expect("input deserializes");
+        assert_eq!(input.phase, WaitPhase::Handoff);
     }
 
     #[test]
