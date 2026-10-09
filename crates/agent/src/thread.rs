@@ -1372,6 +1372,9 @@ pub struct Thread {
     end_turn_at_next_boundary: bool,
     pending_message: Option<AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
+    /// Bridge for creating sibling threads (fork-and-continue). Set when the
+    /// default tool set is installed; absent for threads created without one.
+    environment: Option<Rc<dyn ThreadEnvironment>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
     cumulative_token_usage: TokenUsage,
     /// The per-field maximum usage snapshot already added to
@@ -1528,6 +1531,7 @@ impl Thread {
             end_turn_at_next_boundary: false,
             pending_message: None,
             tools: BTreeMap::default(),
+            environment: None,
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
@@ -1914,6 +1918,7 @@ impl Thread {
             end_turn_at_next_boundary: false,
             pending_message: None,
             tools: BTreeMap::default(),
+            environment: None,
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
@@ -2271,6 +2276,7 @@ impl Thread {
         environment: Rc<dyn ThreadEnvironment>,
         cx: &mut Context<Self>,
     ) {
+        self.environment = Some(environment.clone());
         // Only update the agent location for the root thread, not for subagents.
         let update_agent_location = self.parent_thread_id().is_none();
 
@@ -3392,16 +3398,32 @@ impl Thread {
                 .await
             }
             CompactionPlan::MapReduce { chunks } => {
-                Self::stream_map_reduce_compaction(
-                    this,
-                    event_stream,
-                    cancellation_rx,
-                    model,
-                    chunks,
-                    CompactionInsertion::Auto { insertion_ix },
-                    cx,
-                )
-                .await
+                // Fork-and-continue only makes sense for top-level threads —
+                // a subagent's continuation stays in place.
+                let fork_enabled = this.read_with(cx, |this, _| !this.is_subagent())?;
+                if fork_enabled {
+                    Self::stream_map_reduce_fork(
+                        this,
+                        event_stream,
+                        cancellation_rx,
+                        model,
+                        chunks,
+                        insertion_ix,
+                        cx,
+                    )
+                    .await
+                } else {
+                    Self::stream_map_reduce_compaction(
+                        this,
+                        event_stream,
+                        cancellation_rx,
+                        model,
+                        chunks,
+                        CompactionInsertion::Auto { insertion_ix },
+                        cx,
+                    )
+                    .await
+                }
             }
         }
     }
@@ -3497,27 +3519,7 @@ impl Thread {
                 acp_thread::ContextCompactionStatus::Completed,
             );
 
-            this.update(cx, |this, cx| {
-                let compaction =
-                    Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
-                match insertion {
-                    CompactionInsertion::Auto { insertion_ix } => {
-                        if insertion_ix <= this.messages.len() {
-                            this.messages.insert(insertion_ix, compaction);
-                        } else {
-                            this.messages.push(compaction);
-                        }
-                    }
-                    CompactionInsertion::Manual { marker_id } => {
-                        this.messages.push(Arc::new(Message::User(UserMessage {
-                            id: marker_id,
-                            content: Arc::from([]),
-                        })));
-                        this.messages.push(compaction);
-                    }
-                }
-                cx.notify();
-            })?;
+            insert_compaction_summary(this, summary, &insertion, cx)?;
 
             Ok(ControlFlow::Continue(()))
         }
@@ -3571,6 +3573,7 @@ impl Thread {
                 temperature,
                 &chunks,
                 cancellation_rx.clone(),
+                None,
                 cx,
             )
             .await?;
@@ -3589,29 +3592,150 @@ impl Thread {
                 acp_thread::ContextCompactionStatus::Completed,
             );
 
-            this.update(cx, |this, cx| {
-                let compaction =
-                    Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
-                match insertion {
-                    CompactionInsertion::Auto { insertion_ix } => {
-                        if insertion_ix <= this.messages.len() {
-                            this.messages.insert(insertion_ix, compaction);
-                        } else {
-                            this.messages.push(compaction);
-                        }
-                    }
-                    CompactionInsertion::Manual { marker_id } => {
-                        this.messages.push(Arc::new(Message::User(UserMessage {
-                            id: marker_id,
-                            content: Arc::from([]),
-                        })));
-                        this.messages.push(compaction);
-                    }
-                }
-                cx.notify();
-            })?;
+            insert_compaction_summary(this, summary, &insertion, cx)?;
 
             Ok(ControlFlow::Continue(()))
+        }
+        .await;
+
+        if result.is_err() {
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Failed,
+            );
+        }
+        result
+    }
+
+    /// Phase 4 auto-fallback: when the retained history can't fit in a single
+    /// compaction request, condense it with map-reduce and fork-and-continue
+    /// into a new sibling thread seeded with the merged summary plus the
+    /// retained verbatim tail, leaving this thread untouched. Falls back to
+    /// in-place compaction when forking isn't available (no environment, no
+    /// sibling host, or the fork fails).
+    async fn stream_map_reduce_fork(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        mut cancellation_rx: watch::Receiver<bool>,
+        model: LanguageModel,
+        chunks: Vec<Vec<Arc<Message>>>,
+        insertion_ix: usize,
+        cx: &mut AsyncApp,
+    ) -> Result<ControlFlow<()>> {
+        if *cancellation_rx.borrow() {
+            return Ok(ControlFlow::Break(()));
+        }
+
+        log::debug!(
+            "Running map-reduce fork-and-continue over {} chunks",
+            chunks.len()
+        );
+        let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
+        event_stream.send_context_compaction(
+            compaction_id.clone(),
+            acp_thread::ContextCompactionStatus::InProgress,
+        );
+
+        let result: Result<ControlFlow<()>> = async {
+            let provider =
+                cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
+            let (thread_id, prompt_id, temperature, title, tail, environment) =
+                this.update(cx, |this, cx| {
+                    let insertion_ix = insertion_ix.min(this.messages.len());
+                    (
+                        this.id.to_string(),
+                        this.prompt_id.to_string(),
+                        AgentSettings::temperature_for_model(&model, cx),
+                        this.title.clone(),
+                        messages_to_markdown(&this.messages[insertion_ix..]),
+                        this.environment.clone(),
+                    )
+                })?;
+
+            let progress = |message: String| {
+                event_stream.send_context_compaction_update(compaction_id.clone(), &message);
+            };
+            let summary = match map_reduce_summaries(
+                provider,
+                &model,
+                &thread_id,
+                &prompt_id,
+                temperature,
+                &chunks,
+                cancellation_rx.clone(),
+                Some(&progress),
+                cx,
+            )
+            .await
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    if *cancellation_rx.borrow() {
+                        event_stream.update_context_compaction_status(
+                            compaction_id.clone(),
+                            acp_thread::ContextCompactionStatus::Canceled,
+                        );
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    return Err(error);
+                }
+            };
+            let summary = summary.trim().to_string();
+            if summary.is_empty() {
+                log::warn!("Map-reduce compaction produced an empty summary");
+                return Err(anyhow::anyhow!(
+                    "Map-reduce compaction produced an empty summary"
+                ));
+            }
+
+            event_stream.send_context_compaction_update(compaction_id.clone(), &summary);
+            event_stream.update_context_compaction_status(
+                compaction_id.clone(),
+                acp_thread::ContextCompactionStatus::Completed,
+            );
+
+            // Fork-and-continue: seed a sibling thread with the merged summary
+            // and the retained verbatim tail, and let it continue the work.
+            let fork_result = match environment {
+                Some(environment) => {
+                    let title = title.unwrap_or_else(|| SharedString::from("Previous thread"));
+                    let request = SiblingThreadRequest {
+                        title: format!("{title} (continued)").into(),
+                        prompt: build_fork_continuation_prompt(&title, &summary, &tail),
+                        auto_submit: true,
+                        agent_id: None,
+                        model: None,
+                        use_new_worktree: false,
+                        worktree_name: None,
+                        base_ref: None,
+                    };
+                    environment.create_sibling_thread(request, cx).await
+                }
+                None => Err(anyhow::anyhow!(
+                    "No thread environment for fork-and-continue"
+                )),
+            };
+
+            match fork_result {
+                Ok(info) => {
+                    event_stream
+                        .send_text(&format!("Continued in a new thread: \"{}\"", info.title));
+                    this.update(cx, |this, _| {
+                        this.emit_compaction_telemetry_outcome("forked", None)
+                    })?;
+                    Ok(ControlFlow::Break(()))
+                }
+                Err(fork_error) => {
+                    log::warn!("Fork-and-continue unavailable ({fork_error}); compacting in place");
+                    insert_compaction_summary(
+                        this,
+                        summary,
+                        &CompactionInsertion::Auto { insertion_ix },
+                        cx,
+                    )?;
+                    Ok(ControlFlow::Continue(()))
+                }
+            }
         }
         .await;
 
@@ -4327,6 +4451,7 @@ impl Thread {
                 temperature,
                 &chunks,
                 cancellation_rx,
+                None,
                 cx,
             )
             .await
@@ -5663,6 +5788,49 @@ fn group_summaries_for_merge(summaries: &[String], capacity_tokens: u64) -> Vec<
     groups
 }
 
+/// Inserts a compaction summary into the thread at the location described by
+/// `insertion`, shared by the single-shot, map-reduce, and fork-fallback paths.
+fn insert_compaction_summary(
+    this: &WeakEntity<Thread>,
+    summary: String,
+    insertion: &CompactionInsertion,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    this.update(cx, |this, cx| {
+        let compaction = Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
+        match insertion {
+            CompactionInsertion::Auto { insertion_ix } => {
+                if *insertion_ix <= this.messages.len() {
+                    this.messages.insert(*insertion_ix, compaction);
+                } else {
+                    this.messages.push(compaction);
+                }
+            }
+            CompactionInsertion::Manual { marker_id } => {
+                this.messages.push(Arc::new(Message::User(UserMessage {
+                    id: marker_id.clone(),
+                    content: Arc::from([]),
+                })));
+                this.messages.push(compaction);
+            }
+        }
+        cx.notify();
+    })
+}
+
+/// The seed prompt for a fork-and-continue sibling thread: the "continued
+/// from" preamble, the merged summary, and — when present — the retained
+/// verbatim tail (the active working set).
+fn build_fork_continuation_prompt(title: &str, summary: &str, tail: &str) -> String {
+    let mut prompt =
+        format!("Continued from thread \"{title}\".\n\n## Conversation summary\n\n{summary}");
+    if !tail.trim().is_empty() {
+        prompt.push_str("\n\n## The user's most recent message\n\n");
+        prompt.push_str(tail);
+    }
+    prompt
+}
+
 fn build_chunk_condense_request(
     thread_id: &str,
     prompt_id: &str,
@@ -5764,6 +5932,7 @@ async fn merge_summaries(
     temperature: Option<f32>,
     mut summaries: Vec<String>,
     mut cancellation_rx: watch::Receiver<bool>,
+    progress: Option<&dyn Fn(String)>,
     cx: &mut AsyncApp,
 ) -> Result<String> {
     let provider =
@@ -5779,6 +5948,9 @@ async fn merge_summaries(
             // Nothing shrank: the summaries are individually too large to
             // merge within the budget, so stop instead of looping for nothing.
             break;
+        }
+        if let Some(progress) = progress {
+            progress(format!("Merging {} summaries…", summaries.len()));
         }
 
         let merge_futures: Vec<_> = groups
@@ -5819,11 +5991,19 @@ async fn map_reduce_summaries(
     temperature: Option<f32>,
     chunks: &[Vec<Arc<Message>>],
     mut cancellation_rx: watch::Receiver<bool>,
+    progress: Option<&dyn Fn(String)>,
     cx: &mut AsyncApp,
 ) -> Result<String> {
     // Condense each chunk independently, with bounded concurrency. The futures
     // are `'static`, so building them only borrows `cx` for the synchronous
     // call and releases it before any await.
+    if let Some(progress) = progress {
+        progress(format!(
+            "Condensing {} chunk{}…",
+            chunks.len(),
+            if chunks.len() == 1 { "" } else { "s" }
+        ));
+    }
     let condense_futures: Vec<_> = chunks
         .iter()
         .map(|chunk| {
@@ -5839,8 +6019,11 @@ async fn map_reduce_summaries(
         .await;
 
     let mut summaries = Vec::with_capacity(stream_results.len());
-    for result in stream_results {
+    for (ix, result) in stream_results.into_iter().enumerate() {
         summaries.push(collect_summary_text(result).await?);
+        if let Some(progress) = progress {
+            progress(format!("Condensed chunk {}/{}", ix + 1, chunks.len()));
+        }
     }
 
     if *cancellation_rx.borrow() {
@@ -5854,6 +6037,7 @@ async fn map_reduce_summaries(
         temperature,
         summaries,
         cancellation_rx,
+        progress,
         cx,
     )
     .await
@@ -9155,6 +9339,161 @@ mod tests {
                     }
                 }
             });
+        });
+    }
+
+    /// When a send-path compaction needs map-reduce and the environment
+    /// supports sibling threads, the thread forks-and-continues: a sibling is
+    /// seeded with the merged summary plus the retained verbatim tail, the
+    /// turn in the original thread ends with a notice, and the original
+    /// history is untouched.
+    #[gpui::test]
+    async fn test_map_reduce_fork_creates_sibling_thread(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let environment =
+            Rc::new(crate::tests::FakeThreadEnvironment::default().with_sibling_threads());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.add_default_tools(environment.clone(), cx);
+                thread.set_title("Oversized thread".into(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "old history"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "please continue the work",
+                ));
+            });
+        });
+
+        let (events_tx, mut events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let event_stream = ThreadEventStream::new(events_tx);
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let chunks = ContextChunker::new(map_reduce_chunk_capacity(&model))
+            .chunk(&thread.read_with(cx, |thread, _| thread.messages[..2].to_vec()));
+
+        let weak_thread = thread.downgrade();
+        let fork_model = model.clone();
+        let fork_task = cx.spawn(async move |mut cx| {
+            Thread::stream_map_reduce_fork(
+                &weak_thread,
+                &event_stream,
+                cancellation_rx,
+                fork_model,
+                chunks,
+                2,
+                &mut cx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+
+        // One condense request (a single chunk) — answer it.
+        let request = fake.pending_completions().pop().unwrap();
+        assert_eq!(
+            request.intent,
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+        fake.send_text(&model, &request, "merged handoff summary");
+        fake.end_stream(&model, &request);
+        cx.run_until_parked();
+
+        assert!(matches!(fork_task.await, Ok(ControlFlow::Break(()))));
+
+        // The fork seeded a sibling thread and left the original untouched.
+        let requests = environment.sibling_thread_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].title.as_ref(), "Oversized thread (continued)");
+        assert!(requests[0].auto_submit);
+        assert!(requests[0].prompt.contains("merged handoff summary"));
+        assert!(requests[0].prompt.contains("please continue the work"));
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.messages.len(), 3);
+            assert!(matches!(&*thread.messages[0], Message::User(_)));
+            assert!(matches!(&*thread.messages[1], Message::Agent(_)));
+            assert!(matches!(&*thread.messages[2], Message::User(_)));
+        });
+
+        // The original thread's stream carries the "continued in …" notice.
+        let mut saw_notice = false;
+        while let Some(event) = events_rx.next().await {
+            if let Ok(ThreadEvent::AgentText(text)) = event
+                && text.contains("Continued in a new thread")
+            {
+                saw_notice = true;
+            }
+        }
+        assert!(saw_notice, "expected a fork notice in the original thread");
+    }
+
+    /// When the environment can't create sibling threads, the send-path fork
+    /// falls back to in-place compaction with the summary already computed.
+    #[gpui::test]
+    async fn test_map_reduce_fork_falls_back_to_in_place_compaction(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        // Default FakeThreadEnvironment: sibling threads unsupported.
+        let environment = Rc::new(crate::tests::FakeThreadEnvironment::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.add_default_tools(environment.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "old history"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "pending question",
+                ));
+            });
+        });
+
+        let (events_tx, _events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let event_stream = ThreadEventStream::new(events_tx);
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let chunks = ContextChunker::new(map_reduce_chunk_capacity(&model))
+            .chunk(&thread.read_with(cx, |thread, _| thread.messages[..2].to_vec()));
+
+        let weak_thread = thread.downgrade();
+        let fork_model = model.clone();
+        let fork_task = cx.spawn(async move |mut cx| {
+            Thread::stream_map_reduce_fork(
+                &weak_thread,
+                &event_stream,
+                cancellation_rx,
+                fork_model,
+                chunks,
+                2,
+                &mut cx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+
+        let request = fake.pending_completions().pop().unwrap();
+        fake.send_text(&model, &request, "handoff summary");
+        fake.end_stream(&model, &request);
+        cx.run_until_parked();
+
+        assert!(matches!(fork_task.await, Ok(ControlFlow::Continue(()))));
+        assert!(
+            environment.sibling_thread_requests().is_empty(),
+            "no sibling request should be created when forking is unsupported"
+        );
+
+        // The fallback inserted the summary in place, before the pending user
+        // message.
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.messages.len(), 4);
+            assert!(matches!(&*thread.messages[2], Message::Compaction(_)));
+            assert!(matches!(&*thread.messages[3], Message::User(_)));
         });
     }
 

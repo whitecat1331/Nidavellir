@@ -204,6 +204,8 @@ impl From<&Skill> for NativeAvailableSkill {
 
 pub const COMPACT_COMMAND_NAME: &str = "compact";
 
+pub const TRUNCATE_COMMAND_NAME: &str = "truncate";
+
 /// Returns the set of MCP prompt names that must be server-qualified
 /// (`/<server>.<name>`) to stay unambiguous in the slash-command popup: names
 /// shared by more than one MCP prompt, or names colliding with a reserved
@@ -1650,13 +1652,22 @@ impl NativeAgent {
             acp_thread::CommandCategory::Native,
         ));
 
+        let truncate_command = acp_v1::AvailableCommand::new(
+            TRUNCATE_COMMAND_NAME,
+            "Continue this conversation in a new thread with a compressed summary",
+        )
+        .meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Native,
+        ));
+
         let registry = state.context_server_registry.read(cx);
 
-        // Reserve the built-in command name so a same-named MCP prompt is
-        // force-prefixed (`/<server>.compact`) and stays reachable: an
-        // unqualified `/compact` always routes to the native command.
+        // Reserve the built-in command names so same-named MCP prompts are
+        // force-prefixed (`/<server>.compact`) and stay reachable: an
+        // unqualified `/compact` or `/truncate` always routes to the native
+        // command.
         let ambiguous_prompt_names = ambiguous_mcp_prompt_names(
-            [COMPACT_COMMAND_NAME],
+            [COMPACT_COMMAND_NAME, TRUNCATE_COMMAND_NAME],
             registry.prompts().map(|p| p.prompt.name.as_str()),
         );
 
@@ -1696,6 +1707,7 @@ impl NativeAgent {
         });
 
         std::iter::once(compact_command)
+            .chain(std::iter::once(truncate_command))
             .chain(mcp_commands)
             .collect()
     }
@@ -2228,6 +2240,82 @@ impl NativeAgent {
             cx.update(|cx| {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
+                    acp_thread.downgrade(),
+                    connection,
+                    cx,
+                )
+            })
+            .await
+        })
+    }
+
+    /// Fork-and-continue in response to the built-in `/truncate` slash
+    /// command: summarize the conversation with map-reduce and seed a new
+    /// thread with the summary, leaving this thread untouched.
+    fn send_truncate_command(
+        &self,
+        session_id: acp_v1::SessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<acp_v1::PromptResponse>> {
+        cx.spawn(async move |this, cx| {
+            let (acp_thread, thread) = this.update(cx, |this, _cx| {
+                let session = this
+                    .sessions
+                    .get(&session_id)
+                    .context("Failed to get session")?;
+                let acp_thread = session
+                    .acp_thread
+                    .upgrade()
+                    .context("Session was released")?;
+                anyhow::Ok((acp_thread, session.thread.clone()))
+            })??;
+
+            let title = thread
+                .read_with(cx, |thread, _| thread.title())
+                .unwrap_or_else(|| SharedString::from("Previous thread"));
+            let summary = thread
+                .update(cx, |thread, cx| thread.map_reduce_summary(cx))
+                .await
+                .context("Thread has no history to summarize")?;
+
+            let host = this
+                .update(cx, |this, _| this.sibling_thread_host())?
+                .context("Sibling thread host is not installed")?;
+            let info = host
+                .create_sibling_thread(
+                    SiblingThreadRequest {
+                        title: format!("{title} (continued)").into(),
+                        prompt: format!("Continued from thread \"{title}\":\n\n{summary}"),
+                        auto_submit: false,
+                        agent_id: None,
+                        model: None,
+                        use_new_worktree: false,
+                        worktree_name: None,
+                        base_ref: None,
+                    },
+                    cx,
+                )
+                .await
+                .context("failed to create the continuation thread")?;
+
+            // Respond in the original thread with a notice pointing at the
+            // new one (the "continued in …" half of the notice pair).
+            let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+            events_tx
+                .unbounded_send(Ok(ThreadEvent::AgentText(format!(
+                    "Continued in a new thread: \"{}\"",
+                    info.title
+                ))))
+                .ok();
+            events_tx
+                .unbounded_send(Ok(ThreadEvent::Stop(acp_v1::StopReason::EndTurn)))
+                .ok();
+            drop(events_tx);
+
+            let connection = this.upgrade().map(NativeAgentConnection);
+            cx.update(|cx| {
+                NativeAgentConnection::handle_thread_events(
+                    events_rx,
                     acp_thread.downgrade(),
                     connection,
                     cx,
@@ -3121,6 +3209,11 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
                 return self.0.update(cx, |agent, cx| {
                     agent.send_compact_command(client_user_message_id, session_id, cx)
                 });
+            }
+            if parsed_command.is_unqualified(TRUNCATE_COMMAND_NAME) {
+                return self
+                    .0
+                    .update(cx, |agent, cx| agent.send_truncate_command(session_id, cx));
             }
 
             // Skill scope qualifiers (`/:<name>` and
@@ -4447,6 +4540,13 @@ mod internal_tests {
                 acp_thread::command_category_from_meta(&compact.meta),
                 Some(acp_thread::CommandCategory::Native),
             );
+
+            let truncate = commands.iter().find(|command| command.name == "truncate");
+            let truncate = truncate.expect("truncate command should be available");
+            assert_eq!(
+                acp_thread::command_category_from_meta(&truncate.meta),
+                Some(acp_thread::CommandCategory::Native),
+            );
         });
     }
 
@@ -4618,6 +4718,122 @@ mod internal_tests {
                     .first()
                     .map(|block| block.to_markdown(cx)),
                 Some("retained context")
+            );
+        });
+    }
+
+    /// Recording sibling host so the `/truncate` command path can be tested
+    /// without an agent panel.
+    struct RecordingSiblingHost {
+        requests: std::cell::RefCell<Vec<SiblingThreadRequest>>,
+    }
+
+    impl SiblingThreadHost for RecordingSiblingHost {
+        fn create_sibling_thread(
+            &self,
+            request: SiblingThreadRequest,
+            _cx: &mut AsyncApp,
+        ) -> Task<Result<SiblingThreadInfo>> {
+            self.requests.borrow_mut().push(request.clone());
+            Task::ready(Ok(SiblingThreadInfo {
+                title: request.title,
+                agent_id: "zed".into(),
+                model: None,
+                warning: None,
+            }))
+        }
+
+        fn list_available_agents(&self, _cx: &mut App) -> Result<AvailableAgents> {
+            Ok(AvailableAgents { agents: Vec::new() })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_truncate_prompt_forks_into_new_thread(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 32;
+            model.max_input_tokens = 32;
+            model.max_output_tokens = None;
+        });
+        let host = Rc::new(RecordingSiblingHost {
+            requests: std::cell::RefCell::new(Vec::new()),
+        });
+
+        cx.update(|cx| {
+            let path_style = project.read(cx).path_style(cx);
+            agent.update(cx, |agent, _cx| {
+                agent.set_sibling_thread_host(host.clone());
+            });
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_title("Old thread".into(), cx);
+                thread.push_acp_user_block(
+                    ClientUserMessageId::new(),
+                    [acp_v1::ContentBlock::from("old user")],
+                    path_style,
+                    cx,
+                );
+                thread.push_acp_agent_block("old assistant".into(), cx);
+            });
+        });
+
+        let prompt_task = cx.update(|cx| {
+            acp_thread::AgentSessionClientUserMessageIds::prompt(
+                connection.as_ref(),
+                ClientUserMessageId::new(),
+                acp_v1::PromptRequest::new(session_id.clone(), vec!["/truncate".into()]),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // The map-reduce summary condenses the retained history.
+        let request = fake.pending_completions().pop().unwrap();
+        assert_eq!(
+            request.intent,
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+        fake.send_text(&model, &request, "handoff summary");
+        fake.end_stream(&model, &request);
+        cx.run_until_parked();
+        prompt_task.await.expect("truncate should complete");
+
+        // The fork seeded a sibling thread and left the original untouched.
+        {
+            let requests = host.requests.borrow();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].title.as_ref(), "Old thread (continued)");
+            assert!(!requests[0].auto_submit);
+            assert!(
+                requests[0]
+                    .prompt
+                    .contains("Continued from thread \"Old thread\"")
+            );
+            assert!(requests[0].prompt.contains("handoff summary"));
+        }
+
+        let saved_thread = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        assert_eq!(saved_thread.messages.len(), 2);
+        assert!(matches!(&*saved_thread.messages[0], Message::User(_)));
+        assert!(matches!(&*saved_thread.messages[1], Message::Agent(_)));
+
+        // The original thread shows the "continued in …" notice.
+        acp_thread.read_with(cx, |thread, cx| {
+            let last = thread
+                .entries()
+                .last()
+                .expect("response should add an entry");
+            let acp_thread::AgentThreadEntry::AssistantMessage(message) = last else {
+                panic!("expected an assistant notice in the original thread");
+            };
+            let markdown = message.to_markdown(cx);
+            assert!(
+                markdown.contains("Continued in a new thread: \"Old thread (continued)\""),
+                "unexpected notice: {markdown}"
             );
         });
     }
@@ -5156,10 +5372,15 @@ mod internal_tests {
 
     #[test]
     fn test_ambiguous_mcp_prompt_names() {
-        // Reserving the built-in `/compact` forces a same-named MCP prompt to be
-        // server-qualified so it stays reachable; unique names stay bare.
-        let ambiguous = ambiguous_mcp_prompt_names([COMPACT_COMMAND_NAME], ["compact", "deploy"]);
+        // Reserving the built-in `/compact` and `/truncate` forces a
+        // same-named MCP prompt to be server-qualified so it stays reachable;
+        // unique names stay bare.
+        let ambiguous = ambiguous_mcp_prompt_names(
+            [COMPACT_COMMAND_NAME, TRUNCATE_COMMAND_NAME],
+            ["compact", "truncate", "deploy"],
+        );
         assert!(ambiguous.contains("compact"));
+        assert!(ambiguous.contains("truncate"));
         assert!(!ambiguous.contains("deploy"));
 
         // Without the reservation, a unique MCP prompt is left bare.

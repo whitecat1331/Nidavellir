@@ -10430,7 +10430,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "editor",
- "futures 0.3.32",
+ "futures 0.3.34",
  "fuzzy",
  "gpui",
  "language",
