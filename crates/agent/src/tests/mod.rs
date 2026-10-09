@@ -5,7 +5,7 @@ use acp_thread::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentProfileId;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use client::{Client, RefreshLlmTokenListener, UserStore};
 use collections::IndexMap;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
@@ -193,6 +193,8 @@ pub(crate) struct FakeThreadEnvironment {
     subagent_handle: Option<Rc<FakeSubagentHandle>>,
     terminal_creations: Arc<AtomicUsize>,
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
+    sibling_threads: std::cell::RefCell<Vec<crate::SiblingThreadRequest>>,
+    sibling_threads_enabled: bool,
 }
 
 impl FakeThreadEnvironment {
@@ -201,6 +203,18 @@ impl FakeThreadEnvironment {
             terminal_handle: Some(terminal_handle.into()),
             ..self
         }
+    }
+
+    /// Opt into `create_sibling_thread` support: requests are recorded and
+    /// succeed. Off by default so fork paths fall back to in-place behavior
+    /// in tests that don't care about forking.
+    pub(crate) fn with_sibling_threads(mut self) -> Self {
+        self.sibling_threads_enabled = true;
+        self
+    }
+
+    pub(crate) fn sibling_thread_requests(&self) -> Vec<crate::SiblingThreadRequest> {
+        self.sibling_threads.borrow().clone()
     }
 
     pub(crate) fn terminal_creation_count(&self) -> usize {
@@ -244,6 +258,26 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
             .clone()
             .expect("Subagent handle not available on FakeThreadEnvironment")
             as Rc<dyn SubagentHandle>)
+    }
+
+    fn create_sibling_thread(
+        &self,
+        request: crate::SiblingThreadRequest,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<crate::SiblingThreadInfo>> {
+        if self.sibling_threads_enabled {
+            self.sibling_threads.borrow_mut().push(request.clone());
+            Task::ready(Ok(crate::SiblingThreadInfo {
+                title: request.title,
+                agent_id: "zed".into(),
+                model: None,
+                warning: None,
+            }))
+        } else {
+            Task::ready(Err(anyhow!(
+                "sibling threads not supported by FakeThreadEnvironment"
+            )))
+        }
     }
 }
 
@@ -419,7 +453,6 @@ async fn test_terminal_tool_timeout_kills_handle(cx: &mut TestAppContext) {
         cx.background_executor.timer(Duration::from_millis(1)).await;
     }
 }
-
 
 #[gpui::test]
 async fn test_thinking(cx: &mut TestAppContext) {
@@ -1051,7 +1084,11 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_debugger_tool_read_mode_gating(cx: &mut TestAppContext) {
     let ThreadTest {
-        model, thread, fs, fake, ..
+        model,
+        thread,
+        fs,
+        fake,
+        ..
     } = setup(cx, TestModel::Fake).await;
     let fake_model = fake.as_ref();
 
@@ -1101,16 +1138,17 @@ async fn test_debugger_tool_read_mode_gating(cx: &mut TestAppContext) {
     // Read-only operations are available in read-only mode without a permission
     // prompt.
     let list_breakpoints_input = json!({ "operation": "list_breakpoints" });
-    fake_model.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(
-        LanguageModelToolUse {
+    fake_model.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "debugger_1".into(),
             name: DebuggerTool::NAME.into(),
             raw_input: list_breakpoints_input.to_string(),
             input: language_model::LanguageModelToolUseInput::Json(list_breakpoints_input),
             is_input_complete: true,
             thought_signature: None,
-        },
-    ));
+        }),
+    );
     fake_model.end_last(&model);
     cx.run_until_parked();
 
@@ -1128,16 +1166,17 @@ async fn test_debugger_tool_read_mode_gating(cx: &mut TestAppContext) {
         "operation": "set_breakpoints",
         "breakpoints": [{ "path": path!("/test/main.js"), "line": 1 }]
     });
-    fake_model.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(
-        LanguageModelToolUse {
+    fake_model.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "debugger_2".into(),
             name: DebuggerTool::NAME.into(),
             raw_input: set_breakpoints_input.to_string(),
             input: language_model::LanguageModelToolUseInput::Json(set_breakpoints_input.clone()),
             is_input_complete: true,
             thought_signature: None,
-        },
-    ));
+        }),
+    );
     fake_model.end_last(&model);
     cx.run_until_parked();
 
@@ -1159,16 +1198,17 @@ async fn test_debugger_tool_read_mode_gating(cx: &mut TestAppContext) {
     thread.update(cx, |thread, cx| {
         thread.set_profile(AgentProfileId("test-write".into()), cx);
     });
-    fake_model.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(
-        LanguageModelToolUse {
+    fake_model.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "debugger_3".into(),
             name: DebuggerTool::NAME.into(),
             raw_input: set_breakpoints_input.to_string(),
             input: language_model::LanguageModelToolUseInput::Json(set_breakpoints_input),
             is_input_complete: true,
             thought_signature: None,
-        },
-    ));
+        }),
+    );
     fake_model.end_last(&model);
 
     let auth = next_tool_call_authorization(&mut events).await;
@@ -8023,7 +8063,6 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
 
     send.await.unwrap();
 }
-
 
 #[gpui::test]
 async fn test_edit_file_tool_deny_rule_blocks_edit(cx: &mut TestAppContext) {
