@@ -178,6 +178,7 @@ impl AgentTool for CreateThreadTool {
                 title: title.clone(),
                 prompt: input.prompt,
                 auto_submit: true,
+                focus: false,
                 agent_id: input.agent,
                 model: input.model,
                 use_new_worktree: input.use_new_worktree,
