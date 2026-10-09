@@ -69,7 +69,6 @@ use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
-use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
 use fs::Fs;
 use futures::FutureExt as _;
@@ -5185,17 +5184,17 @@ impl AgentPanel {
             cx.weak_entity(),
             window.window_handle(),
         )) as Rc<dyn agent::DebuggerHost>;
-        let sibling_thread_host = cx.has_flag::<CreateThreadToolFeatureFlag>().then(|| {
-            Rc::new(AgentPanelSiblingHost::new(
-                cx.weak_entity(),
-                window.window_handle(),
-            )) as Rc<dyn agent::SiblingThreadHost>
-        });
+        // Installed unconditionally: `/truncate` fork-and-continue needs the
+        // host regardless of the `create-thread-tool` feature flag. Exposing the
+        // `create_thread`/`list_agents_and_models` tools to the model is gated
+        // separately, at tool-exposure time.
+        let sibling_thread_host = Rc::new(AgentPanelSiblingHost::new(
+            cx.weak_entity(),
+            window.window_handle(),
+        )) as Rc<dyn agent::SiblingThreadHost>;
         native_connection.0.update(cx, |native_agent, _cx| {
             native_agent.set_debugger_host(debugger_host);
-            if let Some(host) = sibling_thread_host {
-                native_agent.set_sibling_thread_host(host);
-            }
+            native_agent.set_sibling_thread_host(sibling_thread_host);
         });
     }
 
