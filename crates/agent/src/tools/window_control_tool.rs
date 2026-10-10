@@ -98,10 +98,13 @@ impl AgentTool for WindowControlTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
-            let request = input.recv().await.map_err(|e| WindowControlToolOutput::Error {
-                operation: WindowControlOperation::State.label().to_string(),
-                error: format!("Failed to receive tool input: {e}"),
-            })?;
+            let request = input
+                .recv()
+                .await
+                .map_err(|e| WindowControlToolOutput::Error {
+                    operation: WindowControlOperation::State.label().to_string(),
+                    error: format!("Failed to receive tool input: {e}"),
+                })?;
 
             let operation = request.operation.label().to_string();
             match self.environment.window_control(request, cx).await {

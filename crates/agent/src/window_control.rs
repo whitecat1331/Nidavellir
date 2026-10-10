@@ -132,8 +132,11 @@ pub trait WindowControlHost {
     ///
     /// `state` returns the structured snapshot; the control operations return a
     /// small acknowledgement object describing what changed.
-    fn window_control(&self, request: WindowControlRequest, cx: &mut AsyncApp)
-    -> Task<Result<serde_json::Value>>;
+    fn window_control(
+        &self,
+        request: WindowControlRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<serde_json::Value>>;
 }
 
 /// Whether a build on `channel` exposes the agent window-control surface.

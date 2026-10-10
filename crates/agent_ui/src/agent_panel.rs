@@ -5761,7 +5761,9 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
                 .upgrade()
                 .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
             window.update(cx, |_root, window, cx| {
-                panel.update(cx, |panel, cx| panel.handle_window_control(request, window, cx))
+                panel.update(cx, |panel, cx| {
+                    panel.handle_window_control(request, window, cx)
+                })
             })?
         })
     }
@@ -5769,7 +5771,10 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
 
 impl AgentPanel {
     /// The `ThreadView`'s message editor for the active thread, if one exists.
-    fn active_message_editor(&self, cx: &App) -> Option<Entity<crate::message_editor::MessageEditor>> {
+    fn active_message_editor(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<crate::message_editor::MessageEditor>> {
         self.active_conversation_view()
             .and_then(|conversation_view| conversation_view.read(cx).active_thread().cloned())
             .map(|thread_view| thread_view.read(cx).message_editor.clone())
@@ -5867,9 +5872,9 @@ impl AgentPanel {
         });
 
         let active_item = workspace.as_ref().and_then(|workspace| {
-            workspace.read(cx).active_item(cx).map(|item| {
-                serde_json::json!({ "title": item.tab_content_text(0, cx).to_string() })
-            })
+            workspace.read(cx).active_item(cx).map(
+                |item| serde_json::json!({ "title": item.tab_content_text(0, cx).to_string() }),
+            )
         });
 
         serde_json::json!({
@@ -5923,7 +5928,9 @@ impl AgentPanel {
                     .active_item(cx)
                     .and_then(|item| item.act_as::<TerminalView>(cx))
                     .ok_or_else(|| anyhow!("No active terminal"))?;
-                terminal.update(cx, |terminal, cx| terminal.focus_handle(cx).focus(window, cx));
+                terminal.update(cx, |terminal, cx| {
+                    terminal.focus_handle(cx).focus(window, cx)
+                });
             }
             other => return Err(anyhow!("Unknown focus target {other:?}")),
         }
@@ -5958,8 +5965,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let uuid = if let Some(url) = request.url.as_deref() {
-            window_control_uuid_from_url(url)
-                .ok_or_else(|| anyhow!("Not a thread URL: {url:?}"))?
+            window_control_uuid_from_url(url).ok_or_else(|| anyhow!("Not a thread URL: {url:?}"))?
         } else if let Some(thread_id) = request.thread_id.as_deref() {
             normalize_uuid(thread_id).ok_or_else(|| anyhow!("Not a thread id: {thread_id:?}"))?
         } else {
