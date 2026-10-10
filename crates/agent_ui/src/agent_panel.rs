@@ -5851,9 +5851,9 @@ fn window_control_dispatch(
     use agent::WindowControlOperation as Operation;
 
     match request.operation {
-        Operation::State => Ok(panel.read_with(cx, |panel, cx| {
-            panel.window_control_state(window, cx)
-        })),
+        Operation::State => {
+            Ok(panel.read_with(cx, |panel, cx| panel.window_control_state(window, cx)))
+        }
         Operation::DispatchAction => {
             let name = request
                 .action
@@ -5939,7 +5939,9 @@ fn window_control_focus(
                     })
                 })
                 .ok_or_else(|| anyhow!("No active terminal"))?;
-            terminal.update(cx, |terminal, cx| terminal.focus_handle(cx).focus(window, cx));
+            terminal.update(cx, |terminal, cx| {
+                terminal.focus_handle(cx).focus(window, cx)
+            });
         }
         other => return Err(anyhow!("Unknown focus target {other:?}")),
     }
