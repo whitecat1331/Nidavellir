@@ -60,7 +60,7 @@ use crate::{
 };
 use agent_settings::AgentSettings;
 use ai_onboarding::AgentPanelOnboarding;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use chrono::{DateTime, Utc};
@@ -5192,9 +5192,18 @@ impl AgentPanel {
             cx.weak_entity(),
             window.window_handle(),
         )) as Rc<dyn agent::SiblingThreadHost>;
+        let window_control_host = agent::window_control_enabled().then(|| {
+            Rc::new(AgentPanelWindowControlHost::new(
+                cx.weak_entity(),
+                window.window_handle(),
+            )) as Rc<dyn agent::WindowControlHost>
+        });
         native_connection.0.update(cx, |native_agent, _cx| {
             native_agent.set_debugger_host(debugger_host);
             native_agent.set_sibling_thread_host(sibling_thread_host);
+            if let Some(window_control_host) = window_control_host {
+                native_agent.set_window_control_host(window_control_host);
+            }
         });
     }
 
@@ -5721,6 +5730,302 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
 
         Ok(agent::AvailableAgents { agents })
     }
+}
+
+/// Dev-channel-only host that lets the `window_control` agent tool drive the
+/// Zed UI by command instead of by pixel (see
+/// `plans/in-progress-plans/AGENT_WINDOW_CONTROL.md`). Installed by
+/// `AgentPanel::ensure_native_agent_hosts_installed` when
+/// `agent::window_control_enabled()` is true.
+pub(crate) struct AgentPanelWindowControlHost {
+    panel: WeakEntity<AgentPanel>,
+    window: gpui::AnyWindowHandle,
+}
+
+impl AgentPanelWindowControlHost {
+    pub(crate) fn new(panel: WeakEntity<AgentPanel>, window: gpui::AnyWindowHandle) -> Self {
+        Self { panel, window }
+    }
+}
+
+impl agent::WindowControlHost for AgentPanelWindowControlHost {
+    fn window_control(
+        &self,
+        request: agent::WindowControlRequest,
+        cx: &mut gpui::AsyncApp,
+    ) -> Task<Result<serde_json::Value>> {
+        let panel = self.panel.clone();
+        let window = self.window;
+        cx.spawn(async move |cx| {
+            let panel = panel
+                .upgrade()
+                .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
+            window.update(cx, |_root, window, cx| {
+                panel.update(cx, |panel, cx| panel.handle_window_control(request, window, cx))
+            })?
+        })
+    }
+}
+
+impl AgentPanel {
+    /// The `ThreadView`'s message editor for the active thread, if one exists.
+    fn active_message_editor(&self, cx: &App) -> Option<Entity<crate::message_editor::MessageEditor>> {
+        self.active_conversation_view()
+            .and_then(|conversation_view| conversation_view.read(cx).active_thread().cloned())
+            .map(|thread_view| thread_view.read(cx).message_editor.clone())
+    }
+
+    fn handle_window_control(
+        &mut self,
+        request: agent::WindowControlRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value> {
+        use agent::WindowControlOperation as Operation;
+
+        match request.operation {
+            Operation::State => Ok(self.window_control_state(window, cx)),
+            Operation::DispatchAction => {
+                let name = request
+                    .action
+                    .clone()
+                    .ok_or_else(|| anyhow!("`dispatch_action` requires `action`"))?;
+                let action = window_control_action(&name)?;
+                window.dispatch_action(action, cx);
+                Ok(serde_json::json!({ "dispatched": name }))
+            }
+            Operation::Focus => {
+                let target = request
+                    .target
+                    .clone()
+                    .ok_or_else(|| anyhow!("`focus` requires `target`"))?;
+                self.window_control_focus(&target, window, cx)?;
+                Ok(serde_json::json!({ "focused": target }))
+            }
+            Operation::Type => {
+                let text = request
+                    .text
+                    .clone()
+                    .ok_or_else(|| anyhow!("`type` requires `text`"))?;
+                self.window_control_type(&text, request.submit, window, cx)?;
+                Ok(serde_json::json!({ "typed": text, "submitted": request.submit }))
+            }
+            Operation::Press => {
+                let keys = request
+                    .keys
+                    .clone()
+                    .ok_or_else(|| anyhow!("`press` requires `keys`"))?;
+                let keystroke =
+                    gpui::Keystroke::parse(&keys).map_err(|error| anyhow!("{error}"))?;
+                let handled = window.dispatch_keystroke(keystroke, cx);
+                Ok(serde_json::json!({ "keys": keys, "handled": handled }))
+            }
+            Operation::OpenThread => {
+                self.window_control_open_thread(&request, window, cx)?;
+                Ok(serde_json::json!({ "opened": true }))
+            }
+        }
+    }
+
+    /// A structured snapshot of the UI, so the agent can assert on state
+    /// instead of reading pixels.
+    fn window_control_state(&self, window: &Window, cx: &App) -> serde_json::Value {
+        let workspace = self.workspace.upgrade();
+        let roots: Vec<String> = workspace
+            .as_ref()
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let thread_id = self.active_thread_id(cx);
+        let metadata = thread_id.and_then(|thread_id| {
+            ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(thread_id).cloned())
+        });
+        let active_thread = thread_id.map(|thread_id| {
+            serde_json::json!({
+                "thread_id": thread_id.to_key_string(),
+                "title": metadata.as_ref().and_then(|m| m.title()).map(|t| t.to_string()),
+                "is_draft": self.active_thread_is_draft(cx),
+                "session_id": metadata
+                    .as_ref()
+                    .and_then(|m| m.session_id.as_ref())
+                    .map(|session_id| session_id.0.to_string()),
+            })
+        });
+
+        let message_editor = self.active_message_editor(cx).map(|message_editor| {
+            let editor = message_editor.read(cx).editor().clone();
+            let text = editor.read(cx).text(cx);
+            let focused = editor.read(cx).focus_handle(cx).is_focused(window);
+            serde_json::json!({ "text": text, "focused": focused })
+        });
+
+        let active_item = workspace.as_ref().and_then(|workspace| {
+            workspace.read(cx).active_item(cx).map(|item| {
+                serde_json::json!({ "title": item.tab_content_text(0, cx).to_string() })
+            })
+        });
+
+        serde_json::json!({
+            "workspace": { "roots": roots },
+            "agent_panel": {
+                "active_thread": active_thread,
+                "message_editor": message_editor,
+            },
+            "active_item": active_item,
+        })
+    }
+
+    fn window_control_focus(
+        &self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        match target {
+            "agent_panel.message_editor" | "message_editor" => {
+                let message_editor = self
+                    .active_message_editor(cx)
+                    .ok_or_else(|| anyhow!("No active agent message editor is available"))?;
+                message_editor.update(cx, |message_editor, cx| {
+                    let handle = message_editor.editor().read(cx).focus_handle(cx);
+                    handle.focus(window, cx);
+                });
+            }
+            "agent_panel" => {
+                self.focus_handle.focus(window, cx);
+            }
+            "editor" => {
+                let workspace = self
+                    .workspace
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("Workspace is no longer available"))?;
+                let editor = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .ok_or_else(|| anyhow!("No active code editor"))?;
+                editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+            }
+            "terminal" => {
+                let workspace = self
+                    .workspace
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("Workspace is no longer available"))?;
+                let terminal = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<TerminalView>(cx))
+                    .ok_or_else(|| anyhow!("No active terminal"))?;
+                terminal.update(cx, |terminal, cx| terminal.focus_handle(cx).focus(window, cx));
+            }
+            other => return Err(anyhow!("Unknown focus target {other:?}")),
+        }
+        Ok(())
+    }
+
+    fn window_control_type(
+        &self,
+        text: &str,
+        submit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let message_editor = self
+            .active_message_editor(cx)
+            .ok_or_else(|| anyhow!("No active agent message editor is available"))?;
+        message_editor.update(cx, |message_editor, cx| {
+            let handle = message_editor.editor().read(cx).focus_handle(cx);
+            handle.focus(window, cx);
+            message_editor.insert_text(text, window, cx);
+        });
+        if submit {
+            message_editor.update(cx, |message_editor, cx| message_editor.send(cx));
+        }
+        Ok(())
+    }
+
+    fn window_control_open_thread(
+        &mut self,
+        request: &agent::WindowControlRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let uuid = if let Some(url) = request.url.as_deref() {
+            window_control_uuid_from_url(url)
+                .ok_or_else(|| anyhow!("Not a thread URL: {url:?}"))?
+        } else if let Some(thread_id) = request.thread_id.as_deref() {
+            normalize_uuid(thread_id).ok_or_else(|| anyhow!("Not a thread id: {thread_id:?}"))?
+        } else {
+            return Err(anyhow!("`open_thread` requires `thread_id` or `url`"));
+        };
+
+        let session_id = {
+            let store = ThreadMetadataStore::try_global(cx)
+                .ok_or_else(|| anyhow!("Thread metadata store is unavailable"))?;
+            let store = store.read(cx);
+            store
+                .entries()
+                .find(|metadata| {
+                    normalize_uuid(&metadata.thread_id.to_key_string()).as_deref()
+                        == Some(uuid.as_str())
+                })
+                .and_then(|metadata| metadata.session_id.clone())
+                .ok_or_else(|| anyhow!("No agent thread found for id {uuid}"))?
+        };
+
+        self.open_thread(session_id, None, None, window, cx);
+        Ok(())
+    }
+}
+
+/// Map a supported action name to a typed action, so `dispatch_action` can
+/// dispatch by name without a global name→action registry. Phase 2 of
+/// `AGENT_WINDOW_CONTROL` replaces this with a real registry.
+fn window_control_action(name: &str) -> Result<Box<dyn Action>> {
+    let action: Box<dyn Action> = match name {
+        "agent::NewThread" | "workspace::NewThread" => Box::new(NewThread),
+        "agent::ExpandMessageEditor" => Box::new(ExpandMessageEditor),
+        "agent::ToggleFocus" | "assistant::ToggleFocus" => {
+            Box::new(zed_actions::assistant::ToggleFocus)
+        }
+        "agent::Toggle" | "assistant::Toggle" => Box::new(zed_actions::assistant::Toggle),
+        "agent::FocusAgent" => Box::new(zed_actions::assistant::FocusAgent),
+        "agent::CopyThreadToClipboard" => Box::new(CopyThreadToClipboard),
+        "agent::LoadThreadFromClipboard" => Box::new(LoadThreadFromClipboard),
+        "workspace::SaveAll" => Box::new(workspace::SaveAll { save_intent: None }),
+        other => bail!(
+            "Unsupported action {other:?}. Supported actions: agent::NewThread, \
+             agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle, \
+             agent::FocusAgent, agent::CopyThreadToClipboard, \
+             agent::LoadThreadFromClipboard, workspace::SaveAll."
+        ),
+    };
+    Ok(action)
+}
+
+/// Normalize a UUID string (lowercase, no hyphens) for comparison.
+fn normalize_uuid(value: &str) -> Option<String> {
+    let normalized: String = value
+        .chars()
+        .filter(|c| *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    (normalized.len() == 32 && normalized.chars().all(|c| c.is_ascii_hexdigit()))
+        .then_some(normalized)
+}
+
+/// Extract the thread UUID from a `zed:///agent/thread/<uuid>` deep link.
+fn window_control_uuid_from_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("zed:///agent/thread/")?;
+    let id = rest.split(['?', '#']).next().unwrap_or(rest);
+    normalize_uuid(id)
 }
 
 impl Focusable for AgentPanel {
