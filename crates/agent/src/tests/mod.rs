@@ -3376,10 +3376,16 @@ async fn test_terminal_tool_cancellation_captures_output(cx: &mut TestAppContext
             result_text.contains("partial output"),
             "expected tool result to contain terminal output, got: {result_text}"
         );
-        // Match the actual format from process_content in terminal_tool.rs
+        // A thread-level cancel is a generation stop, not a user action on the
+        // command (ISSUE-0042): the result must say so and must not claim the
+        // user stopped it.
         assert!(
-            result_text.contains("The user stopped this command"),
-            "expected tool result to indicate user stopped, got: {result_text}"
+            result_text.contains("the agent's generation was stopped (Stop Generation)"),
+            "expected tool result to indicate the generation was stopped, got: {result_text}"
+        );
+        assert!(
+            !result_text.contains("The user stopped this command"),
+            "generation-stop result must not be attributed to the user, got: {result_text}"
         );
     });
 
@@ -7434,7 +7440,9 @@ async fn test_window_control_surface_is_dev_channel_only(cx: &mut TestAppContext
             thread.add_default_tools(environment, cx);
             thread
         });
-        thread.read_with(cx, |thread, _| thread.has_registered_tool(WindowControlTool::NAME))
+        thread.read_with(cx, |thread, _| {
+            thread.has_registered_tool(WindowControlTool::NAME)
+        })
     };
 
     assert!(
