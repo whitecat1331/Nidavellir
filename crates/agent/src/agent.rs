@@ -13,6 +13,7 @@ mod thread;
 mod thread_store;
 mod tool_permissions;
 mod tools;
+mod window_control;
 
 use context_server::ContextServerId;
 pub use db::*;
@@ -31,6 +32,7 @@ pub use thread::*;
 pub use thread_store::*;
 pub use tool_permissions::*;
 pub use tools::*;
+pub use window_control::*;
 
 use acp_thread::{
     AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
@@ -503,6 +505,9 @@ pub struct NativeAgent {
     sibling_thread_host: Option<Rc<dyn SiblingThreadHost>>,
     /// Handler installed by the UI for native-agent debugger tools.
     debugger_host: Option<Rc<dyn DebuggerHost>>,
+    /// Handler installed by the UI (dev builds only) for the `window_control`
+    /// tool: drives the window by command instead of by pixel.
+    window_control_host: Option<Rc<dyn WindowControlHost>>,
     fs: Arc<dyn Fs>,
     _subscriptions: Vec<Subscription>,
     /// Tracks the lifecycle of global skills directory observation. We
@@ -677,6 +682,7 @@ impl NativeAgent {
                 models: LanguageModels::new(cx),
                 sibling_thread_host: None,
                 debugger_host: None,
+                window_control_host: None,
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),
@@ -817,6 +823,14 @@ impl NativeAgent {
 
     pub fn debugger_host(&self) -> Option<Rc<dyn DebuggerHost>> {
         self.debugger_host.clone()
+    }
+
+    pub fn set_window_control_host(&mut self, host: Rc<dyn WindowControlHost>) {
+        self.window_control_host = Some(host);
+    }
+
+    pub fn window_control_host(&self) -> Option<Rc<dyn WindowControlHost>> {
+        self.window_control_host.clone()
     }
 
     fn new_session(
@@ -3809,6 +3823,28 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             Err(err) => return Task::ready(Err(err)),
         };
         host.restart_session(session_id, cx)
+    }
+
+    fn window_control(
+        &self,
+        request: WindowControlRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<serde_json::Value>> {
+        let host = match self
+            .agent
+            .read_with(cx, |agent, _| agent.window_control_host())
+        {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                return Task::ready(Err(anyhow!(
+                    "No window-control host is registered. This usually means the \
+                     agent panel hasn't been initialized in this workspace, or this \
+                     is not a dev-channel build."
+                )));
+            }
+            Err(err) => return Task::ready(Err(err)),
+        };
+        host.window_control(request, cx)
     }
 }
 

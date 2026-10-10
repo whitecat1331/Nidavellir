@@ -57,6 +57,7 @@ prompt_store.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 regex.workspace = true
+release_channel.workspace = true
 sandbox.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -84,11 +85,6 @@ zstd.workspace = true
 [build-dependencies]
 fs_embed_build.workspace = true
 
-# Used only on Windows to resolve the running release channel/version so the WSL
-# sandbox helper can fetch a matching Linux `zed`.
-[target.'cfg(target_os = "windows")'.dependencies]
-release_channel.workspace = true
-
 [dev-dependencies]
 acp_thread = { workspace = true, features = ["test-support"] }
 async-io.workspace = true
@@ -112,6 +108,7 @@ pretty_assertions.workspace = true
 project = { workspace = true, "features" = ["test-support"] }
 proptest.workspace = true
 reqwest_client.workspace = true
+semver.workspace = true
 settings = { workspace = true, "features" = ["test-support"] }
 
 theme = { workspace = true, "features" = ["test-support"] }

@@ -5,8 +5,8 @@ use crate::{
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
     MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot, ReadFileTool, RenameTool,
     SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ThreadSearchTool, ToolPermissionDecision, WaitForReportTool, WebSearchTool, WriteFileTool,
-    decide_permission_from_settings,
+    ThreadSearchTool, ToolPermissionDecision, WaitForReportTool, WebSearchTool, WindowControlTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -878,6 +878,20 @@ pub trait ThreadEnvironment {
         let _ = cx;
         Task::ready(Err(anyhow::anyhow!(
             "Restarting debug sessions is not supported in this environment"
+        )))
+    }
+
+    /// Drives the Zed UI by command through the host UI, if the environment
+    /// provides one (dev-channel builds only).
+    fn window_control(
+        &self,
+        request: crate::WindowControlRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<serde_json::Value>> {
+        let _ = request;
+        let _ = cx;
+        Task::ready(Err(anyhow::anyhow!(
+            "Driving the window is not supported in this environment"
         )))
     }
 }
@@ -2361,6 +2375,12 @@ impl Thread {
         // to the model is gated by `CreateThreadToolFeatureFlag` in
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
+        // Dev-channel-only UI driver. Installing the host and exposing this tool
+        // are gated by the same channel predicate, so a release build has
+        // neither.
+        if crate::window_control_enabled(cx) {
+            self.add_tool(WindowControlTool::new(environment.clone()));
+        }
         self.add_tool(ListAgentsAndModelsTool::new(environment));
     }
 
@@ -4738,8 +4758,14 @@ impl Thread {
                     tool_name.as_ref()
                 };
 
+                // The dev-channel window-control tool is added outside any
+                // profile's allowlist (a user's custom profiles can't know about
+                // it), so expose it independently of the profile. The channel
+                // gate is applied by `tool_feature_flag_enabled` below.
+                let is_window_control = tool_name.as_ref() == WindowControlTool::NAME;
+
                 if tool.supports_provider(&model.provider_id())
-                    && profile.is_tool_enabled(profile_tool_name)
+                    && (profile.is_tool_enabled(profile_tool_name) || is_window_control)
                 {
                     match (tool_name.as_ref(), use_sandboxed_terminal) {
                         (TerminalTool::NAME, false) | (SandboxedTerminalTool::NAME, true) => {
