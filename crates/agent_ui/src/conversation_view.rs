@@ -5123,6 +5123,21 @@ pub(crate) mod tests {
                 .read_with(cx, |thread, _cx| thread.message_queue.len()),
             1,
         );
+
+        // The render-level `menu::Cancel` handler and any other Cancel-driven
+        // path funnel through `cancel_generation`: while a synthetic dispatch is
+        // held that must be a no-op too (the live 2026-10-10 failure, where the
+        // message-editor path was guarded but the render path still cancelled).
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, _window, cx| view.cancel_generation(cx));
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert_eq!(
+                view.thread.read(cx).status(),
+                ThreadStatus::Generating,
+                "cancel_generation must be a no-op while a synthetic dispatch is held"
+            );
+        });
         drop(guard);
 
         // Real (user) Escape: generation still stops.
