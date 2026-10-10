@@ -1156,13 +1156,7 @@ impl ThreadView {
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
             MessageEditorEvent::Cancel => {
                 if !self.close_thread_search(window, cx) {
-                    // A keystroke dispatched by the `window_control` surface is
-                    // a probe, not the user: it may dismiss overlays, but it
-                    // must never Stop-Generate the turn that dispatched it
-                    // (ISSUE-0042).
-                    if !crate::agent_panel::window_control_synthetic_input_active() {
-                        self.cancel_generation(cx);
-                    }
+                    self.cancel_generation(cx);
                 }
             }
             MessageEditorEvent::Focus => {
@@ -2296,6 +2290,17 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        // A keystroke dispatched by the `window_control` surface is a probe,
+        // not the user: it may dismiss overlays, but it must never
+        // Stop-Generate the turn that dispatched it (ISSUE-0042). Every
+        // Cancel-driven path — the message editor's `MessageEditorEvent::Cancel`
+        // and the render-level `menu::Cancel` / `editor::Cancel` handlers —
+        // funnels through here, so this single check covers them all; a real
+        // user action (stop button, terminal-card stop) never has the guard
+        // held.
+        if crate::agent_panel::window_control_synthetic_input_active() {
+            return;
+        }
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
