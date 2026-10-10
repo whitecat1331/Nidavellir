@@ -4757,8 +4757,14 @@ impl Thread {
                     tool_name.as_ref()
                 };
 
+                // The dev-channel window-control tool is added outside any
+                // profile's allowlist (a user's custom profiles can't know about
+                // it), so expose it independently of the profile. The channel
+                // gate is applied by `tool_feature_flag_enabled` below.
+                let is_window_control = tool_name.as_ref() == WindowControlTool::NAME;
+
                 if tool.supports_provider(&model.provider_id())
-                    && profile.is_tool_enabled(profile_tool_name)
+                    && (profile.is_tool_enabled(profile_tool_name) || is_window_control)
                 {
                     match (tool_name.as_ref(), use_sandboxed_terminal) {
                         (TerminalTool::NAME, false) | (SandboxedTerminalTool::NAME, true) => {
