@@ -33,6 +33,7 @@ mod thread_search_tool;
 mod tool_permissions;
 mod wait_for_report_tool;
 mod web_search_tool;
+mod window_control_tool;
 mod write_file_tool;
 
 use crate::AgentTool;
@@ -109,6 +110,7 @@ pub use thread_search_tool::*;
 pub use tool_permissions::*;
 pub use wait_for_report_tool::*;
 pub use web_search_tool::*;
+pub use window_control_tool::*;
 pub use write_file_tool::*;
 
 macro_rules! tools {
@@ -236,6 +238,7 @@ tools! {
     ThreadSearchTool,
     WaitForReportTool,
     WebSearchTool,
+    WindowControlTool,
     WriteFileTool,
 }
 
@@ -256,6 +259,8 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
         CreateThreadTool::NAME | ListAgentsAndModelsTool::NAME => {
             cx.has_flag::<CreateThreadToolFeatureFlag>()
         }
+        // Dev-channel-only UI driver; off in every release/nightly build.
+        WindowControlTool::NAME => crate::window_control_enabled(cx),
         _ => true,
     }
 }

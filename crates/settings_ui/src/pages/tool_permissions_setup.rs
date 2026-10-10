@@ -1428,6 +1428,8 @@ mod tests {
             "thread_search",
             // Read-only report-file polling; no project or command access.
             "wait_for_report",
+            // Dev-channel-only UI driver; does not call decide_permission_from_settings.
+            "window_control",
             "open",
             "read_file",
             "rename_symbol",

@@ -7394,6 +7394,82 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     );
 }
 
+/// Negative test for the Design D hard requirement (see
+/// `AGENT_WINDOW_CONTROL.md`): a release-profile build must expose **no**
+/// `window_control` tool. This is the regression guard for `646b3b4934`, where a
+/// dev-only surface leaked because installation was gated on a flag that
+/// resolved unexpectedly. The channel predicate is the single source of truth,
+/// so both registration and model-facing exposure are asserted against it.
+#[gpui::test]
+async fn test_window_control_surface_is_dev_channel_only(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = fake.model("fake");
+
+    // Register the default tools under an explicit channel and report whether
+    // the window-control tool made it into the registry.
+    let registered_on = |cx: &mut TestAppContext, channel: release_channel::ReleaseChannel| {
+        cx.update(|cx| {
+            release_channel::init_test(semver::Version::new(0, 0, 0), channel, cx);
+        });
+        let environment = Rc::new(cx.update(|cx| {
+            FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+        }));
+        let thread = cx.new(|cx| {
+            let mut thread = Thread::new(
+                project.clone(),
+                project_context.clone(),
+                context_server_registry.clone(),
+                Templates::new(),
+                Some(model.clone()),
+                cx,
+            );
+            thread.add_default_tools(environment, cx);
+            thread
+        });
+        thread.read_with(cx, |thread, _| thread.has_registered_tool(WindowControlTool::NAME))
+    };
+
+    assert!(
+        registered_on(cx, release_channel::ReleaseChannel::Dev),
+        "a dev-channel build must register the window-control tool"
+    );
+    for channel in [
+        release_channel::ReleaseChannel::Nightly,
+        release_channel::ReleaseChannel::Preview,
+        release_channel::ReleaseChannel::Stable,
+    ] {
+        assert!(
+            !registered_on(cx, channel),
+            "a {channel:?} build must NOT register the window-control tool"
+        );
+    }
+
+    // The exposure gate — what actually reaches the model — mirrors registration.
+    cx.update(|cx| {
+        release_channel::init_test(
+            semver::Version::new(0, 0, 0),
+            release_channel::ReleaseChannel::Stable,
+            cx,
+        );
+        assert!(
+            !window_control_enabled(cx),
+            "the window-control surface must be disabled on a release channel"
+        );
+        assert!(
+            !tool_feature_flag_enabled(WindowControlTool::NAME, cx),
+            "a release build must not expose the window-control tool to the model"
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_thread_tools_feature_gating(cx: &mut TestAppContext) {
     let fake = init_test(cx);
