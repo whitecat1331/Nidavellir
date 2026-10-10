@@ -8002,6 +8002,49 @@ mod tests {
     }
 
     #[test]
+    fn test_window_control_uuid_normalization() {
+        assert_eq!(
+            normalize_uuid("1E824091-FAE6-4c6f-9c63-c674164b5ad1").as_deref(),
+            Some("1e824091fae64c6f9c63c674164b5ad1")
+        );
+        assert_eq!(normalize_uuid("not-a-uuid"), None);
+        assert_eq!(normalize_uuid(""), None);
+    }
+
+    #[test]
+    fn test_window_control_uuid_from_thread_url() {
+        assert_eq!(
+            window_control_uuid_from_url(
+                "zed:///agent/thread/1e824091-fae6-4c6f-9c63-c674164b5ad1?name=x"
+            )
+            .as_deref(),
+            Some("1e824091fae64c6f9c63c674164b5ad1")
+        );
+        assert_eq!(window_control_uuid_from_url("zed://agent"), None);
+        assert_eq!(window_control_uuid_from_url("https://example.com"), None);
+    }
+
+    #[test]
+    fn test_window_control_action_names() {
+        for name in [
+            "agent::NewThread",
+            "agent::ExpandMessageEditor",
+            "agent::ToggleFocus",
+            "agent::Toggle",
+            "agent::FocusAgent",
+            "agent::CopyThreadToClipboard",
+            "agent::LoadThreadFromClipboard",
+            "workspace::SaveAll",
+        ] {
+            assert!(
+                window_control_action(name).is_ok(),
+                "expected {name} to map to an action",
+            );
+        }
+        assert!(window_control_action("agent::DefinitelyNotAnAction").is_err());
+    }
+
+    #[test]
     fn test_terminal_program_reports_known_agent_transitions() {
         let mut last_observed_program = None;
 
