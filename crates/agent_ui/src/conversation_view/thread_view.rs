@@ -1156,7 +1156,13 @@ impl ThreadView {
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
             MessageEditorEvent::Cancel => {
                 if !self.close_thread_search(window, cx) {
-                    self.cancel_generation(cx);
+                    // A keystroke dispatched by the `window_control` surface is
+                    // a probe, not the user: it may dismiss overlays, but it
+                    // must never Stop-Generate the turn that dispatched it
+                    // (ISSUE-0042).
+                    if !crate::agent_panel::window_control_synthetic_input_active() {
+                        self.cancel_generation(cx);
+                    }
                 }
             }
             MessageEditorEvent::Focus => {

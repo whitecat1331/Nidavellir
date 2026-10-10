@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -5926,6 +5926,33 @@ impl AgentPanel {
     }
 }
 
+/// Depth of `window_control` synthetic keystroke dispatches currently on the
+/// stack. While non-zero, UI handlers must not treat a keystroke as a real
+/// user action — in particular, a probe's `press escape` must never
+/// Stop-Generate the turn that dispatched it (ISSUE-0042).
+static WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Marks a `window_control`-dispatched keystroke as synthetic for its duration.
+pub(crate) struct SyntheticInputGuard(());
+
+impl SyntheticInputGuard {
+    pub(crate) fn new() -> Self {
+        WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.fetch_add(1, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for SyntheticInputGuard {
+    fn drop(&mut self) {
+        WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a `window_control` synthetic keystroke is currently being dispatched.
+pub(crate) fn window_control_synthetic_input_active() -> bool {
+    WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.load(Ordering::SeqCst) > 0
+}
+
 /// Dispatch a `window_control` request against `panel` at the top level.
 ///
 /// The mutations below (typing, focusing, dispatching actions) must run
@@ -5977,6 +6004,10 @@ pub(crate) fn window_control_dispatch(
                 .clone()
                 .ok_or_else(|| anyhow!("`press` requires `keys`"))?;
             let keystroke = gpui::Keystroke::parse(&keys).map_err(|error| anyhow!("{error}"))?;
+            // Mark the dispatch as synthetic while it runs: a probe keystroke
+            // must not be mistaken for user input (an `escape` here once
+            // cancelled the very turn that sent it — ISSUE-0042).
+            let _synthetic = SyntheticInputGuard::new();
             let handled = window.dispatch_keystroke(keystroke, cx);
             Ok(serde_json::json!({ "keys": keys, "handled": handled }))
         }
@@ -8235,6 +8266,24 @@ mod tests {
     }
 
     #[test]
+    fn test_window_control_synthetic_input_guard_scopes_dispatch() {
+        assert!(!window_control_synthetic_input_active());
+        {
+            let _guard = SyntheticInputGuard::new();
+            assert!(window_control_synthetic_input_active());
+            {
+                let _nested = SyntheticInputGuard::new();
+                assert!(window_control_synthetic_input_active());
+            }
+            assert!(
+                window_control_synthetic_input_active(),
+                "an inner guard drop must not clear an outer dispatch"
+            );
+        }
+        assert!(!window_control_synthetic_input_active());
+    }
+
+    #[test]
     fn test_window_control_action_names() {
         for name in [
             "agent::NewThread",
@@ -8404,6 +8453,28 @@ mod tests {
             .expect("click op should succeed");
         assert_eq!(clicked["clicked"], json!("agent_panel.new_thread"));
         cx.run_until_parked();
+
+        // ISSUE-0042: `press` runs under the synthetic-input guard and must
+        // leave it released afterwards.
+        let pressed = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Press,
+                        keys: Some("escape".to_string()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("press op should succeed");
+        assert_eq!(pressed["keys"], json!("escape"));
+        assert!(
+            !window_control_synthetic_input_active(),
+            "the synthetic-input guard must be released after a press"
+        );
     }
 
     #[test]
