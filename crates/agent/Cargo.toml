@@ -108,6 +108,7 @@ pretty_assertions.workspace = true
 project = { workspace = true, "features" = ["test-support"] }
 proptest.workspace = true
 reqwest_client.workspace = true
+semver.workspace = true
 settings = { workspace = true, "features" = ["test-support"] }
 
 theme = { workspace = true, "features" = ["test-support"] }

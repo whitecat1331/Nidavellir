@@ -5192,7 +5192,7 @@ impl AgentPanel {
             cx.weak_entity(),
             window.window_handle(),
         )) as Rc<dyn agent::SiblingThreadHost>;
-        let window_control_host = agent::window_control_enabled().then(|| {
+        let window_control_host = agent::window_control_enabled(cx).then(|| {
             Rc::new(AgentPanelWindowControlHost::new(
                 cx.weak_entity(),
                 window.window_handle(),
@@ -5208,7 +5208,7 @@ impl AgentPanel {
 
         // Dev-only: also expose the same surface to non-agent drivers over a
         // local command file (Phase 3). No-op outside dev builds.
-        if agent::window_control_enabled() {
+        if agent::window_control_enabled(cx) {
             crate::window_control_channel::ensure_started(
                 cx.weak_entity(),
                 window.window_handle(),
@@ -5805,13 +5805,17 @@ impl AgentPanel {
     /// instead of reading pixels. Read-only.
     fn window_control_state(&self, window: &Window, cx: &App) -> serde_json::Value {
         let workspace = self.workspace.upgrade();
+        // `state` is an output surface: redact so absolute paths don't leak the
+        // account name and pasted credentials/tokens never reach the model.
         let roots: Vec<String> = workspace
             .as_ref()
             .map(|workspace| {
                 workspace
                     .read(cx)
                     .visible_worktrees(cx)
-                    .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+                    .map(|worktree| {
+                        agent::redact_sensitive(&worktree.read(cx).abs_path().to_string_lossy())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -5824,7 +5828,10 @@ impl AgentPanel {
         let active_thread = thread_id.map(|thread_id| {
             serde_json::json!({
                 "thread_id": thread_id.to_key_string(),
-                "title": metadata.as_ref().and_then(|m| m.title()).map(|t| t.to_string()),
+                "title": metadata
+                    .as_ref()
+                    .and_then(|m| m.title())
+                    .map(|title| agent::redact_sensitive(title.as_ref())),
                 "is_draft": self.active_thread_is_draft(cx),
                 "session_id": metadata
                     .as_ref()
@@ -5835,15 +5842,17 @@ impl AgentPanel {
 
         let message_editor = self.active_message_editor(cx).map(|message_editor| {
             let editor = message_editor.read(cx).editor().clone();
-            let text = editor.read(cx).text(cx);
+            let text = agent::redact_sensitive(&editor.read(cx).text(cx));
             let focused = editor.read(cx).focus_handle(cx).is_focused(window);
             serde_json::json!({ "text": text, "focused": focused })
         });
 
         let active_item = workspace.as_ref().and_then(|workspace| {
-            workspace.read(cx).active_item(cx).map(
-                |item| serde_json::json!({ "title": item.tab_content_text(0, cx).to_string() }),
-            )
+            workspace.read(cx).active_item(cx).map(|item| {
+                serde_json::json!({
+                    "title": agent::redact_sensitive(item.tab_content_text(0, cx).as_ref()),
+                })
+            })
         });
 
         serde_json::json!({
@@ -5862,7 +5871,7 @@ impl AgentPanel {
 
         if let Some(message_editor) = self.active_message_editor(cx) {
             let editor = message_editor.read(cx).editor().clone();
-            let text = editor.read(cx).text(cx);
+            let text = agent::redact_sensitive(&editor.read(cx).text(cx));
             let focus_handle = editor.read(cx).focus_handle(cx);
             let focused = focus_handle.is_focused(window);
             selectors.push(WindowControlSelector {

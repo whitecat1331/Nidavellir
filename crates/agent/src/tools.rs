@@ -260,7 +260,7 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
             cx.has_flag::<CreateThreadToolFeatureFlag>()
         }
         // Dev-channel-only UI driver; off in every release/nightly build.
-        WindowControlTool::NAME => crate::window_control_enabled(),
+        WindowControlTool::NAME => crate::window_control_enabled(cx),
         _ => true,
     }
 }

@@ -2376,8 +2376,9 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         // Dev-channel-only UI driver. Installing the host and exposing this tool
-        // are gated the same way, so a release build has neither.
-        if crate::window_control_enabled() {
+        // are gated by the same channel predicate, so a release build has
+        // neither.
+        if crate::window_control_enabled(cx) {
             self.add_tool(WindowControlTool::new(environment.clone()));
         }
         self.add_tool(ListAgentsAndModelsTool::new(environment));
