@@ -5847,11 +5847,7 @@ impl AgentPanel {
     }
 
     /// The panel's addressable affordances, for `find`/`click`/`assert`.
-    fn window_control_selectors(
-        &self,
-        window: &Window,
-        cx: &App,
-    ) -> Vec<WindowControlSelector> {
+    fn window_control_selectors(&self, window: &Window, cx: &App) -> Vec<WindowControlSelector> {
         let mut selectors = Vec::new();
 
         if let Some(message_editor) = self.active_message_editor(cx) {
