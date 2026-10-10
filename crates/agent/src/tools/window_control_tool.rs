@@ -27,6 +27,11 @@ use crate::{
 /// ### Operations
 /// - `state` — a JSON snapshot of the active thread, focused/agent message
 ///   editor text, and the active item.
+/// - `find` — list the registered, addressable UI selectors (optionally
+///   filtered by `selector`), with their ids, labels, visibility, and text.
+/// - `click` — invoke a selector's handler directly by `selector` id (no
+///   synthetic mouse event, no foreground dependency).
+/// - `assert` — check a selector's `expect_text` and/or `expect_visible`.
 /// - `dispatch_action` — dispatch a registered action by name.
 /// - `focus` — move focus to a named view/handle
 ///   (`agent_panel.message_editor`, `agent_panel`, `editor`, `terminal`).

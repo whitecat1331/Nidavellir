@@ -35,6 +35,12 @@ pub enum WindowControlOperation {
     Press,
     /// Open an existing agent thread by id or `zed:///agent/thread/<uuid>` URL.
     OpenThread,
+    /// List the registered, addressable UI selectors (optionally filtered).
+    Find,
+    /// Invoke a selector's handler directly (no synthetic mouse event).
+    Click,
+    /// Assert on a selector's visibility or text.
+    Assert,
 }
 
 impl WindowControlOperation {
@@ -46,6 +52,9 @@ impl WindowControlOperation {
             Self::Type => "type",
             Self::Press => "press",
             Self::OpenThread => "open_thread",
+            Self::Find => "find",
+            Self::Click => "click",
+            Self::Assert => "assert",
         }
     }
 }
@@ -93,6 +102,19 @@ pub struct WindowControlRequest {
     /// For `open_thread`: a `zed:///agent/thread/<uuid>` deep link to open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+
+    /// For `find`/`click`/`assert`: the selector id (e.g.
+    /// `agent_panel.message_editor`). For `find`, an optional substring filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+
+    /// For `assert`: the exact text the selector must currently show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_text: Option<String>,
+
+    /// For `assert`: the visibility the selector must currently have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_visible: Option<bool>,
 }
 
 impl WindowControlRequest {
@@ -116,6 +138,9 @@ impl Default for WindowControlRequest {
             keys: None,
             thread_id: None,
             url: None,
+            selector: None,
+            expect_text: None,
+            expect_visible: None,
         }
     }
 }
@@ -188,5 +213,21 @@ mod tests {
             WindowControlRequest::default().operation,
             WindowControlOperation::State
         );
+    }
+
+    #[test]
+    fn click_and_assert_operations_serialize() {
+        let value = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::Assert,
+            selector: Some("agent_panel.message_editor".into()),
+            expect_text: Some("hi".into()),
+            expect_visible: Some(true),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(value["operation"], "assert");
+        assert_eq!(value["selector"], "agent_panel.message_editor");
+        assert_eq!(value["expect_text"], "hi");
+        assert_eq!(value["expect_visible"], true);
     }
 }
