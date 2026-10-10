@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use gpui::{AnyWindowHandle, App, TaskExt as _, WeakEntity};
+use gpui::{AnyWindowHandle, App, WeakEntity};
 use serde_json::json;
 
 use crate::agent_panel::{AgentPanel, window_control_dispatch};
