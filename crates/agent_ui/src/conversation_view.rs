@@ -5063,6 +5063,93 @@ pub(crate) mod tests {
         );
     }
 
+    /// ISSUE-0042: a synthetic `escape` (as the `window_control` surface
+    /// dispatches it) must not Stop-Generate the turn that sent it, while a
+    /// real Escape (no synthetic guard) keeps stopping generation.
+    #[gpui::test]
+    async fn test_synthetic_escape_does_not_stop_generation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // Queue a follow-up so the stop is observable: `cancel_generation`
+        // pauses the queue (see test_queue_resumes_after_stop_and_new_message).
+        active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.add_to_queue(
+                vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                    "queued".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+        });
+
+        // Synthetic (`window_control` `press`): the Cancel event must not cancel.
+        let guard = crate::agent_panel::SyntheticInputGuard::new();
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.handle_message_editor_event(
+                &message_editor,
+                &MessageEditorEvent::Cancel,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert_eq!(
+                view.thread.read(cx).status(),
+                ThreadStatus::Generating,
+                "a synthetic escape must not cancel the generation"
+            );
+        });
+        assert_eq!(
+            active_thread(&conversation_view, cx)
+                .read_with(cx, |thread, _cx| thread.message_queue.len()),
+            1,
+        );
+        drop(guard);
+
+        // Real (user) Escape: generation still stops.
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.handle_message_editor_event(
+                &message_editor,
+                &MessageEditorEvent::Cancel,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert_ne!(
+                view.thread.read(cx).status(),
+                ThreadStatus::Generating,
+                "a real escape must still stop generation"
+            );
+        });
+        assert_eq!(
+            active_thread(&conversation_view, cx)
+                .read_with(cx, |thread, _cx| thread.message_queue.len()),
+            1,
+            "stopping must not send the queued message"
+        );
+    }
+
     #[gpui::test]
     async fn test_notification_for_error(cx: &mut TestAppContext) {
         init_test(cx);
