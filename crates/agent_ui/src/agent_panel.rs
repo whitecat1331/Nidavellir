@@ -5205,6 +5205,16 @@ impl AgentPanel {
                 native_agent.set_window_control_host(window_control_host);
             }
         });
+
+        // Dev-only: also expose the same surface to non-agent drivers over a
+        // local command file (Phase 3). No-op outside dev builds.
+        if agent::window_control_enabled() {
+            crate::window_control_channel::ensure_started(
+                cx.weak_entity(),
+                window.window_handle(),
+                cx,
+            );
+        }
     }
 
     fn active_thread_has_messages(&self, cx: &App) -> bool {
@@ -5915,7 +5925,7 @@ impl AgentPanel {
 /// "cannot read AgentPanel while it is already being updated". So each op here
 /// reads the entities it needs from the panel first, then mutates them with the
 /// panel borrow released.
-fn window_control_dispatch(
+pub(crate) fn window_control_dispatch(
     panel: &Entity<AgentPanel>,
     request: agent::WindowControlRequest,
     window: &mut Window,
