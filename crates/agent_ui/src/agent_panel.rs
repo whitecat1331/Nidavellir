@@ -8050,9 +8050,7 @@ mod tests {
     /// `window_control` tool must focus and type with no synthetic click and no
     /// OS foreground dependency.
     #[gpui::test]
-    async fn test_window_control_focus_and_type_reaches_message_editor(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_window_control_focus_and_type_reaches_message_editor(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -8066,7 +8064,9 @@ mod tests {
         let multi_workspace =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace
-            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
             .unwrap();
         let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
         let panel = workspace.update_in(cx, |workspace, window, cx| {
@@ -8110,7 +8110,10 @@ mod tests {
                 cx,
             )
         });
-        assert!(type_result.is_ok(), "type op should succeed: {type_result:?}");
+        assert!(
+            type_result.is_ok(),
+            "type op should succeed: {type_result:?}"
+        );
         cx.run_until_parked();
 
         let snapshot = panel
