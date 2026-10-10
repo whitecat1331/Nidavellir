@@ -8044,6 +8044,87 @@ mod tests {
         assert!(window_control_action("agent::DefinitelyNotAnAction").is_err());
     }
 
+    /// Reproduction of the 2026-10-09 failure that motivated
+    /// `AGENT_WINDOW_CONTROL`: the pixel-based panel harness could not focus
+    /// the agent panel's message editor, so a human had to click it. The
+    /// `window_control` tool must focus and type with no synthetic click and no
+    /// OS foreground dependency.
+    #[gpui::test]
+    async fn test_window_control_focus_and_type_reaches_message_editor(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+
+        let focus_result = panel.update_in(cx, |panel, window, cx| {
+            panel.handle_window_control(
+                agent::WindowControlRequest {
+                    operation: agent::WindowControlOperation::Focus,
+                    target: Some("agent_panel.message_editor".to_string()),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(
+            focus_result.is_ok(),
+            "focus op should succeed: {focus_result:?}"
+        );
+
+        let type_result = panel.update_in(cx, |panel, window, cx| {
+            panel.handle_window_control(
+                agent::WindowControlRequest {
+                    operation: agent::WindowControlOperation::Type,
+                    text: Some("hello window".to_string()),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(type_result.is_ok(), "type op should succeed: {type_result:?}");
+        cx.run_until_parked();
+
+        let snapshot = panel
+            .update_in(cx, |panel, window, cx| {
+                panel.handle_window_control(agent::WindowControlRequest::state(), window, cx)
+            })
+            .expect("state op should succeed");
+        assert_eq!(
+            snapshot["agent_panel"]["message_editor"]["text"],
+            json!("hello window"),
+            "state should report the text typed through window_control"
+        );
+    }
+
     #[test]
     fn test_terminal_program_reports_known_agent_transitions() {
         let mut last_observed_program = None;
