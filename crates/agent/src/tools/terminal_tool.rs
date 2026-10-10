@@ -1106,11 +1106,23 @@ async fn run_terminal_tool(
 
     let user_stopped_via_signal = user_stopped_via_signal || event_stream.was_cancelled_by_user();
     let user_stopped_via_terminal = terminal.was_stopped_by_user(cx).unwrap_or(false);
-    let user_stopped = user_stopped_via_signal || user_stopped_via_terminal;
+
+    // `was_cancelled_by_user` fires for *any* cancellation of the surrounding
+    // turn, not only for actions the user took on this command. Keep the two
+    // sources apart so the result text never attributes a Stop Generation to
+    // the user (ISSUE-0042): an explicit stop of this command wins, otherwise a
+    // cancelled turn is reported as a generation stop.
+    let stop_source = if user_stopped_via_terminal {
+        Some(StopSource::UserStopButton)
+    } else if user_stopped_via_signal {
+        Some(StopSource::GenerationStop)
+    } else {
+        None
+    };
 
     let output = terminal.current_output(cx).map_err(|e| e.to_string())?;
 
-    let result = process_content(output, &input.command, timed_out, user_stopped, selection);
+    let result = process_content(output, &input.command, timed_out, stop_source, selection);
     let result = if failure_detected {
         format!(
             "Command \"{}\" was stopped early because its output looked like a failure \
@@ -1442,11 +1454,22 @@ fn terminal_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, String> {
     Ok(timeout_ms)
 }
 
+/// Why a running command was terminated before it finished.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopSource {
+    /// The user clicked this terminal card's own stop button.
+    UserStopButton,
+    /// The agent's generation was stopped, which cancelled the tool call. The
+    /// user may not have touched this command at all (e.g. Escape in the
+    /// message editor, the panel stop button, or a programmatic cancel).
+    GenerationStop,
+}
+
 fn process_content(
     output: acp::TerminalOutputResponse,
     command: &str,
     timed_out: bool,
-    user_stopped: bool,
+    stop_source: Option<StopSource>,
     selection: TerminalOutputSelection,
 ) -> String {
     let content = output.output.trim();
@@ -1472,18 +1495,34 @@ fn process_content(
         content
     };
 
-    let content = if user_stopped {
-        if is_empty {
-            "The user stopped this command. No output was captured before stopping.\n\n\
-            Since the user intentionally interrupted this command, ask them what they would like to do next \
-            rather than automatically retrying or assuming something went wrong.".to_string()
-        } else {
-            format!(
-                "The user stopped this command. Output captured before stopping:\n\n{}\n\n\
+    let content = if let Some(stop_source) = stop_source {
+        match (stop_source, is_empty) {
+            (StopSource::UserStopButton, true) => {
+                "The user stopped this command. No output was captured before stopping.\n\n\
                 Since the user intentionally interrupted this command, ask them what they would like to do next \
-                rather than automatically retrying or assuming something went wrong.",
-                content
-            )
+                rather than automatically retrying or assuming something went wrong.".to_string()
+            }
+            (StopSource::UserStopButton, false) => {
+                format!(
+                    "The user stopped this command. Output captured before stopping:\n\n{}\n\n\
+                    Since the user intentionally interrupted this command, ask them what they would like to do next \
+                    rather than automatically retrying or assuming something went wrong.",
+                    content
+                )
+            }
+            (StopSource::GenerationStop, true) => {
+                format!(
+                    "Command \"{command}\" was terminated because the agent's generation was stopped \
+                     (Stop Generation). No output was captured before stopping."
+                )
+            }
+            (StopSource::GenerationStop, false) => {
+                format!(
+                    "Command \"{command}\" was terminated because the agent's generation was stopped \
+                     (Stop Generation). Output captured before stopping:\n\n{}",
+                    content
+                )
+            }
         }
     } else if timed_out {
         if is_empty {
@@ -1960,7 +1999,7 @@ mod tests {
             output,
             "cargo build",
             false,
-            true,
+            Some(StopSource::UserStopButton),
             TerminalOutputSelection::default(),
         );
 
@@ -2197,7 +2236,7 @@ mod tests {
             output,
             "printf lines",
             false,
-            false,
+            None,
             TerminalOutputSelection {
                 head_lines: Some(1),
                 tail_lines: Some(1),
@@ -2216,7 +2255,7 @@ mod tests {
             output,
             "failing command",
             false,
-            false,
+            None,
             TerminalOutputSelection {
                 head_lines: None,
                 tail_lines: Some(1),
@@ -2237,7 +2276,7 @@ mod tests {
             output,
             "slow command",
             true,
-            false,
+            None,
             TerminalOutputSelection {
                 head_lines: Some(1),
                 tail_lines: None,
@@ -2258,7 +2297,7 @@ mod tests {
             output,
             "stopped command",
             false,
-            true,
+            Some(StopSource::UserStopButton),
             TerminalOutputSelection {
                 head_lines: None,
                 tail_lines: Some(1),
@@ -2281,7 +2320,7 @@ mod tests {
             output,
             "printf lines",
             false,
-            false,
+            None,
             TerminalOutputSelection {
                 head_lines: Some(1),
                 tail_lines: Some(1),
@@ -2301,7 +2340,7 @@ mod tests {
             output,
             "cargo build",
             false,
-            true,
+            Some(StopSource::UserStopButton),
             TerminalOutputSelection::default(),
         );
 
@@ -2318,6 +2357,64 @@ mod tests {
     }
 
     #[test]
+    fn test_process_content_generation_stopped() {
+        let output = acp::TerminalOutputResponse::new("partial output".to_string(), false);
+
+        let result = process_content(
+            output,
+            "cargo build",
+            false,
+            Some(StopSource::GenerationStop),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(
+            result.contains("because the agent's generation was stopped (Stop Generation)"),
+            "Expected generation-stop message, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("The user stopped this command"),
+            "A generation stop must not be attributed to the user, got: {}",
+            result
+        );
+        assert!(
+            result.contains("partial output"),
+            "Expected output to be included, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_content_generation_stopped_empty_output() {
+        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+
+        let result = process_content(
+            output,
+            "cargo build",
+            false,
+            Some(StopSource::GenerationStop),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(
+            result.contains("because the agent's generation was stopped (Stop Generation)"),
+            "Expected generation-stop message, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("The user stopped this command"),
+            "A generation stop must not be attributed to the user, got: {}",
+            result
+        );
+        assert!(
+            result.contains("No output was captured before stopping"),
+            "Expected empty-output note, got: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_process_content_timed_out() {
         let output = acp::TerminalOutputResponse::new("build output here".to_string(), false);
 
@@ -2325,7 +2422,7 @@ mod tests {
             output,
             "cargo build",
             true,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2349,7 +2446,7 @@ mod tests {
             output,
             "sleep 1000",
             true,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2374,7 +2471,7 @@ mod tests {
             output,
             "echo hello",
             false,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2399,7 +2496,7 @@ mod tests {
             output,
             "true",
             false,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2419,7 +2516,7 @@ mod tests {
             output,
             "false",
             false,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2444,7 +2541,7 @@ mod tests {
             output,
             "false",
             false,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2463,7 +2560,7 @@ mod tests {
             output,
             "some_command",
             false,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2487,7 +2584,7 @@ mod tests {
             output,
             "some_command",
             false,
-            false,
+            None,
             TerminalOutputSelection::default(),
         );
 
