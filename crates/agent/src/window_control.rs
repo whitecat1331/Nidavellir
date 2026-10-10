@@ -172,9 +172,11 @@ mod tests {
         .unwrap();
         assert_eq!(value["operation"], "dispatch_action");
         assert_eq!(value["action"], "agent::ToggleFocus");
-        // Defaulted fields are omitted so the model's JSON stays small.
+        // `submit` is a plain bool with a serde default, so it serializes as
+        // `false` rather than being omitted; the unused optional fields are
+        // omitted to keep the model's JSON small.
+        assert_eq!(value["submit"], false);
         assert!(value.get("text").is_none());
-        assert!(value.get("submit").is_none());
     }
 
     #[test]
