@@ -5761,9 +5761,7 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
                 .upgrade()
                 .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
             window.update(cx, |_root, window, cx| {
-                panel.update(cx, |panel, cx| {
-                    panel.handle_window_control(request, window, cx)
-                })
+                window_control_dispatch(&panel, request, window, cx)
             })?
         })
     }
@@ -5780,60 +5778,8 @@ impl AgentPanel {
             .map(|thread_view| thread_view.read(cx).message_editor.clone())
     }
 
-    fn handle_window_control(
-        &mut self,
-        request: agent::WindowControlRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<serde_json::Value> {
-        use agent::WindowControlOperation as Operation;
-
-        match request.operation {
-            Operation::State => Ok(self.window_control_state(window, cx)),
-            Operation::DispatchAction => {
-                let name = request
-                    .action
-                    .clone()
-                    .ok_or_else(|| anyhow!("`dispatch_action` requires `action`"))?;
-                let action = window_control_action(&name)?;
-                window.dispatch_action(action, cx);
-                Ok(serde_json::json!({ "dispatched": name }))
-            }
-            Operation::Focus => {
-                let target = request
-                    .target
-                    .clone()
-                    .ok_or_else(|| anyhow!("`focus` requires `target`"))?;
-                self.window_control_focus(&target, window, cx)?;
-                Ok(serde_json::json!({ "focused": target }))
-            }
-            Operation::Type => {
-                let text = request
-                    .text
-                    .clone()
-                    .ok_or_else(|| anyhow!("`type` requires `text`"))?;
-                self.window_control_type(&text, request.submit, window, cx)?;
-                Ok(serde_json::json!({ "typed": text, "submitted": request.submit }))
-            }
-            Operation::Press => {
-                let keys = request
-                    .keys
-                    .clone()
-                    .ok_or_else(|| anyhow!("`press` requires `keys`"))?;
-                let keystroke =
-                    gpui::Keystroke::parse(&keys).map_err(|error| anyhow!("{error}"))?;
-                let handled = window.dispatch_keystroke(keystroke, cx);
-                Ok(serde_json::json!({ "keys": keys, "handled": handled }))
-            }
-            Operation::OpenThread => {
-                self.window_control_open_thread(&request, window, cx)?;
-                Ok(serde_json::json!({ "opened": true }))
-            }
-        }
-    }
-
     /// A structured snapshot of the UI, so the agent can assert on state
-    /// instead of reading pixels.
+    /// instead of reading pixels. Read-only.
     fn window_control_state(&self, window: &Window, cx: &App) -> serde_json::Value {
         let workspace = self.workspace.upgrade();
         let roots: Vec<String> = workspace
@@ -5886,95 +5832,158 @@ impl AgentPanel {
             "active_item": active_item,
         })
     }
+}
 
-    fn window_control_focus(
-        &self,
-        target: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<()> {
-        match target {
-            "agent_panel.message_editor" | "message_editor" => {
-                let message_editor = self
-                    .active_message_editor(cx)
-                    .ok_or_else(|| anyhow!("No active agent message editor is available"))?;
-                message_editor.update(cx, |message_editor, cx| {
-                    let handle = message_editor.editor().read(cx).focus_handle(cx);
-                    handle.focus(window, cx);
-                });
-            }
-            "agent_panel" => {
-                self.focus_handle.focus(window, cx);
-            }
-            "editor" => {
-                let workspace = self
-                    .workspace
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("Workspace is no longer available"))?;
-                let editor = workspace
-                    .read(cx)
-                    .active_item(cx)
-                    .and_then(|item| item.act_as::<Editor>(cx))
-                    .ok_or_else(|| anyhow!("No active code editor"))?;
-                editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
-            }
-            "terminal" => {
-                let workspace = self
-                    .workspace
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("Workspace is no longer available"))?;
-                let terminal = workspace
-                    .read(cx)
-                    .active_item(cx)
-                    .and_then(|item| item.act_as::<TerminalView>(cx))
-                    .ok_or_else(|| anyhow!("No active terminal"))?;
-                terminal.update(cx, |terminal, cx| {
-                    terminal.focus_handle(cx).focus(window, cx)
-                });
-            }
-            other => return Err(anyhow!("Unknown focus target {other:?}")),
+/// Dispatch a `window_control` request against `panel` at the top level.
+///
+/// The mutations below (typing, focusing, dispatching actions) must run
+/// *outside* any `AgentPanel` update: they emit events that re-enter the panel,
+/// and doing that while the panel is already being updated panics with
+/// "cannot read AgentPanel while it is already being updated". So each op here
+/// reads the entities it needs from the panel first, then mutates them with the
+/// panel borrow released.
+fn window_control_dispatch(
+    panel: &Entity<AgentPanel>,
+    request: agent::WindowControlRequest,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<serde_json::Value> {
+    use agent::WindowControlOperation as Operation;
+
+    match request.operation {
+        Operation::State => Ok(panel.read_with(cx, |panel, cx| {
+            panel.window_control_state(window, cx)
+        })),
+        Operation::DispatchAction => {
+            let name = request
+                .action
+                .clone()
+                .ok_or_else(|| anyhow!("`dispatch_action` requires `action`"))?;
+            let action = window_control_action(&name)?;
+            window.dispatch_action(action, cx);
+            Ok(serde_json::json!({ "dispatched": name }))
         }
-        Ok(())
+        Operation::Focus => {
+            let target = request
+                .target
+                .clone()
+                .ok_or_else(|| anyhow!("`focus` requires `target`"))?;
+            window_control_focus(panel, &target, window, cx)?;
+            Ok(serde_json::json!({ "focused": target }))
+        }
+        Operation::Type => {
+            let text = request
+                .text
+                .clone()
+                .ok_or_else(|| anyhow!("`type` requires `text`"))?;
+            window_control_type(panel, &text, request.submit, window, cx)?;
+            Ok(serde_json::json!({ "typed": text, "submitted": request.submit }))
+        }
+        Operation::Press => {
+            let keys = request
+                .keys
+                .clone()
+                .ok_or_else(|| anyhow!("`press` requires `keys`"))?;
+            let keystroke = gpui::Keystroke::parse(&keys).map_err(|error| anyhow!("{error}"))?;
+            let handled = window.dispatch_keystroke(keystroke, cx);
+            Ok(serde_json::json!({ "keys": keys, "handled": handled }))
+        }
+        Operation::OpenThread => {
+            window_control_open_thread(panel, &request, window, cx)?;
+            Ok(serde_json::json!({ "opened": true }))
+        }
     }
+}
 
-    fn window_control_type(
-        &self,
-        text: &str,
-        submit: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<()> {
-        let message_editor = self
-            .active_message_editor(cx)
-            .ok_or_else(|| anyhow!("No active agent message editor is available"))?;
-        message_editor.update(cx, |message_editor, cx| {
-            let handle = message_editor.editor().read(cx).focus_handle(cx);
+fn window_control_focus(
+    panel: &Entity<AgentPanel>,
+    target: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    match target {
+        "agent_panel.message_editor" | "message_editor" => {
+            let message_editor = panel
+                .read_with(cx, |panel, cx| panel.active_message_editor(cx))
+                .ok_or_else(|| anyhow!("No active agent message editor is available"))?;
+            message_editor.update(cx, |message_editor, cx| {
+                let handle = message_editor.editor().read(cx).focus_handle(cx);
+                handle.focus(window, cx);
+            });
+        }
+        "agent_panel" => {
+            let handle = panel.read_with(cx, |panel, _cx| panel.focus_handle.clone());
             handle.focus(window, cx);
-            message_editor.insert_text(text, window, cx);
-        });
-        if submit {
-            message_editor.update(cx, |message_editor, cx| message_editor.send(cx));
         }
-        Ok(())
+        "editor" => {
+            let editor = panel
+                .read_with(cx, |panel, cx| {
+                    panel.workspace.upgrade().and_then(|workspace| {
+                        workspace
+                            .read(cx)
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<Editor>(cx))
+                    })
+                })
+                .ok_or_else(|| anyhow!("No active code editor"))?;
+            editor.update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        }
+        "terminal" => {
+            let terminal = panel
+                .read_with(cx, |panel, cx| {
+                    panel.workspace.upgrade().and_then(|workspace| {
+                        workspace
+                            .read(cx)
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<TerminalView>(cx))
+                    })
+                })
+                .ok_or_else(|| anyhow!("No active terminal"))?;
+            terminal.update(cx, |terminal, cx| terminal.focus_handle(cx).focus(window, cx));
+        }
+        other => return Err(anyhow!("Unknown focus target {other:?}")),
     }
+    Ok(())
+}
 
-    fn window_control_open_thread(
-        &mut self,
-        request: &agent::WindowControlRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<()> {
-        let uuid = if let Some(url) = request.url.as_deref() {
-            window_control_uuid_from_url(url).ok_or_else(|| anyhow!("Not a thread URL: {url:?}"))?
-        } else if let Some(thread_id) = request.thread_id.as_deref() {
-            normalize_uuid(thread_id).ok_or_else(|| anyhow!("Not a thread id: {thread_id:?}"))?
-        } else {
-            return Err(anyhow!("`open_thread` requires `thread_id` or `url`"));
-        };
+fn window_control_type(
+    panel: &Entity<AgentPanel>,
+    text: &str,
+    submit: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    let message_editor = panel
+        .read_with(cx, |panel, cx| panel.active_message_editor(cx))
+        .ok_or_else(|| anyhow!("No active agent message editor is available"))?;
+    message_editor.update(cx, |message_editor, cx| {
+        let handle = message_editor.editor().read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+        message_editor.insert_text(text, window, cx);
+    });
+    if submit {
+        message_editor.update(cx, |message_editor, cx| message_editor.send(cx));
+    }
+    Ok(())
+}
 
-        let session_id = {
-            let store = ThreadMetadataStore::try_global(cx)
-                .ok_or_else(|| anyhow!("Thread metadata store is unavailable"))?;
+fn window_control_open_thread(
+    panel: &Entity<AgentPanel>,
+    request: &agent::WindowControlRequest,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    let uuid = if let Some(url) = request.url.as_deref() {
+        window_control_uuid_from_url(url).ok_or_else(|| anyhow!("Not a thread URL: {url:?}"))?
+    } else if let Some(thread_id) = request.thread_id.as_deref() {
+        normalize_uuid(thread_id).ok_or_else(|| anyhow!("Not a thread id: {thread_id:?}"))?
+    } else {
+        return Err(anyhow!("`open_thread` requires `thread_id` or `url`"));
+    };
+
+    let session_id = panel
+        .read_with(cx, |_panel, cx| {
+            let store = ThreadMetadataStore::try_global(cx)?;
             let store = store.read(cx);
             store
                 .entries()
@@ -5983,12 +5992,13 @@ impl AgentPanel {
                         == Some(uuid.as_str())
                 })
                 .and_then(|metadata| metadata.session_id.clone())
-                .ok_or_else(|| anyhow!("No agent thread found for id {uuid}"))?
-        };
+        })
+        .ok_or_else(|| anyhow!("No agent thread found for id {uuid}"))?;
 
-        self.open_thread(session_id, None, None, window, cx);
-        Ok(())
-    }
+    panel.update(cx, |panel, cx| {
+        panel.open_thread(session_id, None, None, window, cx)
+    });
+    Ok(())
 }
 
 /// Map a supported action name to a typed action, so `dispatch_action` can
@@ -8068,7 +8078,8 @@ mod tests {
                 multi_workspace.workspace().clone()
             })
             .unwrap();
-        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let window_handle: gpui::AnyWindowHandle = multi_workspace.into();
+        let cx = &mut VisualTestContext::from_window(window_handle, cx);
         let panel = workspace.update_in(cx, |workspace, window, cx| {
             let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
@@ -8083,8 +8094,11 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let focus_result = panel.update_in(cx, |panel, window, cx| {
-            panel.handle_window_control(
+        // Drive the same top-level entry point the host uses, so this test would
+        // catch a re-entrant `AgentPanel` update (the live crash this pins).
+        let focus_result = cx.update(|window, cx| {
+            window_control_dispatch(
+                &panel,
                 agent::WindowControlRequest {
                     operation: agent::WindowControlOperation::Focus,
                     target: Some("agent_panel.message_editor".to_string()),
@@ -8099,8 +8113,9 @@ mod tests {
             "focus op should succeed: {focus_result:?}"
         );
 
-        let type_result = panel.update_in(cx, |panel, window, cx| {
-            panel.handle_window_control(
+        let type_result = cx.update(|window, cx| {
+            window_control_dispatch(
+                &panel,
                 agent::WindowControlRequest {
                     operation: agent::WindowControlOperation::Type,
                     text: Some("hello window".to_string()),
@@ -8116,9 +8131,9 @@ mod tests {
         );
         cx.run_until_parked();
 
-        let snapshot = panel
-            .update_in(cx, |panel, window, cx| {
-                panel.handle_window_control(agent::WindowControlRequest::state(), window, cx)
+        let snapshot = cx
+            .update(|window, cx| {
+                window_control_dispatch(&panel, agent::WindowControlRequest::state(), window, cx)
             })
             .expect("state op should succeed");
         assert_eq!(
