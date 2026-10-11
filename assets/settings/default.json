@@ -1447,6 +1447,11 @@
     //
     // Default: false
     "cancel_generation_on_terminal_stop": false,
+    // How long to leave the output sampler's "kill or continue" prompt open
+    // before the command is stopped automatically.
+    //
+    // Default: 10
+    "terminal_error_sampler_timeout_seconds": 10,
     // Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages in the agent panel.
     //
     // Default: false
