@@ -7728,6 +7728,10 @@ impl ToolCallEventStream {
         cx: &mut App,
     ) -> Task<Result<acp::PermissionOptionId>> {
         let options = acp_thread::PermissionOptions::Flat(options);
+        log::info!(
+            "SAMPLER-DIAG prompt_for_decision auto_resolve_after={:?}",
+            auto_resolve_after
+        );
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
         cx.spawn(async move |_cx| {

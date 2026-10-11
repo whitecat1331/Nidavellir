@@ -5682,6 +5682,10 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<(PermissionRequestId, Task<RequestPermissionOutcome>)> {
         let (tx, rx) = oneshot::channel();
+        log::info!(
+            "SAMPLER-DIAG _with_id_inner auto_resolve_after={:?}",
+            auto_resolve_after
+        );
 
         let current_status = self
             .tool_call(&tool_call.tool_call_id)

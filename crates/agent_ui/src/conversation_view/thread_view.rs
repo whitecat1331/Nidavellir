@@ -8717,6 +8717,11 @@ impl ThreadView {
                 )
             })
             .when_some(permission_request, |this, request| {
+                log::info!(
+                    "SAMPLER-DIAG render deadline={:?} outcome={:?}",
+                    request.auto_resolve_deadline(),
+                    terminal_data.sampler_outcome()
+                );
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
                 let allow_disabled = self.sandbox_confusables_block_allow(tool_call, cx);
                 this.when_some(request.auto_resolve_deadline(), |this, deadline| {

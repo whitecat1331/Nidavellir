@@ -1094,6 +1094,11 @@ async fn run_terminal_tool(
                             let outcome = sampler_outcome_for(choice.as_ref());
                             sampler_outcome = Some(outcome);
                             let reason = format!("{detected_error_lines} error-signature lines");
+                            log::info!(
+                                "SAMPLER-DIAG terminal_tool outcome={:?} window={}s",
+                                outcome,
+                                sampler_window.as_secs()
+                            );
                             terminal
                                 .mark_sampler_outcome(outcome, reason, cx)
                                 .map_err(|e| e.to_string())?;
