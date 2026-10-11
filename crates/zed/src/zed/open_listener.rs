@@ -246,9 +246,7 @@ impl OpenRequest {
 
     fn parse_agent_thread_url(&mut self, thread_path: &str) -> Result<()> {
         // Format: <session-id>?name=<title>
-        let (session_id, query) = thread_path
-            .split_once('?')
-            .unwrap_or((thread_path, ""));
+        let (session_id, query) = thread_path.split_once('?').unwrap_or((thread_path, ""));
         anyhow::ensure!(
             !session_id.is_empty(),
             "invalid agent thread url: missing session id"

@@ -135,7 +135,9 @@ async fn run_prompt(
     });
 
     project
-        .update(cx, |project, cx| project.create_worktree(&workdir, true, cx))
+        .update(cx, |project, cx| {
+            project.create_worktree(&workdir, true, cx)
+        })
         .await
         .context("creating worktree")?;
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use async_tungstenite::client_async;
 use async_tungstenite::tungstenite::{Error as TungsteniteError, Message};
 use futures::channel::oneshot;
-use futures::future::{select, Either};
+use futures::future::{Either, select};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use gpui::BackgroundExecutor;
 use serde_json::{Value, json};
@@ -149,13 +149,21 @@ impl CdpClient {
             self.pending.lock().unwrap().remove(&id);
             return Err(anyhow!("failed to send CDP command: connection closed"));
         }
-        match select(Box::pin(response), Box::pin(self.executor.timer(self.timeout))).await {
+        match select(
+            Box::pin(response),
+            Box::pin(self.executor.timer(self.timeout)),
+        )
+        .await
+        {
             Either::Left((result, _timer)) => {
                 result.map_err(|_| anyhow!("CDP connection closed while awaiting response"))?
             }
             Either::Right(((), _response)) => {
                 self.pending.lock().unwrap().remove(&id);
-                return Err(anyhow!("CDP command {method} timed out after {:?}", self.timeout));
+                return Err(anyhow!(
+                    "CDP command {method} timed out after {:?}",
+                    self.timeout
+                ));
             }
         }
     }
@@ -254,6 +262,9 @@ mod tests {
             events: Arc::new(Mutex::new(EventBuffer::default())),
         };
         let result = client.send_command("Browser.getVersion", json!({})).await;
-        assert!(result.is_err(), "expected command to time out, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected command to time out, got {result:?}"
+        );
     }
 }

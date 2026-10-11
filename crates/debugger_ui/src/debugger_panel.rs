@@ -415,9 +415,7 @@ impl DebugPanel {
         }
 
         let Some(worktree) = curr_session.read(cx).worktree() else {
-            return Task::ready(Err(anyhow!(
-                "Attempted to restart a non-running session"
-            )));
+            return Task::ready(Err(anyhow!("Attempted to restart a non-running session")));
         };
 
         let dap_store_handle = self.project.read(cx).dap_store();

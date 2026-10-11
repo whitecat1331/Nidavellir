@@ -408,11 +408,7 @@ impl WorkspaceManager {
 
     /// Add a project to a managed workspace, appending it at the end. The id is
     /// unchanged.
-    pub async fn add_project(
-        &self,
-        workspace_id: ManagedWorkspaceId,
-        path: PathBuf,
-    ) -> Result<()> {
+    pub async fn add_project(&self, workspace_id: ManagedWorkspaceId, path: PathBuf) -> Result<()> {
         let key = workspace_id.to_key_string();
         let path = path.to_string_lossy().into_owned();
         let position = self.projects(workspace_id)?.len() as i64;

@@ -204,10 +204,7 @@ mod tests {
         )
     }
 
-    fn action_statistics(
-        action: &'static str,
-        started_at: Instant,
-    ) -> gpui::ActionStatistics {
+    fn action_statistics(action: &'static str, started_at: Instant) -> gpui::ActionStatistics {
         let mut statistics = gpui::ActionStatistics::default();
         statistics.update_running_action(action, started_at);
         statistics
@@ -216,8 +213,10 @@ mod tests {
     #[test]
     fn an_action_hang_requests_a_trace() {
         let mut reporter = reporter(Duration::from_millis(100));
-        let action_stats =
-            action_statistics("dev::HangForeground", Instant::now() - Duration::from_secs(1));
+        let action_stats = action_statistics(
+            "dev::HangForeground",
+            Instant::now() - Duration::from_secs(1),
+        );
 
         // Regression: before the hang detector counted action hangs, a hang
         // that only surfaced as a long-running action returned `false` here, so

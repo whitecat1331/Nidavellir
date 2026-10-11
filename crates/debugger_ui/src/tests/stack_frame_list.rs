@@ -16,7 +16,10 @@ use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
 use project::{FakeFs, Project};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use unindent::Unindent as _;
 use util::{path, rel_path::rel_path};
 use workspace::Item;
@@ -1392,7 +1395,9 @@ async fn test_go_to_stack_frame_roots_worktree_at_parent_directory(
     // itself: a single-file worktree root gets persisted as a workspace folder
     // and makes language servers spawn with a file as their cwd.
     let (worktree, relative_path) = project
-        .update(cx, |project, cx| project.find_worktree(Path::new(path!("/outside/lib.js")), cx))
+        .update(cx, |project, cx| {
+            project.find_worktree(Path::new(path!("/outside/lib.js")), cx)
+        })
         .expect("worktree containing the frame file should exist");
 
     assert_eq!(

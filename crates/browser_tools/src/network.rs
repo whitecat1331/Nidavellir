@@ -701,11 +701,17 @@ mod tests {
 
         let request = store.request("1").expect("request should be tracked");
         assert_eq!(
-            request.response_headers.get("set-cookie").map(String::as_str),
+            request
+                .response_headers
+                .get("set-cookie")
+                .map(String::as_str),
             Some("session=abc; Path=/")
         );
         assert_eq!(
-            request.response_headers.get("Content-Type").map(String::as_str),
+            request
+                .response_headers
+                .get("Content-Type")
+                .map(String::as_str),
             Some("text/html")
         );
     }

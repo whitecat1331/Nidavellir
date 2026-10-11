@@ -1725,8 +1725,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div,
+        list, point, px, size,
     };
 
     #[gpui::test]
@@ -2418,15 +2418,30 @@ mod test {
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().flex().flex_col().size_full()
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
                     .child(div().h(px(40.)).w_full())
                     .child(
-                        div().flex_1().min_h_0().grid().grid_cols(2).grid_rows(1).children(vec![
-                            list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .grid()
+                            .grid_cols(2)
+                            .grid_rows(1)
+                            .children(vec![
+                                list(self.0.clone(), |_, _, _| {
+                                    div().h(px(24.)).w_full().into_any()
+                                })
                                 .size_full()
                                 .into_any_element(),
-                            div().size_full().flex_col().child(div().h(px(24.)).w_full()).into_any_element(),
-                        ]),
+                                div()
+                                    .size_full()
+                                    .flex_col()
+                                    .child(div().h(px(24.)).w_full())
+                                    .into_any_element(),
+                            ]),
                     )
             }
         }
@@ -2462,9 +2477,11 @@ mod test {
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
-                    .w_full()
-                    .h_full()
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(24.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
             }
         }
 
@@ -2501,9 +2518,11 @@ mod test {
         struct TestView(ListState);
         impl Render for TestView {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                list(self.0.clone(), |_, _, _| div().h(px(24.)).w_full().into_any())
-                    .w_full()
-                    .h_full()
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(24.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
             }
         }
 

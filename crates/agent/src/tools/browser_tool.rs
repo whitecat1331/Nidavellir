@@ -507,7 +507,10 @@ async fn authorize_browser_operation(
     task.await
 }
 
-pub(crate) fn permission_inputs(operation: &str, values: impl IntoIterator<Item = String>) -> Vec<String> {
+pub(crate) fn permission_inputs(
+    operation: &str,
+    values: impl IntoIterator<Item = String>,
+) -> Vec<String> {
     let mut inputs = values.into_iter().collect::<Vec<_>>();
     if inputs.is_empty() {
         inputs.push(operation.to_string());
