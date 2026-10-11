@@ -10912,7 +10912,7 @@ mod tests {
 
             fn connect(
                 &self,
-                _delegate: AgentServerDelegate,
+                _delegate: agent_servers::AgentServerDelegate,
                 _project: Entity<Project>,
                 _cx: &mut App,
             ) -> Task<gpui::Result<Rc<dyn AgentConnection>>> {
@@ -10943,7 +10943,7 @@ mod tests {
                 cx,
             )
         });
-        let thread_id = thread.conversation_view.read(cx).thread_id;
+        let thread_id = cx.update(|_window, cx| thread.conversation_view.read(cx).thread_id);
         panel.update_in(cx, |panel, window, cx| {
             panel.set_base_view(
                 BaseView::AgentThread {
