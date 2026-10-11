@@ -1266,32 +1266,34 @@ impl AgentPanel {
                     // completed (a fork-and-continue sibling). Fall back to
                     // the persisted state so a serialize in this window still
                     // records the active thread: a restored session keeps its
-                    // session id (the conversation view remembers it and the
-                    // metadata row is found by session), and a row-less
-                    // thread is a draft by construction (rows are written
-                    // once the native thread connects).
+                    // session id (the conversation view remembers it), and a
+                    // row-less thread is a draft by construction (rows are
+                    // written once the native thread connects).
                     let active_thread_id = active_thread_id?;
                     let conversation_view = self.active_conversation_view()?;
-                    let metadata = conversation_view
-                        .read(cx)
-                        .root_session_id
-                        .clone()
+                    let root_session_id = conversation_view.read(cx).root_session_id.clone();
+                    let metadata = root_session_id
+                        .as_ref()
                         .and_then(|session_id| {
                             ThreadMetadataStore::try_global(cx).and_then(|store| {
-                                store.read(cx).entry_by_session(&session_id).cloned()
+                                store.read(cx).entry_by_session(session_id).cloned()
                             })
                         })
                         .or_else(|| {
                             ThreadMetadataStore::try_global(cx)
                                 .and_then(|store| store.read(cx).entry(active_thread_id).cloned())
                         });
-                    let (session_id, title, work_dirs) = match metadata {
+                    let session_id = root_session_id.map(|s| s.0.to_string()).or_else(|| {
+                        metadata
+                            .as_ref()
+                            .and_then(|m| m.session_id.as_ref().map(|s| s.0.to_string()))
+                    });
+                    let (title, work_dirs) = match metadata {
                         Some(metadata) => (
-                            metadata.session_id.as_ref().map(|s| s.0.to_string()),
                             metadata.title.as_ref().map(|t| t.to_string()),
                             Some(metadata.folder_paths().serialize()),
                         ),
-                        None => (None, None, None),
+                        None => (None, None),
                     };
                     Some(SerializedActiveThread {
                         session_id,
