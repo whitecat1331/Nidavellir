@@ -8618,6 +8618,30 @@ impl ThreadView {
                 reason
             );
         };
+
+        // While a permission prompt is up, its message replaces the tool call's
+        // content; render that text above the buttons so the prompt still reads.
+        let prompt_content = tool_call
+            .content()
+            .iter()
+            .filter(|content| !matches!(content, ToolCallContent::Terminal { .. }))
+            .enumerate()
+            .map(|(context_ix, content)| {
+                self.render_tool_call_content(
+                    active_session_id,
+                    entry_ix,
+                    content,
+                    context_ix,
+                    tool_call,
+                    true,
+                    tool_failed,
+                    focus_handle,
+                    window,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
             header_group,
@@ -8723,6 +8747,7 @@ impl ThreadView {
                         .child(banner),
                 )
             })
+            .when(needs_confirmation, |this| this.children(prompt_content))
             .when_some(permission_request, |this, request| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
                 let allow_disabled = self.sandbox_confusables_block_allow(tool_call, cx);
