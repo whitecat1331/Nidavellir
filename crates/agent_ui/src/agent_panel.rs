@@ -1260,17 +1260,31 @@ impl AgentPanel {
                 })
                 .or_else(|| {
                     // The active view has no live thread yet — either a
-                    // restored session still loading (waiting for a custom
-                    // agent to finish registering, say) or a thread created
-                    // moments ago whose connection hasn't completed (a
-                    // fork-and-continue sibling). Fall back to the metadata
-                    // store so a serialize in this window still records the
-                    // active thread: a restored session keeps its session id,
-                    // and a row-less thread is a draft by construction (rows
-                    // are written once the native thread connects).
+                    // restored session still loading (or in `LoadError`, e.g.
+                    // waiting for a custom agent to finish registering) or a
+                    // thread created moments ago whose connection hasn't
+                    // completed (a fork-and-continue sibling). Fall back to
+                    // the persisted state so a serialize in this window still
+                    // records the active thread: a restored session keeps its
+                    // session id (the conversation view remembers it and the
+                    // metadata row is found by session), and a row-less
+                    // thread is a draft by construction (rows are written
+                    // once the native thread connects).
                     let active_thread_id = active_thread_id?;
-                    let metadata = ThreadMetadataStore::try_global(cx)
-                        .and_then(|store| store.read(cx).entry(active_thread_id).cloned());
+                    let conversation_view = self.active_conversation_view()?;
+                    let metadata = conversation_view
+                        .read(cx)
+                        .root_session_id
+                        .clone()
+                        .and_then(|session_id| {
+                            ThreadMetadataStore::try_global(cx).and_then(|store| {
+                                store.read(cx).entry_by_session(&session_id).cloned()
+                            })
+                        })
+                        .or_else(|| {
+                            ThreadMetadataStore::try_global(cx)
+                                .and_then(|store| store.read(cx).entry(active_thread_id).cloned())
+                        });
                     let (session_id, title, work_dirs) = match metadata {
                         Some(metadata) => (
                             metadata.session_id.as_ref().map(|s| s.0.to_string()),
