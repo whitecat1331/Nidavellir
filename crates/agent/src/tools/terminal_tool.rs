@@ -1,4 +1,6 @@
+use acp_thread::SamplerOutcome;
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::AgentSettings;
 use anyhow::Result;
 use futures::FutureExt as _;
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
@@ -32,11 +34,6 @@ const MAX_TERMINAL_TIMEOUT_MS: u64 = 7_200_000;
 // Poll cadence for the output sampler that detects a failing command from its
 // output before the timeout fires.
 const SAMPLER_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-// How long to leave the "kill or continue" prompt open. The command keeps
-// running if the prompt goes unanswered: only an explicit "Kill" stops it, so a
-// heuristic on printed output can never kill a command in an unattended run.
-const SAMPLER_KILL_CONTINUE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Executes a shell one-liner and returns the combined output.
 ///
@@ -1011,9 +1008,16 @@ async fn run_terminal_tool(
     let timeout = Duration::from_millis(terminal_timeout_ms(input.timeout_ms)?);
 
     let mut timed_out = false;
-    let mut failure_detected = false;
+    let mut sampler_outcome: Option<SamplerOutcome> = None;
     let mut user_stopped_via_signal = false;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
+
+    // How long to leave the sampler's kill/continue prompt open before stopping
+    // the command automatically (`agent.terminal_error_sampler_timeout_seconds`).
+    let sampler_window = cx.update(|cx| {
+        AgentSettings::get_global(cx).terminal_error_sampler_timeout_seconds
+    });
+    let sampler_window = Duration::from_secs(sampler_window);
 
     let timeout_task = cx.background_executor().timer(timeout).shared();
 
@@ -1055,14 +1059,16 @@ async fn run_terminal_tool(
                             && detect_error_stream(new_output, &mut sampler_state)
                         {
                             detected_error_lines = sampler_state.error_lines;
+                            let sampler_window_secs = sampler_window.as_secs();
                             let decision = cx.update(|cx| {
                                 event_stream.prompt_for_decision(
                                     None,
                                     Some(format!(
                                         "Detected a sustained stream of error output \
                                          ({detected_error_lines} error-signature lines). \
-                                         Kill the command, or let it continue? It keeps \
-                                         running if you don't answer.",
+                                         Kill the command, or let it continue? If you \
+                                         don't answer, it stops automatically in \
+                                         {sampler_window_secs}s.",
                                     )),
                                     vec![
                                         acp::PermissionOption::new(
@@ -1076,22 +1082,23 @@ async fn run_terminal_tool(
                                             acp::PermissionOptionKind::AllowOnce,
                                         ),
                                     ],
+                                    Some(sampler_window),
                                     cx,
                                 )
                             });
                             let choice = futures::select! {
                                 outcome = decision.fuse() => outcome.ok(),
                                 _ = cx.background_executor()
-                                    .timer(SAMPLER_KILL_CONTINUE_WINDOW)
+                                    .timer(sampler_window)
                                     .fuse() => None,
                             };
-                            let kill = should_kill_after_error_stream(choice);
-                            if kill {
-                                failure_detected = true;
-                                let reason = format!("a sustained stream of {detected_error_lines} error-signature lines was detected");
-                                terminal
-                                    .mark_failure_detected(reason, cx)
-                                    .map_err(|e| e.to_string())?;
+                            let outcome = sampler_outcome_for(choice.as_ref());
+                            sampler_outcome = Some(outcome);
+                            let reason = format!("{detected_error_lines} error-signature lines");
+                            terminal
+                                .mark_sampler_outcome(outcome, reason, cx)
+                                .map_err(|e| e.to_string())?;
+                            if should_kill_after_error_stream(choice.as_ref()) {
                                 terminal.kill(cx).map_err(|e| e.to_string())?;
                                 wait_for_exit.await;
                                 break 'wait;
@@ -1123,14 +1130,25 @@ async fn run_terminal_tool(
     let output = terminal.current_output(cx).map_err(|e| e.to_string())?;
 
     let result = process_content(output, &input.command, timed_out, stop_source, selection);
-    let result = if failure_detected {
-        format!(
-            "Command \"{}\" was stopped early because its output looked like a failure \
-             (a sustained stream of {detected_error_lines} error-signature lines was detected).\n\n{result}",
+    let result = match sampler_outcome {
+        Some(SamplerOutcome::StoppedByUser) => format!(
+            "{result}\n\nCommand \"{}\" was stopped because you stopped it after its output \
+             looked like a failure (a sustained stream of {detected_error_lines} \
+             error-signature lines was detected).",
             input.command
-        )
-    } else {
-        result
+        ),
+        Some(SamplerOutcome::StoppedByTimeout) => format!(
+            "{result}\n\nCommand \"{}\" was stopped automatically because its output looked \
+             like a failure (a sustained stream of {detected_error_lines} error-signature \
+             lines was detected) and the kill/continue prompt went unanswered.",
+            input.command
+        ),
+        Some(SamplerOutcome::Continued) => format!(
+            "{result}\n\nNote: the command's output looked like a failure (a sustained \
+             stream of {detected_error_lines} error-signature lines was detected), but it \
+             was allowed to continue.",
+        ),
+        None => result,
     };
     let notes = sandbox_note.into_iter().collect::<Vec<_>>();
     Ok(if notes.is_empty() {
@@ -1433,15 +1451,27 @@ fn is_error_line(line: &str) -> bool {
         .any(|signature| lower.contains(*signature))
 }
 
-/// Whether the sampler's detected error stream should stop the command.
+/// How the sampler's kill/continue prompt resolved.
 ///
-/// Only an explicit "Kill" does: an unanswered prompt (the decision window
-/// elapsing) or a closed decision channel lets the command run to completion.
-/// An unattended / autonomous run has nobody to answer, so defaulting to a kill
-/// turned a heuristic on printed text into a mid-flight stop of a command that
-/// may be perfectly healthy — the real failure signal is the exit code.
-fn should_kill_after_error_stream(choice: Option<acp::PermissionOptionId>) -> bool {
-    matches!(choice, Some(option_id) if option_id.0.as_ref() == "kill")
+/// An explicit "Continue" is the only answer that keeps the command running. An
+/// explicit "Kill" and an unanswered prompt (the decision window elapsed, or the
+/// channel closed) both stop the command: with nobody there to answer, a
+/// heuristic on printed text must not leave a failing command running
+/// unattended. This reverses the earlier advisory behaviour (see
+/// `FIX_TERMINAL_ERROR_SAMPLER_ADVISORY`); it is safe now that a command stop
+/// no longer cancels the turn (`TERMINAL_STOP_ONLY_STOPS_COMMAND`).
+fn sampler_outcome_for(choice: Option<&acp::PermissionOptionId>) -> SamplerOutcome {
+    match choice.map(|option_id| option_id.0.as_ref()) {
+        Some("continue") => SamplerOutcome::Continued,
+        Some("kill") => SamplerOutcome::StoppedByUser,
+        _ => SamplerOutcome::StoppedByTimeout,
+    }
+}
+
+/// Whether the sampler's resolved choice stops the command. Only an explicit
+/// "Continue" keeps it running.
+fn should_kill_after_error_stream(choice: Option<&acp::PermissionOptionId>) -> bool {
+    sampler_outcome_for(choice) != SamplerOutcome::Continued
 }
 
 fn terminal_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, String> {
@@ -1654,22 +1684,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sampler_does_not_kill_without_an_explicit_choice() {
-        // Unanswered prompt / decision window elapsed / channel closed. This is
-        // the regression: the old logic returned `true` here and killed the
-        // command mid-flight in an unattended run.
+    fn test_sampler_stops_when_unanswered() {
+        // Unanswered prompt / decision window elapsed / closed channel: the
+        // sampler stops the command rather than leaving a failing command
+        // running unattended.
         assert!(
-            !should_kill_after_error_stream(None),
-            "an unanswered sampler prompt must not kill the command"
+            should_kill_after_error_stream(None),
+            "an unanswered sampler prompt must stop the command"
         );
-        // An explicit "Continue" also keeps it running.
-        assert!(!should_kill_after_error_stream(Some(
-            acp::PermissionOptionId::new("continue")
-        )));
-        // An explicit "Kill" is the only thing that stops the command.
-        assert!(should_kill_after_error_stream(Some(
-            acp::PermissionOptionId::new("kill")
-        )));
+        assert_eq!(sampler_outcome_for(None), SamplerOutcome::StoppedByTimeout);
+        // An explicit "Continue" is the only answer that keeps it running.
+        let continue_choice = acp::PermissionOptionId::new("continue");
+        assert!(!should_kill_after_error_stream(Some(&continue_choice)));
+        assert_eq!(
+            sampler_outcome_for(Some(&continue_choice)),
+            SamplerOutcome::Continued
+        );
+        // An explicit "Kill" stops it, attributed to the user.
+        let kill_choice = acp::PermissionOptionId::new("kill");
+        assert!(should_kill_after_error_stream(Some(&kill_choice)));
+        assert_eq!(
+            sampler_outcome_for(Some(&kill_choice)),
+            SamplerOutcome::StoppedByUser
+        );
     }
 
     #[test]

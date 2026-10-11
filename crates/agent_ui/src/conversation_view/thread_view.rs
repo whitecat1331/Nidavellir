@@ -8562,6 +8562,9 @@ impl ThreadView {
             cx,
         );
 
+        // Show the captured output whenever the sampler fired, even if the card
+        // is collapsed: the outcome banner below explains what the output shows.
+        let sampler_fired = terminal_data.sampler_outcome().is_some();
         let is_expanded = self
             .entry_view_state
             .read(cx)
@@ -8588,14 +8591,27 @@ impl ThreadView {
             }
         });
 
-        let failure_banner = terminal_data.was_failure_detected().then(|| {
-            SharedString::from(format!(
-                "Stopped early: {}.",
-                terminal_data
-                    .failure_reason()
-                    .unwrap_or("the output looked like a failure")
-            ))
-        });
+        let sampler_window_secs =
+            AgentSettings::get_global(cx).terminal_error_sampler_timeout_seconds;
+        let sampler_banner = terminal_data
+            .sampler_outcome()
+            .map(|(outcome, reason)| {
+                let text = match outcome {
+                    acp_thread::SamplerOutcome::StoppedByUser => format!(
+                        "Stopped: you stopped the command after its output looked like a \
+                         failure ({reason})."
+                    ),
+                    acp_thread::SamplerOutcome::StoppedByTimeout => format!(
+                        "Stopped automatically: no answer within {sampler_window_secs}s after \
+                         its output looked like a failure ({reason})."
+                    ),
+                    acp_thread::SamplerOutcome::Continued => format!(
+                        "Continued: the output looked like a failure ({reason}), but you \
+                         chose to continue."
+                    ),
+                };
+                SharedString::from(text)
+            });
 
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
@@ -8656,18 +8672,7 @@ impl ThreadView {
             })
             .overflow_hidden()
             .child(header)
-            .when_some(failure_banner, |this, banner| {
-                this.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .border_t_1()
-                        .border_color(border_color)
-                        .text_ui_sm(cx)
-                        .child(banner),
-                )
-            })
-            .when(is_expanded && terminal_view.is_some(), |this| {
+            .when((is_expanded || sampler_fired) && terminal_view.is_some(), |this| {
                 this.child(
                     div()
                         .pt_2()
@@ -8699,10 +8704,43 @@ impl ThreadView {
                         })),
                 )
             })
+            .when_some(sampler_banner, |this, banner| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(border_color)
+                        .text_ui_sm(cx)
+                        .child(banner),
+                )
+            })
             .when_some(permission_request, |this, request| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
                 let allow_disabled = self.sandbox_confusables_block_allow(tool_call, cx);
-                this.child(self.render_permission_buttons(
+                this.when_some(request.auto_resolve_deadline(), |this, deadline| {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining > Duration::ZERO {
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_secs(1))
+                                .await;
+                            this.update(cx, |_this, cx| cx.notify()).ok();
+                        })
+                        .detach();
+                    }
+                    this.child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .text_ui_sm(cx)
+                            .child(SharedString::from(format!(
+                                "Stopped automatically in {}s",
+                                remaining.as_secs().saturating_add(1)
+                            ))),
+                    )
+                })
+                .child(self.render_permission_buttons(
                     self.thread.read(cx).session_id().clone(),
                     is_first,
                     request,

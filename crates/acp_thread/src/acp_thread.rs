@@ -1066,6 +1066,10 @@ enum PermissionRequestData {
         options: PermissionOptions,
         kind: AuthorizationKind,
         respond_tx: oneshot::Sender<RequestPermissionOutcome>,
+        /// When this prompt auto-resolves if unanswered. Display-only: the UI
+        /// counts down to it, while the requesting tool keeps the authoritative
+        /// timer and still performs the stop when the window elapses.
+        auto_resolve_deadline: Option<Instant>,
     },
     Generic {
         request: acp_v2::RequestPermissionRequest,
@@ -1084,6 +1088,19 @@ impl PermissionRequest {
     pub fn legacy_options(&self) -> Option<&PermissionOptions> {
         match &self.data {
             PermissionRequestData::LegacyTool { options, .. } => Some(options),
+            PermissionRequestData::Generic { .. } => None,
+        }
+    }
+
+    /// The deadline at which this prompt auto-resolves if unanswered, when a
+    /// countdown window was set. Display-only: the requesting tool owns the
+    /// authoritative timer and still acts when the window elapses.
+    pub fn auto_resolve_deadline(&self) -> Option<Instant> {
+        match &self.data {
+            PermissionRequestData::LegacyTool {
+                auto_resolve_deadline,
+                ..
+            } => *auto_resolve_deadline,
             PermissionRequestData::Generic { .. } => None,
         }
     }
@@ -5621,8 +5638,29 @@ impl AcpThread {
         kind: AuthorizationKind,
         cx: &mut Context<Self>,
     ) -> Result<Task<RequestPermissionOutcome>> {
-        self.request_tool_call_authorization_with_id(tool_call, options, kind, cx)
+        self.request_tool_call_authorization_with_id_inner(tool_call, options, kind, None, cx)
             .map(|(_, task)| task)
+    }
+
+    /// Like [`Self::request_tool_call_authorization`], but the prompt carries a
+    /// display-only auto-resolve window: the UI counts down to it, and the
+    /// caller (whose authoritative timer it mirrors) still acts when it elapses.
+    pub fn request_tool_call_authorization_with_auto_resolve(
+        &mut self,
+        tool_call: acp_v1::ToolCallUpdate,
+        options: PermissionOptions,
+        kind: AuthorizationKind,
+        auto_resolve_after: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<RequestPermissionOutcome>> {
+        self.request_tool_call_authorization_with_id_inner(
+            tool_call,
+            options,
+            kind,
+            auto_resolve_after,
+            cx,
+        )
+        .map(|(_, task)| task)
     }
 
     pub fn request_tool_call_authorization_with_id(
@@ -5630,6 +5668,17 @@ impl AcpThread {
         tool_call: acp_v1::ToolCallUpdate,
         options: PermissionOptions,
         kind: AuthorizationKind,
+        cx: &mut Context<Self>,
+    ) -> Result<(PermissionRequestId, Task<RequestPermissionOutcome>)> {
+        self.request_tool_call_authorization_with_id_inner(tool_call, options, kind, None, cx)
+    }
+
+    fn request_tool_call_authorization_with_id_inner(
+        &mut self,
+        tool_call: acp_v1::ToolCallUpdate,
+        options: PermissionOptions,
+        kind: AuthorizationKind,
+        auto_resolve_after: Option<Duration>,
         cx: &mut Context<Self>,
     ) -> Result<(PermissionRequestId, Task<RequestPermissionOutcome>)> {
         let (tx, rx) = oneshot::channel();
@@ -5666,6 +5715,7 @@ impl AcpThread {
                     options,
                     respond_tx: tx,
                     kind,
+                    auto_resolve_deadline: auto_resolve_after.map(|window| Instant::now() + window),
                 },
             },
         );

@@ -399,6 +399,23 @@ pub(crate) async fn prepare_sandbox_wrap(
     ))
 }
 
+/// Which way the output sampler's kill/continue prompt resolved.
+///
+/// The sampler watches a running command's output and, on first detecting a
+/// sustained error stream, asks the user whether to stop the command or let it
+/// continue. How that prompt resolved is recorded on the [`Terminal`] so the
+/// card can explain the outcome (and by what cause) after the command exits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerOutcome {
+    /// The user explicitly chose to stop the command.
+    StoppedByUser,
+    /// The prompt went unanswered for the configured window, so the command was
+    /// stopped automatically.
+    StoppedByTimeout,
+    /// The user chose to let the command continue.
+    Continued,
+}
+
 pub struct Terminal {
     id: acp_v1::TerminalId,
     command: Entity<Markdown>,
@@ -412,10 +429,11 @@ pub struct Terminal {
     /// (e.g., clicking the Stop button). This is set before kill() is called
     /// so that code awaiting wait_for_exit() can check it deterministically.
     user_stopped: Arc<AtomicBool>,
-    /// Why this terminal was stopped by the output sampler (set before kill so
-    /// the UI can show the reason after the command exits). `None` when the
-    /// command wasn't stopped by the sampler.
-    failure_reason: Option<String>,
+    /// How the output sampler's kill/continue prompt resolved, with the reason
+    /// text (e.g. "10 error-signature lines"). Recorded before `kill()` for the
+    /// stopped outcomes so the UI can explain the outcome after the command
+    /// exits; `None` when the sampler never fired.
+    sampler_outcome: Option<(SamplerOutcome, String)>,
     /// The live sandbox (Seatbelt policy file and/or network proxy) kept alive
     /// until the sandboxed command exits. `None` when the command isn't
     /// sandboxed or after it finishes. Dropping it tears down the proxy on a
@@ -522,7 +540,7 @@ impl Terminal {
             output: None,
             output_byte_limit,
             user_stopped: Arc::new(AtomicBool::new(false)),
-            failure_reason: None,
+            sampler_outcome: None,
             execution: TerminalExecution::Process(
                 cx.spawn(async move |this, cx| {
                     let exit_status = command_task.await.map(Self::transform_exit_status);
@@ -590,7 +608,7 @@ impl Terminal {
                 ..Default::default()
             }),
             user_stopped: Arc::new(AtomicBool::new(false)),
-            failure_reason: None,
+            sampler_outcome: None,
             _sandbox: None,
         }
     }
@@ -637,20 +655,28 @@ impl Terminal {
         self.user_stopped.load(Ordering::SeqCst)
     }
 
-    /// Records why this terminal was stopped by the output sampler. Called
-    /// before `kill()` so the UI can show the reason after the command exits.
-    pub fn mark_failure_detected(&mut self, reason: String) {
-        self.failure_reason = Some(reason);
+    /// Records how the output sampler's kill/continue prompt resolved, with the
+    /// reason text. Called before `kill()` (for the stopped outcomes) so the UI
+    /// can explain the outcome after the command exits.
+    pub fn mark_sampler_outcome(&mut self, outcome: SamplerOutcome, reason: String) {
+        self.sampler_outcome = Some((outcome, reason));
     }
 
-    /// Returns whether this terminal was stopped by the output sampler.
-    pub fn was_failure_detected(&self) -> bool {
-        self.failure_reason.is_some()
+    /// The output sampler's outcome for this terminal, with the reason text, if
+    /// the sampler's prompt fired.
+    pub fn sampler_outcome(&self) -> Option<(SamplerOutcome, &str)> {
+        self.sampler_outcome
+            .as_ref()
+            .map(|(outcome, reason)| (*outcome, reason.as_str()))
     }
 
-    /// The reason the output sampler stopped this terminal, if any.
-    pub fn failure_reason(&self) -> Option<&str> {
-        self.failure_reason.as_deref()
+    /// Whether the output sampler actually stopped this terminal, as opposed to
+    /// letting it continue.
+    pub fn was_stopped_by_sampler(&self) -> bool {
+        matches!(
+            self.sampler_outcome,
+            Some((SamplerOutcome::StoppedByUser | SamplerOutcome::StoppedByTimeout, _))
+        )
     }
 
     pub fn current_output(&self, cx: &App) -> acp_v1::TerminalOutputResponse {
