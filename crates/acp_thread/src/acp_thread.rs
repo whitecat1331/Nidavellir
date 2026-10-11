@@ -1270,7 +1270,7 @@ impl ToolCall {
         terminals: &HashMap<acp_v1::TerminalId, Entity<Terminal>>,
         cx: &mut App,
     ) -> Result<Self> {
-        let content = patch
+        let content: Vec<ToolCallContent> = patch
             .content
             .take()
             .map(|content| content.prepare(terminals))
