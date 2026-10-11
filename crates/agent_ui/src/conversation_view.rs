@@ -5124,10 +5124,12 @@ pub(crate) mod tests {
             1,
         );
 
-        // The render-level `menu::Cancel` handler and any other Cancel-driven
-        // path funnel through `cancel_generation`: while a synthetic dispatch is
-        // held that must be a no-op too (the live 2026-10-10 failure, where the
-        // message-editor path was guarded but the render path still cancelled).
+        // Any other Cancel-driven path funnels through `cancel_generation`: while a
+        // synthetic dispatch is held that must be a no-op too. (The live
+        // 2026-10-10 failure was actually the message-editor path, which reaches
+        // here via a DEFERRED `MessageEditorEvent::Cancel` effect that outlives the
+        // dispatch — see the guard-lifetime assertion in `agent_panel`'s
+        // press-dispatch test; this keeps `cancel_generation` itself pinned.)
         active_thread(&conversation_view, cx)
             .update_in(cx, |view, _window, cx| view.cancel_generation(cx));
         cx.run_until_parked();

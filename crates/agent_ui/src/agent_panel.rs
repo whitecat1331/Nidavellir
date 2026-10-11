@@ -6004,11 +6004,20 @@ pub(crate) fn window_control_dispatch(
                 .clone()
                 .ok_or_else(|| anyhow!("`press` requires `keys`"))?;
             let keystroke = gpui::Keystroke::parse(&keys).map_err(|error| anyhow!("{error}"))?;
-            // Mark the dispatch as synthetic while it runs: a probe keystroke
-            // must not be mistaken for user input (an `escape` here once
-            // cancelled the very turn that sent it — ISSUE-0042).
-            let _synthetic = SyntheticInputGuard::new();
+            // Mark the dispatch as synthetic until the effects it queues have been
+            // processed: a probe keystroke must not be mistaken for user input (an
+            // `escape` here once cancelled the very turn that sent it — ISSUE-0042).
+            //
+            // The guard must OUTLIVE `dispatch_keystroke`. An `escape` reaches the
+            // `ThreadView` through a deferred `MessageEditorEvent::Cancel` effect
+            // (`Context::emit` only queues an `Effect::Emit`; the subscriber runs
+            // when the effect cycle is flushed later), so a guard scoped to the
+            // call itself is already dropped by the time `cancel_generation` runs.
+            // Release it via a queued effect instead, so it is still held while the
+            // queued emit is handled and is cleared at the end of the cycle.
+            let guard = SyntheticInputGuard::new();
             let handled = window.dispatch_keystroke(keystroke, cx);
+            cx.defer(move |_cx: &mut App| drop(guard));
             Ok(serde_json::json!({ "keys": keys, "handled": handled }))
         }
         Operation::OpenThread => {
@@ -8471,9 +8480,87 @@ mod tests {
             })
             .expect("press op should succeed");
         assert_eq!(pressed["keys"], json!("escape"));
+        // ISSUE-0042: the guard is released at the end of the effect cycle (it is
+        // held past `dispatch_keystroke` via a queued effect, not dropped when the
+        // call returns). That the guard is active exactly when the deferred Cancel
+        // is handled is pinned by
+        // `test_window_control_press_guard_outlives_dispatch`.
+        cx.run_until_parked();
         assert!(
             !window_control_synthetic_input_active(),
-            "the synthetic-input guard must be released after a press"
+            "the synthetic-input guard must be released after the effect cycle"
+        );
+    }
+
+    /// ISSUE-0042: the synthetic-input guard must outlive the press dispatch. An
+    /// `escape` reaches the `ThreadView` through a deferred
+    /// `MessageEditorEvent::Cancel` effect, so the guard is released at the end of
+    /// the effect cycle — not synchronously when `dispatch_keystroke` returns.
+    /// Scoping the guard to the dispatch call (attempts 1-2) left the deferred
+    /// `cancel_generation` unguarded and let a probe's escape stop the turn.
+    #[gpui::test]
+    async fn test_window_control_press_guard_outlives_dispatch(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let window_handle: gpui::AnyWindowHandle = multi_workspace.into();
+        let cx = &mut VisualTestContext::from_window(window_handle, cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Read the guard *inside the same update*, before the effect cycle flushes.
+        // Pre-fix the guard is scoped to `dispatch_keystroke` and is already dropped
+        // here; post-fix it is held until the queued release effect runs.
+        let held_after_dispatch = cx.update(|window, cx| {
+            window_control_dispatch(
+                &panel,
+                agent::WindowControlRequest {
+                    operation: agent::WindowControlOperation::Press,
+                    keys: Some("escape".to_string()),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+            .expect("press op should succeed");
+            window_control_synthetic_input_active()
+        });
+        assert!(
+            held_after_dispatch,
+            "the synthetic-input guard must still be held after the press dispatch \
+             returns — it is released at the end of the effect cycle, not \
+             synchronously (ISSUE-0042)"
+        );
+
+        cx.run_until_parked();
+        assert!(
+            !window_control_synthetic_input_active(),
+            "the guard must be released once the effect cycle has flushed"
         );
     }
 
