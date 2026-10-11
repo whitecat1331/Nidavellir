@@ -3633,7 +3633,17 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session_id = action.from_session_id.clone();
+        // The callout dispatches with the current thread's session id; a
+        // window-control dispatch carries no args, so it arrives with an empty
+        // id — fall back to the active native thread in that case so the action
+        // means "fork the thread I'm looking at".
+        let session_id = if action.from_session_id.0.is_empty() {
+            self.active_agent_thread(cx)
+                .map(|thread| thread.read(cx).session_id().clone())
+                .unwrap_or_else(|| action.from_session_id.clone())
+        } else {
+            action.from_session_id.clone()
+        };
 
         self.ensure_native_agent_connection(cx);
         let Some(connect_task) = self.connection_store.update(cx, |store, cx| {
@@ -6312,13 +6322,15 @@ fn window_control_action(name: &str) -> Result<Box<dyn Action>> {
         "agent::FocusAgent" => Box::new(zed_actions::assistant::FocusAgent),
         "agent::CopyThreadToClipboard" => Box::new(CopyThreadToClipboard),
         "agent::LoadThreadFromClipboard" => Box::new(LoadThreadFromClipboard),
+        "agent::NewNativeAgentThreadFromTruncate" => {
+            Box::new(NewNativeAgentThreadFromTruncate {
+                from_session_id: acp::SessionId::new(""),
+            })
+        }
         "agent::Chat" => Box::new(zed_actions::agent::Chat),
         "workspace::SaveAll" => Box::new(workspace::SaveAll { save_intent: None }),
         other => bail!(
-            "Unsupported action {other:?}. Supported actions: agent::NewThread, \
-             agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle, \
-             agent::FocusAgent, agent::CopyThreadToClipboard, \
-             agent::LoadThreadFromClipboard, agent::Chat, workspace::SaveAll."
+            "Unsupported action {other:?}. Supported actions: agent::NewThread,              agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle,              agent::FocusAgent, agent::CopyThreadToClipboard,              agent::LoadThreadFromClipboard, agent::NewNativeAgentThreadFromTruncate,              agent::Chat, workspace::SaveAll."
         ),
     };
     Ok(action)
@@ -8360,6 +8372,7 @@ mod tests {
             "agent::FocusAgent",
             "agent::CopyThreadToClipboard",
             "agent::LoadThreadFromClipboard",
+            "agent::NewNativeAgentThreadFromTruncate",
             "workspace::SaveAll",
         ] {
             assert!(
