@@ -8611,14 +8611,6 @@ impl ThreadView {
             SharedString::from(text)
         });
 
-        if let Some((outcome, reason)) = terminal_data.sampler_outcome() {
-            log::info!(
-                "SAMPLER-DIAG terminal banner outcome={:?} reason={:?}",
-                outcome,
-                reason
-            );
-        };
-
         // While a permission prompt is up, its message replaces the tool call's
         // content; render that text above the buttons so the prompt still reads.
         let prompt_content = tool_call
@@ -10164,10 +10156,6 @@ impl ThreadView {
         match request.auto_resolve_deadline() {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                log::info!(
-                    "SAMPLER-DIAG permission buttons countdown remaining={:?}",
-                    remaining
-                );
                 if remaining > Duration::ZERO {
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(Duration::from_secs(1)).await;

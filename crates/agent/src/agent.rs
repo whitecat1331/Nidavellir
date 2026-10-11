@@ -2602,10 +2602,6 @@ impl NativeAgentConnection {
                                 kind,
                                 auto_resolve_after,
                             }) => {
-                                log::info!(
-                                    "SAMPLER-DIAG handle_thread_events auto_resolve_after={:?}",
-                                    auto_resolve_after
-                                );
                                 let outcome_task = acp_thread.update(cx, |thread, cx| {
                                     thread.request_tool_call_authorization_with_auto_resolve(
                                         tool_call,
