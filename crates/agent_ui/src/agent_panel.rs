@@ -10869,7 +10869,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_fork_serializes_active_draft_before_connection(cx: &mut TestAppContext) {
+    async fn test_unconnected_thread_serializes_as_active_draft(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -10894,31 +10894,70 @@ mod tests {
             panel
         });
 
-        // No connection is registered: the fork's conversation view stays in
-        // `Loading`, exactly the window a restart can land in when the user
-        // acts quickly after `/truncate` (or Continue in New Thread).
-        let fork_thread_id = panel.update_in(cx, |panel, window, cx| {
-            panel.selected_agent = Agent::Stub;
-            panel.create_thread_with_options(
-                CreateThreadOptions {
-                    initial_content: Some(AgentInitialContent::ContentBlock {
-                        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                            "Continued from thread \"Parent\":\n\ncompressed summary",
-                        ))],
-                        auto_submit: false,
-                    }),
-                    focus: true,
-                    ..CreateThreadOptions::default()
-                },
+        // A server that never connects: the thread stays without a live
+        // native thread — the same window a fork-and-continue sibling sits in
+        // between its creation and its connection completing. A serialize in
+        // that window must still record the thread as the active draft, or a
+        // restart loses the restore pointer and the seed appears missing.
+        struct NeverConnectsAgentServer;
+
+        impl AgentServer for NeverConnectsAgentServer {
+            fn logo(&self) -> ui::IconName {
+                ui::IconName::ZedAgent
+            }
+
+            fn agent_id(&self) -> AgentId {
+                AgentId::from("never-connects")
+            }
+
+            fn connect(
+                &self,
+                _delegate: AgentServerDelegate,
+                _project: Entity<Project>,
+                _cx: &mut App,
+            ) -> Task<gpui::Result<Rc<dyn AgentConnection>>> {
+                Task::ready(Err(anyhow!("never connects")))
+            }
+
+            fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+                self
+            }
+        }
+
+        let thread = panel.update_in(cx, |panel, window, cx| {
+            panel.create_agent_thread_with_server(
+                Agent::Stub,
+                Some(Rc::new(NeverConnectsAgentServer)),
+                None,
+                None,
+                None,
+                Some(AgentInitialContent::ContentBlock {
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "Continued from thread \"Parent\":\n\ncompressed summary",
+                    ))],
+                    auto_submit: false,
+                }),
+                None,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
             )
         });
+        let thread_id = thread.conversation_view.read(cx).thread_id;
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_base_view(
+                BaseView::AgentThread {
+                    conversation_view: thread.conversation_view.clone(),
+                },
+                true,
+                window,
+                cx,
+            );
+        });
 
-        // Serialize before the connection completes; the fork must still be
-        // recorded as the active thread so a restart in this window restores
-        // it (and reseeds its editor) instead of dropping the pointer.
+        // Serialize while the thread is still unconnected, then park so the
+        // background write lands (the server never connects, so no later
+        // serialize can self-heal the state).
         panel.update(cx, |panel, cx| panel.serialize(cx));
         cx.run_until_parked();
 
@@ -10933,18 +10972,17 @@ mod tests {
         let last_active = serialized
             .last_active_thread
             .as_ref()
-            .expect("serialize should record the fork as the last active thread");
+            .expect("serialize should record the unconnected thread as last active");
         assert_eq!(
             last_active.thread_id,
-            Some(fork_thread_id),
-            "serialized state should point at the fork even before it connects"
+            Some(thread_id),
+            "serialized state should point at the thread even before it connects"
         );
         assert_eq!(
             last_active.session_id, None,
-            "an unconnected fork is a draft and must serialize with no session id"
+            "an unconnected thread is a draft and must serialize with no session id"
         );
     }
-
     #[gpui::test]
     async fn test_reloaded_ephemeral_draft_preserves_original_agent(cx: &mut TestAppContext) {
         init_test(cx);
