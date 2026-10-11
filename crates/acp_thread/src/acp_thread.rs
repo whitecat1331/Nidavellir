@@ -1031,6 +1031,12 @@ pub struct ToolCall {
     pub reported_status: Option<acp_v2::ToolCallStatus>,
     pub meta: Option<acp_v2::Meta>,
     structured_content: Vec<ToolCallContent>,
+    /// Terminals this tool call has ever referenced, kept even when a later
+    /// content update replaces `structured_content` (for example, a tool that
+    /// raises a permission prompt overwrites its content with the prompt text).
+    /// Lets the card keep rendering the command's terminal instead of falling
+    /// back to a plain text card. See [`ToolCall::terminals`].
+    retained_terminals: Vec<Entity<Terminal>>,
     local_status: Option<ToolCallStatus>,
     authorization: Option<PermissionRequestId>,
     pub locations: Vec<acp_v1::ToolCallLocation>,
@@ -1047,6 +1053,17 @@ pub struct ToolCall {
     /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
     /// the command was sandboxed normally (or sandboxing was off).
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
+}
+
+/// The terminals referenced by a tool call's content.
+fn terminals_in_content(content: &[ToolCallContent]) -> Vec<Entity<Terminal>> {
+    content
+        .iter()
+        .filter_map(|content| match content {
+            ToolCallContent::Terminal { terminal, .. } => Some(terminal.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1066,6 +1083,10 @@ enum PermissionRequestData {
         options: PermissionOptions,
         kind: AuthorizationKind,
         respond_tx: oneshot::Sender<RequestPermissionOutcome>,
+        /// When this prompt auto-resolves if unanswered. Display-only: the UI
+        /// counts down to it, while the requesting tool keeps the authoritative
+        /// timer and still performs the stop when the window elapses.
+        auto_resolve_deadline: Option<Instant>,
     },
     Generic {
         request: acp_v2::RequestPermissionRequest,
@@ -1084,6 +1105,19 @@ impl PermissionRequest {
     pub fn legacy_options(&self) -> Option<&PermissionOptions> {
         match &self.data {
             PermissionRequestData::LegacyTool { options, .. } => Some(options),
+            PermissionRequestData::Generic { .. } => None,
+        }
+    }
+
+    /// The deadline at which this prompt auto-resolves if unanswered, when a
+    /// countdown window was set. Display-only: the requesting tool owns the
+    /// authoritative timer and still acts when the window elapses.
+    pub fn auto_resolve_deadline(&self) -> Option<Instant> {
+        match &self.data {
+            PermissionRequestData::LegacyTool {
+                auto_resolve_deadline,
+                ..
+            } => *auto_resolve_deadline,
             PermissionRequestData::Generic { .. } => None,
         }
     }
@@ -1236,7 +1270,7 @@ impl ToolCall {
         terminals: &HashMap<acp_v1::TerminalId, Entity<Terminal>>,
         cx: &mut App,
     ) -> Result<Self> {
-        let content = patch
+        let content: Vec<ToolCallContent> = patch
             .content
             .take()
             .map(|content| content.prepare(terminals))
@@ -1270,6 +1304,7 @@ impl ToolCall {
             cx,
         );
 
+        let retained_terminals = terminals_in_content(&content);
         let mut result = Self {
             id,
             label,
@@ -1279,6 +1314,7 @@ impl ToolCall {
             reported_status: patch.status.take(),
             meta,
             structured_content: content,
+            retained_terminals,
             locations: patch.locations.take().unwrap_or_default(),
             resolved_locations: Vec::default(),
             local_status: None,
@@ -1535,6 +1571,10 @@ impl ToolCall {
                 ));
             }
             self.structured_content.truncate(new_content_len);
+            let terminals = terminals_in_content(&self.structured_content);
+            if !terminals.is_empty() {
+                self.retained_terminals = terminals;
+            }
         }
 
         if !locations.is_undefined() {
@@ -1579,11 +1619,11 @@ impl ToolCall {
         language_registry: &Arc<LanguageRegistry>,
         cx: &mut App,
     ) {
-        self.structured_content.push(ToolCallContent::from_prepared(
-            content,
-            language_registry,
-            cx,
-        ));
+        let content = ToolCallContent::from_prepared(content, language_registry, cx);
+        if let ToolCallContent::Terminal { terminal, .. } = &content {
+            self.retained_terminals.push(terminal.clone());
+        }
+        self.structured_content.push(content);
         self.update_raw_output_content(language_registry, cx);
     }
 
@@ -1662,12 +1702,22 @@ impl ToolCall {
     }
 
     pub fn terminals(&self) -> impl Iterator<Item = &Entity<Terminal>> {
-        self.structured_content
+        // Prefer terminals still present in the content; fall back to the ones
+        // the call has referenced before, so a prompt that overwrote the content
+        // doesn't hide the command's terminal.
+        let content_terminals = self
+            .structured_content
             .iter()
             .filter_map(|content| match content {
                 ToolCallContent::Terminal { terminal, .. } => Some(terminal),
                 _ => None,
             })
+            .collect::<Vec<_>>();
+        if content_terminals.is_empty() {
+            itertools::Either::Right(self.retained_terminals.iter())
+        } else {
+            itertools::Either::Left(content_terminals.into_iter())
+        }
     }
 
     pub fn is_subagent(&self) -> bool {
@@ -5621,8 +5671,29 @@ impl AcpThread {
         kind: AuthorizationKind,
         cx: &mut Context<Self>,
     ) -> Result<Task<RequestPermissionOutcome>> {
-        self.request_tool_call_authorization_with_id(tool_call, options, kind, cx)
+        self.request_tool_call_authorization_with_id_inner(tool_call, options, kind, None, cx)
             .map(|(_, task)| task)
+    }
+
+    /// Like [`Self::request_tool_call_authorization`], but the prompt carries a
+    /// display-only auto-resolve window: the UI counts down to it, and the
+    /// caller (whose authoritative timer it mirrors) still acts when it elapses.
+    pub fn request_tool_call_authorization_with_auto_resolve(
+        &mut self,
+        tool_call: acp_v1::ToolCallUpdate,
+        options: PermissionOptions,
+        kind: AuthorizationKind,
+        auto_resolve_after: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<RequestPermissionOutcome>> {
+        self.request_tool_call_authorization_with_id_inner(
+            tool_call,
+            options,
+            kind,
+            auto_resolve_after,
+            cx,
+        )
+        .map(|(_, task)| task)
     }
 
     pub fn request_tool_call_authorization_with_id(
@@ -5630,6 +5701,17 @@ impl AcpThread {
         tool_call: acp_v1::ToolCallUpdate,
         options: PermissionOptions,
         kind: AuthorizationKind,
+        cx: &mut Context<Self>,
+    ) -> Result<(PermissionRequestId, Task<RequestPermissionOutcome>)> {
+        self.request_tool_call_authorization_with_id_inner(tool_call, options, kind, None, cx)
+    }
+
+    fn request_tool_call_authorization_with_id_inner(
+        &mut self,
+        tool_call: acp_v1::ToolCallUpdate,
+        options: PermissionOptions,
+        kind: AuthorizationKind,
+        auto_resolve_after: Option<Duration>,
         cx: &mut Context<Self>,
     ) -> Result<(PermissionRequestId, Task<RequestPermissionOutcome>)> {
         let (tx, rx) = oneshot::channel();
@@ -5666,6 +5748,7 @@ impl AcpThread {
                     options,
                     respond_tx: tx,
                     kind,
+                    auto_resolve_deadline: auto_resolve_after.map(|window| Instant::now() + window),
                 },
             },
         );

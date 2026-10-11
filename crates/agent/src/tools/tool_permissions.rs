@@ -863,7 +863,7 @@ pub fn authorize_dirty_buffer(
         ),
     };
 
-    let prompt = event_stream.prompt_for_decision(None, Some(message), options, cx);
+    let prompt = event_stream.prompt_for_decision(None, Some(message), options, None, cx);
     cx.spawn(async move |_cx| {
         let option_id = prompt.await?;
         match option_id.0.as_ref() {

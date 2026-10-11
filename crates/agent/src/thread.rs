@@ -792,8 +792,13 @@ pub trait TerminalHandle {
     fn wait_for_exit(&self, cx: &AsyncApp) -> Result<Shared<Task<acp::TerminalExitStatus>>>;
     fn kill(&self, cx: &AsyncApp) -> Result<()>;
     fn was_stopped_by_user(&self, cx: &AsyncApp) -> Result<bool>;
-    fn mark_failure_detected(&self, reason: String, _cx: &AsyncApp) -> Result<()> {
-        let _ = reason;
+    fn mark_sampler_outcome(
+        &self,
+        outcome: acp_thread::SamplerOutcome,
+        reason: String,
+        _cx: &AsyncApp,
+    ) -> Result<()> {
+        let _ = (outcome, reason);
         Ok(())
     }
 }
@@ -1280,6 +1285,10 @@ pub struct ToolCallAuthorization {
     pub response: oneshot::Sender<acp_thread::SelectedPermissionOutcome>,
     pub context: Option<ToolPermissionContext>,
     pub kind: acp_thread::AuthorizationKind,
+    /// Display-only countdown window the UI shows on this prompt. The caller
+    /// (e.g. the terminal tool's sampler) keeps the authoritative timer and
+    /// still performs the stop when the window elapses without an answer.
+    pub auto_resolve_after: Option<Duration>,
 }
 
 fn ensure_tool_call_authorization_not_interrupted(
@@ -7236,6 +7245,7 @@ impl ToolCallEventStream {
                             response: response_tx,
                             context: None,
                             kind: acp_thread::AuthorizationKind::PermissionGrant,
+                            auto_resolve_after: None,
                         },
                     )))
             {
@@ -7353,6 +7363,7 @@ impl ToolCallEventStream {
                             response: response_tx,
                             context: None,
                             kind: acp_thread::AuthorizationKind::PermissionGrant,
+                            auto_resolve_after: None,
                         },
                     )))
             {
@@ -7630,6 +7641,7 @@ impl ToolCallEventStream {
                             response: response_tx,
                             context: None,
                             kind: acp_thread::AuthorizationKind::ActionChoice,
+                            auto_resolve_after: None,
                         },
                     )))
             {
@@ -7703,11 +7715,16 @@ impl ToolCallEventStream {
     /// are responsible for handling each `option_id` explicitly. Use this
     /// when a tool needs the user to pick between several side-effecting
     /// actions (for example, "Save" vs "Discard" for a dirty buffer).
+    ///
+    /// `auto_resolve_after`, when set, is forwarded to the UI as a display-only
+    /// countdown window; the caller keeps the authoritative timer and still
+    /// acts when the window elapses without an answer.
     pub fn prompt_for_decision(
         &self,
         title: Option<String>,
         message: Option<String>,
         options: Vec<acp::PermissionOption>,
+        auto_resolve_after: Option<Duration>,
         cx: &mut App,
     ) -> Task<Result<acp::PermissionOptionId>> {
         let options = acp_thread::PermissionOptions::Flat(options);
@@ -7733,6 +7750,7 @@ impl ToolCallEventStream {
                             response: response_tx,
                             context: None,
                             kind: acp_thread::AuthorizationKind::ActionChoice,
+                            auto_resolve_after,
                         },
                     )))
             {
@@ -7845,6 +7863,7 @@ impl ToolCallEventStream {
                             response: response_tx,
                             context,
                             kind: acp_thread::AuthorizationKind::PermissionGrant,
+                            auto_resolve_after: None,
                         },
                     )))
             {

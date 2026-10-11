@@ -2600,10 +2600,15 @@ impl NativeAgentConnection {
                                 response,
                                 context: _,
                                 kind,
+                                auto_resolve_after,
                             }) => {
                                 let outcome_task = acp_thread.update(cx, |thread, cx| {
-                                    thread.request_tool_call_authorization(
-                                        tool_call, options, kind, cx,
+                                    thread.request_tool_call_authorization_with_auto_resolve(
+                                        tool_call,
+                                        options,
+                                        kind,
+                                        auto_resolve_after,
+                                        cx,
                                     )
                                 })??;
                                 cx.background_spawn(async move {
@@ -4030,10 +4035,15 @@ impl TerminalHandle for AcpTerminalHandle {
             .read_with(cx, |term, _cx| term.was_stopped_by_user()))
     }
 
-    fn mark_failure_detected(&self, reason: String, cx: &AsyncApp) -> Result<()> {
+    fn mark_sampler_outcome(
+        &self,
+        outcome: acp_thread::SamplerOutcome,
+        reason: String,
+        cx: &AsyncApp,
+    ) -> Result<()> {
         cx.update(|cx| {
             self.terminal.update(cx, |terminal, _cx| {
-                terminal.mark_failure_detected(reason);
+                terminal.mark_sampler_outcome(outcome, reason);
             });
         });
         Ok(())
