@@ -8611,6 +8611,13 @@ impl ThreadView {
             SharedString::from(text)
         });
 
+        if let Some((outcome, reason)) = terminal_data.sampler_outcome() {
+            log::info!(
+                "SAMPLER-DIAG terminal banner outcome={:?} reason={:?}",
+                outcome,
+                reason
+            );
+        };
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
             header_group,
@@ -8717,30 +8724,9 @@ impl ThreadView {
                 )
             })
             .when_some(permission_request, |this, request| {
-                log::info!(
-                    "SAMPLER-DIAG render deadline={:?} outcome={:?}",
-                    request.auto_resolve_deadline(),
-                    terminal_data.sampler_outcome()
-                );
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
                 let allow_disabled = self.sandbox_confusables_block_allow(tool_call, cx);
-                this.when_some(request.auto_resolve_deadline(), |this, deadline| {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining > Duration::ZERO {
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(Duration::from_secs(1)).await;
-                            this.update(cx, |_this, cx| cx.notify()).ok();
-                        })
-                        .detach();
-                    }
-                    this.child(div().px_3().pt_2().text_ui_sm(cx).child(SharedString::from(
-                        format!(
-                            "Stopped automatically in {}s",
-                            remaining.as_secs().saturating_add(1)
-                        ),
-                    )))
-                })
-                .child(self.render_permission_buttons(
+                this.child(self.render_permission_buttons(
                     self.thread.read(cx).session_id().clone(),
                     is_first,
                     request,
@@ -10106,7 +10092,7 @@ impl ThreadView {
         else {
             return div();
         };
-        match options {
+        let buttons = match options {
             PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
                 session_id,
                 is_first,
@@ -10145,6 +10131,37 @@ impl ThreadView {
                 allow_disabled,
                 cx,
             ),
+        };
+
+        // Display-only mirror of the requesting tool's authoritative timer: tick
+        // once a second so the countdown visibly decreases. The tool still
+        // performs the stop when the window elapses.
+        match request.auto_resolve_deadline() {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                log::info!(
+                    "SAMPLER-DIAG permission buttons countdown remaining={:?}",
+                    remaining
+                );
+                if remaining > Duration::ZERO {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        if this.update(cx, |_this, cx| cx.notify()).is_err() {
+                            return;
+                        }
+                    })
+                    .detach();
+                }
+                v_flex()
+                    .child(div().px_3().pt_2().text_ui_sm(cx).child(SharedString::from(
+                        format!(
+                            "Stopped automatically in {}s",
+                            remaining.as_secs().saturating_add(1)
+                        ),
+                    )))
+                    .child(buttons)
+            }
+            None => buttons,
         }
     }
 
