@@ -912,6 +912,11 @@ pub struct SiblingThreadRequest {
     pub prompt: String,
     /// Whether to submit `prompt` automatically once the new thread opens.
     pub auto_submit: bool,
+    /// Whether to switch the UI to the new thread once it is created.
+    /// Fork-and-continue sets this so the user lands in the continuation;
+    /// the `create_thread` tool leaves it `false` so spawning a sibling can't
+    /// steal focus from an in-progress turn.
+    pub focus: bool,
     /// Optional agent ID to use. Defaults to the native Zed agent.
     pub agent_id: Option<String>,
     /// Optional model override, as `provider/model-id`.
@@ -3732,6 +3737,7 @@ impl Thread {
                         title: format!("{title} (continued)").into(),
                         prompt: build_fork_continuation_prompt(&title, &summary, &tail),
                         auto_submit: true,
+                        focus: true,
                         agent_id: None,
                         model: None,
                         use_new_worktree: false,
@@ -5761,6 +5767,10 @@ const MAP_REDUCE_CHUNK_OVERHEAD_TOKENS: u64 = 1_000;
 /// they are safe to parallelize within this bound.
 const MAP_REDUCE_CONCURRENCY: usize = 3;
 
+/// Hard bound on one full map-reduce pass (condense plus merge). A provider
+/// stream that stalls must surface as an error instead of hanging the turn.
+const MAP_REDUCE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Cap on merge levels. The summaries are already condensed by then, so if a
 /// pathological thread still refuses to shrink, the remaining summaries are
 /// concatenated rather than summarized indefinitely.
@@ -5944,17 +5954,24 @@ fn build_merge_request(
 
 /// Drains a single completion stream into its concatenated text, discarding
 /// non-text events (thinking, tool use, usage) that a plain summarization never
-/// needs.
+/// needs. `label` names the stream in [MR] logs so a stall can be attributed.
 async fn collect_summary_text(
     result: Result<LanguageModelCompletionStream, LanguageModelCompletionError>,
+    label: &str,
 ) -> Result<String> {
     let mut stream = result?;
     let mut text = String::new();
+    let mut events = 0usize;
     while let Some(event) = stream.next().await {
+        events += 1;
+        if events == 1 {
+            log::info!("[MR] first completion event received ({label})");
+        }
         if let LanguageModelCompletionEvent::Text(text_chunk) = event? {
             text.push_str(&text_chunk);
         }
     }
+    log::info!("[MR] completion stream drained ({label}, {events} events)");
     Ok(text.trim().to_string())
 }
 
@@ -5973,8 +5990,13 @@ async fn merge_summaries(
     let provider =
         cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
     let merge_capacity = map_reduce_merge_capacity(model);
+    log::info!(
+        "[MR] merge start: {} summary(ies), merge capacity {} tokens",
+        summaries.len(),
+        merge_capacity
+    );
 
-    for _depth in 0..MAP_REDUCE_MAX_MERGE_DEPTH {
+    for depth in 0..MAP_REDUCE_MAX_MERGE_DEPTH {
         if summaries.len() <= 1 {
             break;
         }
@@ -6000,10 +6022,14 @@ async fn merge_summaries(
             .buffer_unordered(MAP_REDUCE_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
+        log::info!(
+            "[MR] merge level {depth} streams resolved ({} group(s))",
+            groups.len()
+        );
 
         let mut merged = Vec::with_capacity(stream_results.len());
         for result in stream_results {
-            merged.push(collect_summary_text(result).await?);
+            merged.push(collect_summary_text(result, &format!("merge level {depth}")).await?);
         }
         summaries = merged;
 
@@ -6017,8 +6043,45 @@ async fn merge_summaries(
 
 /// Condenses each chunk with a plain model call, then merges the chunk
 /// summaries into a single handoff. Shared by in-place compaction and the
-/// fork-and-continue summary path. Returns an error if cancelled mid-flight.
+/// fork-and-continue summary path. Returns an error if cancelled mid-flight or
+/// the whole pass exceeds [`MAP_REDUCE_TOTAL_TIMEOUT`].
 async fn map_reduce_summaries(
+    provider: Arc<dyn LanguageModelProvider>,
+    model: &LanguageModel,
+    thread_id: &str,
+    prompt_id: &str,
+    temperature: Option<f32>,
+    chunks: &[Vec<Arc<Message>>],
+    cancellation_rx: watch::Receiver<bool>,
+    progress: Option<&dyn Fn(String)>,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    // Race the pass against a hard timeout: a provider stream that stalls must
+    // become an error (dropping the in-flight streams) instead of hanging the
+    // turn forever.
+    let timeout = cx.background_executor().timer(MAP_REDUCE_TOTAL_TIMEOUT);
+    let work = map_reduce_summaries_inner(
+        provider,
+        model,
+        thread_id,
+        prompt_id,
+        temperature,
+        chunks,
+        cancellation_rx,
+        progress,
+        cx,
+    );
+    futures::pin_mut!(work);
+    match futures::future::select(work, timeout).await {
+        futures::future::Either::Left((result, _timeout)) => result,
+        futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+            "Map-reduce compaction timed out after {}s without completing",
+            MAP_REDUCE_TOTAL_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn map_reduce_summaries_inner(
     provider: Arc<dyn LanguageModelProvider>,
     model: &LanguageModel,
     thread_id: &str,
@@ -6029,6 +6092,12 @@ async fn map_reduce_summaries(
     progress: Option<&dyn Fn(String)>,
     cx: &mut AsyncApp,
 ) -> Result<String> {
+    log::info!(
+        "[MR] map-reduce start: {} chunk(s), model {}, temperature {:?}",
+        chunks.len(),
+        model.id().0,
+        temperature
+    );
     // Condense each chunk independently, with bounded concurrency. The futures
     // are `'static`, so building them only borrows `cx` for the synchronous
     // call and releases it before any await.
@@ -6052,10 +6121,21 @@ async fn map_reduce_summaries(
         .buffer_unordered(MAP_REDUCE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
+    log::info!(
+        "[MR] condense streams resolved ({}/{} chunk(s))",
+        stream_results.len(),
+        chunks.len()
+    );
 
     let mut summaries = Vec::with_capacity(stream_results.len());
     for (ix, result) in stream_results.into_iter().enumerate() {
-        summaries.push(collect_summary_text(result).await?);
+        summaries.push(
+            collect_summary_text(
+                result,
+                &format!("condense chunk {}/{}", ix + 1, chunks.len()),
+            )
+            .await?,
+        );
         if let Some(progress) = progress {
             progress(format!("Condensed chunk {}/{}", ix + 1, chunks.len()));
         }
