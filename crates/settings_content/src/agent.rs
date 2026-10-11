@@ -329,6 +329,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub cancel_generation_on_terminal_stop: Option<bool>,
+    /// How long to leave the output sampler's "kill or continue" prompt open
+    /// before the command is stopped automatically. Only applies while a
+    /// terminal tool's output looks like a failure and the prompt goes
+    /// unanswered.
+    ///
+    /// Default: 10
+    pub terminal_error_sampler_timeout_seconds: Option<u64>,
     /// Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages in the agent panel.
     ///
     /// Default: false

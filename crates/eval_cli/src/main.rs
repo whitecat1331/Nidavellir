@@ -566,14 +566,8 @@ mod tests {
 
     #[test]
     fn synthesized_settings_json_is_valid() {
-        let settings = synthesized_settings_json(
-            "{}",
-            "deepseek",
-            "deepseek-v4-pro",
-            true,
-            "\"high\"",
-            "",
-        );
+        let settings =
+            synthesized_settings_json("{}", "deepseek", "deepseek-v4-pro", true, "\"high\"", "");
         serde_json::from_str::<serde_json::Value>(&settings)
             .expect("synthesized settings must be valid JSON");
     }
@@ -797,7 +791,13 @@ async fn run_agent(
     let worktree = project.update(cx, |project, cx| project.create_worktree(workdir, true, cx));
     let worktree = match worktree.await {
         Ok(w) => w,
-        Err(e) => return (Err(e).context("creating worktree"), RunStats::default(), None),
+        Err(e) => {
+            return (
+                Err(e).context("creating worktree"),
+                RunStats::default(),
+                None,
+            );
+        }
     };
 
     let scan_result = worktree.update(cx, |tree, _cx| {
@@ -856,7 +856,13 @@ async fn run_agent(
         .await
     {
         Ok(t) => t,
-        Err(e) => return (Err(e).context("creating ACP session"), RunStats::default(), None),
+        Err(e) => {
+            return (
+                Err(e).context("creating ACP session"),
+                RunStats::default(),
+                None,
+            );
+        }
     };
 
     let _subscription = cx.subscribe(&acp_thread, |acp_thread, event, cx| {

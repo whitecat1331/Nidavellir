@@ -328,7 +328,9 @@ pub fn init(cx: &mut App) {
                     return;
                 };
                 let name = WorkspaceManager::derive_name(&paths);
-                let Some(workspace_id) = manager.create_or_reuse(name, paths.clone()).await.log_err() else {
+                let Some(workspace_id) =
+                    manager.create_or_reuse(name, paths.clone()).await.log_err()
+                else {
                     return;
                 };
                 cx.update(|_window, cx| {

@@ -1,6 +1,4 @@
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 use streaming_diff::StreamingDiff;
 

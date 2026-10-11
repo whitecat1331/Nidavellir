@@ -52,11 +52,7 @@ impl Schedule {
     /// Falls back to `now` when the schedule has never run or is overdue.
     pub fn next_fire(self, now: DateTime<Utc>, last_run: Option<DateTime<Utc>>) -> DateTime<Utc> {
         let due = last_run.unwrap_or(now) + self.interval();
-        if due <= now {
-            now
-        } else {
-            due
-        }
+        if due <= now { now } else { due }
     }
 }
 
@@ -97,7 +93,11 @@ impl Automations {
     }
 
     pub fn upsert(&mut self, automation: Automation) {
-        match self.entries.iter_mut().find(|entry| entry.id == automation.id) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == automation.id)
+        {
             Some(existing) => *existing = automation,
             None => self.entries.push(automation),
         }
@@ -202,12 +202,30 @@ mod tests {
 
     #[test]
     fn schedule_parses_known_specs() {
-        assert_eq!(Schedule::parse("@hourly").unwrap().interval(), Duration::hours(1));
-        assert_eq!(Schedule::parse("@daily").unwrap().interval(), Duration::days(1));
-        assert_eq!(Schedule::parse("@weekly").unwrap().interval(), Duration::weeks(1));
-        assert_eq!(Schedule::parse("30s").unwrap().interval(), Duration::seconds(30));
-        assert_eq!(Schedule::parse("5m").unwrap().interval(), Duration::minutes(5));
-        assert_eq!(Schedule::parse("2h").unwrap().interval(), Duration::hours(2));
+        assert_eq!(
+            Schedule::parse("@hourly").unwrap().interval(),
+            Duration::hours(1)
+        );
+        assert_eq!(
+            Schedule::parse("@daily").unwrap().interval(),
+            Duration::days(1)
+        );
+        assert_eq!(
+            Schedule::parse("@weekly").unwrap().interval(),
+            Duration::weeks(1)
+        );
+        assert_eq!(
+            Schedule::parse("30s").unwrap().interval(),
+            Duration::seconds(30)
+        );
+        assert_eq!(
+            Schedule::parse("5m").unwrap().interval(),
+            Duration::minutes(5)
+        );
+        assert_eq!(
+            Schedule::parse("2h").unwrap().interval(),
+            Duration::hours(2)
+        );
         assert_eq!(Schedule::parse("1d").unwrap().interval(), Duration::days(1));
         assert!(Schedule::parse("nonsense").is_err());
         assert!(Schedule::parse("0s").is_err());
@@ -241,7 +259,10 @@ mod tests {
         let mut changed = automation;
         changed.prompt = "run the DST audit".into();
         automations.upsert(changed);
-        assert_eq!(automations.get("prtg-sync").unwrap().prompt, "run the DST audit");
+        assert_eq!(
+            automations.get("prtg-sync").unwrap().prompt,
+            "run the DST audit"
+        );
         assert_eq!(automations.entries().len(), 1);
 
         let at = ts(1_700_000_000);

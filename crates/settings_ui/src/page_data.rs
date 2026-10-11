@@ -8944,6 +8944,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Terminal Error Sampler Timeout (Seconds)",
+                description: "How long to leave the terminal output sampler's 'kill or continue' prompt open before the command is stopped automatically.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.terminal_error_sampler_timeout_seconds"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .terminal_error_sampler_timeout_seconds
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .terminal_error_sampler_timeout_seconds = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Use Modifier To Send",
                 description: "Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages.",
                 field: Box::new(SettingField {

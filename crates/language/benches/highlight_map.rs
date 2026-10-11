@@ -131,7 +131,12 @@ fn bench_build_highlight_map(c: &mut Criterion) {
                 BenchmarkId::new(capture_label, theme_label),
                 &(capture_names, &theme),
                 |b, (capture_names, theme)| {
-                    b.iter(|| build_highlight_map(std::hint::black_box(capture_names), std::hint::black_box(theme)));
+                    b.iter(|| {
+                        build_highlight_map(
+                            std::hint::black_box(capture_names),
+                            std::hint::black_box(theme),
+                        )
+                    });
                 },
             );
         }

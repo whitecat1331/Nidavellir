@@ -7,8 +7,8 @@ use db::kvp::KeyValueStore;
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     AnyElement, App, Context, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div,
-    list, point, px,
+    ListAlignment, ListState, ScrollHandle, Task, WeakEntity, Window, actions, div, list, point,
+    px,
 };
 use serde_json::Value;
 use settings::Settings;

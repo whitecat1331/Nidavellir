@@ -93,7 +93,9 @@ fn current_platform() -> anyhow::Result<ChromiumPlatform> {
 async fn ensure_pinned_chromium(http_client: &Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
     let platform = current_platform()?;
     let version_dir = chromium_cache_dir()?.join(PINNED_CHROMIUM_VERSION);
-    let binary_path = version_dir.join(platform.archive_dir).join(platform.binary_rel);
+    let binary_path = version_dir
+        .join(platform.archive_dir)
+        .join(platform.binary_rel);
     if binary_path.exists() {
         return Ok(binary_path);
     }
@@ -165,7 +167,9 @@ async fn extract_chromium_archive(
 async fn finalize_download(staging_path: &Path, destination_path: &Path) -> anyhow::Result<()> {
     if let Err(err) = async_fs::remove_dir_all(destination_path).await {
         if err.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("failed to remove existing Chromium destination {destination_path:?}: {err:?}");
+            log::warn!(
+                "failed to remove existing Chromium destination {destination_path:?}: {err:?}"
+            );
         }
     }
     async_fs::rename(staging_path, destination_path)

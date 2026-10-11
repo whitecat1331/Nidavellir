@@ -237,6 +237,7 @@ pub struct AgentSettings {
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
+    pub terminal_error_sampler_timeout_seconds: u64,
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
@@ -815,6 +816,9 @@ impl Settings for AgentSettings {
                 .filter(|command| !command.trim().is_empty()),
             thinking_display: agent.thinking_display.unwrap(),
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
+            terminal_error_sampler_timeout_seconds: agent
+                .terminal_error_sampler_timeout_seconds
+                .unwrap_or(10),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),

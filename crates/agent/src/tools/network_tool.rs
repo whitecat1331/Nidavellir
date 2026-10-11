@@ -1,7 +1,10 @@
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::builtin_profiles;
 use anyhow::{Context as _, Result};
-use browser_tools::{AgentBrowserApi, DrivenBy, InterceptionPattern, RequestFilter, ThrottleConditions, ThrottlePreset};
+use browser_tools::{
+    AgentBrowserApi, DrivenBy, InterceptionPattern, RequestFilter, ThrottleConditions,
+    ThrottlePreset,
+};
 use gpui::{App, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -303,7 +306,10 @@ impl NetworkTool {
                 };
                 let limit = validate_limit(input.limit)?;
                 let offset = input.cursor.unwrap_or(0);
-                let data = self.api.list_requests(session_id, &filter, offset, limit).await?;
+                let data = self
+                    .api
+                    .list_requests(session_id, &filter, offset, limit)
+                    .await?;
                 Ok(success(operation, "listed network requests", data))
             }
             NetworkOperation::GetRequest => {
@@ -400,7 +406,9 @@ impl NetworkTool {
                 self.ensure_write_mode(&operation, cx)?;
                 let session_id = required_session(&input)?;
                 let conditions = if let Some(preset) = &input.preset {
-                    ThrottlePreset::parse(preset).context("unknown throttle preset")?.conditions()
+                    ThrottlePreset::parse(preset)
+                        .context("unknown throttle preset")?
+                        .conditions()
                 } else if let Some(custom) = &input.conditions {
                     ThrottleConditions {
                         offline: custom.offline.unwrap_or(false),
@@ -410,7 +418,9 @@ impl NetworkTool {
                         connection_type: custom.connection_type.clone(),
                     }
                 } else {
-                    anyhow::bail!("set_throttle requires either a preset name or custom conditions");
+                    anyhow::bail!(
+                        "set_throttle requires either a preset name or custom conditions"
+                    );
                 };
                 authorize_network_operation(
                     &event_stream,
@@ -459,7 +469,8 @@ impl NetworkTool {
                     "Block network URLs",
                     permission_inputs(
                         &operation,
-                        urls.iter().map(|url| format!("session_id:{session_id} url:{url}")),
+                        urls.iter()
+                            .map(|url| format!("session_id:{session_id} url:{url}")),
                     ),
                     cx,
                 )
@@ -482,7 +493,8 @@ impl NetworkTool {
                     "Unblock network URLs",
                     permission_inputs(
                         &operation,
-                        urls.iter().map(|url| format!("session_id:{session_id} url:{url}")),
+                        urls.iter()
+                            .map(|url| format!("session_id:{session_id} url:{url}")),
                     ),
                     cx,
                 )
@@ -669,9 +681,9 @@ impl NetworkTool {
                     permission_inputs(
                         &operation,
                         std::iter::once(format!("session_id:{session_id}")).chain(
-                            patterns.iter().map(|pattern| {
-                                format!("url:{}", pattern.url_pattern)
-                            }),
+                            patterns
+                                .iter()
+                                .map(|pattern| format!("url:{}", pattern.url_pattern)),
                         ),
                     ),
                     cx,
@@ -754,12 +766,7 @@ impl NetworkTool {
                 .await?;
                 let data = self
                     .api
-                    .fulfill_request(
-                        session_id,
-                        input.target_id.as_deref(),
-                        request_id,
-                        response,
-                    )
+                    .fulfill_request(session_id, input.target_id.as_deref(), request_id, response)
                     .await?;
                 Ok(success(operation, "fulfilled request", data))
             }

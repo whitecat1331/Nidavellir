@@ -8562,6 +8562,9 @@ impl ThreadView {
             cx,
         );
 
+        // Show the captured output whenever the sampler fired, even if the card
+        // is collapsed: the outcome banner below explains what the output shows.
+        let sampler_fired = terminal_data.sampler_outcome().is_some();
         let is_expanded = self
             .entry_view_state
             .read(cx)
@@ -8588,14 +8591,48 @@ impl ThreadView {
             }
         });
 
-        let failure_banner = terminal_data.was_failure_detected().then(|| {
-            SharedString::from(format!(
-                "Stopped early: {}.",
-                terminal_data
-                    .failure_reason()
-                    .unwrap_or("the output looked like a failure")
-            ))
+        let sampler_window_secs =
+            AgentSettings::get_global(cx).terminal_error_sampler_timeout_seconds;
+        let sampler_banner = terminal_data.sampler_outcome().map(|(outcome, reason)| {
+            let text = match outcome {
+                acp_thread::SamplerOutcome::StoppedByUser => format!(
+                    "Stopped: you stopped the command after its output looked like a \
+                         failure ({reason})."
+                ),
+                acp_thread::SamplerOutcome::StoppedByTimeout => format!(
+                    "Stopped automatically: no answer within {sampler_window_secs}s after \
+                         its output looked like a failure ({reason})."
+                ),
+                acp_thread::SamplerOutcome::Continued => format!(
+                    "Continued: the output looked like a failure ({reason}), but you \
+                         chose to continue."
+                ),
+            };
+            SharedString::from(text)
         });
+
+        // While a permission prompt is up, its message replaces the tool call's
+        // content; render that text above the buttons so the prompt still reads.
+        let prompt_content = tool_call
+            .content()
+            .iter()
+            .filter(|content| !matches!(content, ToolCallContent::Terminal { .. }))
+            .enumerate()
+            .map(|(context_ix, content)| {
+                self.render_tool_call_content(
+                    active_session_id,
+                    entry_ix,
+                    content,
+                    context_ix,
+                    tool_call,
+                    true,
+                    tool_failed,
+                    focus_handle,
+                    window,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
@@ -8656,7 +8693,42 @@ impl ThreadView {
             })
             .overflow_hidden()
             .child(header)
-            .when_some(failure_banner, |this, banner| {
+            .when(
+                (is_expanded || sampler_fired) && terminal_view.is_some(),
+                |this| {
+                    this.child(
+                        div()
+                            .pt_2()
+                            .border_t_1()
+                            .when(tool_failed || command_failed, |card| card.border_dashed())
+                            .border_color(border_color)
+                            .bg(cx.theme().colors().editor_background)
+                            .rounded_b_md()
+                            .text_ui_sm(cx)
+                            .h_full()
+                            .children(terminal_view.map(|terminal_view| {
+                                let element = if terminal_view
+                                    .read(cx)
+                                    .content_mode(window, cx)
+                                    .is_scrollable()
+                                {
+                                    div().h_72().child(terminal_view).into_any_element()
+                                } else {
+                                    terminal_view.into_any_element()
+                                };
+
+                                div()
+                                    .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
+                                        window.dispatch_action(NewThread.boxed_clone(), cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(element)
+                                    .into_any_element()
+                            })),
+                    )
+                },
+            )
+            .when_some(sampler_banner, |this, banner| {
                 this.child(
                     div()
                         .px_3()
@@ -8667,38 +8739,7 @@ impl ThreadView {
                         .child(banner),
                 )
             })
-            .when(is_expanded && terminal_view.is_some(), |this| {
-                this.child(
-                    div()
-                        .pt_2()
-                        .border_t_1()
-                        .when(tool_failed || command_failed, |card| card.border_dashed())
-                        .border_color(border_color)
-                        .bg(cx.theme().colors().editor_background)
-                        .rounded_b_md()
-                        .text_ui_sm(cx)
-                        .h_full()
-                        .children(terminal_view.map(|terminal_view| {
-                            let element = if terminal_view
-                                .read(cx)
-                                .content_mode(window, cx)
-                                .is_scrollable()
-                            {
-                                div().h_72().child(terminal_view).into_any_element()
-                            } else {
-                                terminal_view.into_any_element()
-                            };
-
-                            div()
-                                .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
-                                    window.dispatch_action(NewThread.boxed_clone(), cx);
-                                    cx.stop_propagation();
-                                }))
-                                .child(element)
-                                .into_any_element()
-                        })),
-                )
-            })
+            .when(needs_confirmation, |this| this.children(prompt_content))
             .when_some(permission_request, |this, request| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
                 let allow_disabled = self.sandbox_confusables_block_allow(tool_call, cx);
@@ -10068,7 +10109,7 @@ impl ThreadView {
         else {
             return div();
         };
-        match options {
+        let buttons = match options {
             PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
                 session_id,
                 is_first,
@@ -10107,6 +10148,37 @@ impl ThreadView {
                 allow_disabled,
                 cx,
             ),
+        };
+
+        // Display-only mirror of the requesting tool's authoritative timer: tick
+        // once a second so the countdown visibly decreases. The tool still
+        // performs the stop when the window elapses.
+        match request.auto_resolve_deadline() {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining > Duration::ZERO {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        if this.update(cx, |_this, cx| cx.notify()).is_err() {
+                            return;
+                        }
+                    })
+                    .detach();
+                }
+                v_flex()
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .text_ui_sm(cx)
+                            .child(SharedString::from(format!(
+                                "Stopped automatically in {}s",
+                                remaining.as_secs().saturating_add(1)
+                            ))),
+                    )
+                    .child(buttons)
+            }
+            None => buttons,
         }
     }
 

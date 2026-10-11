@@ -17,14 +17,14 @@ use http_client::{
     AsyncBody, HttpClient, HttpClientWithUrl, HttpRequestExt, Method, Response, StatusCode,
 };
 use language_model::{
-    ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME, BASETEN_PROVIDER_ID,
-    BASETEN_PROVIDER_NAME, CompactionResult, DisabledReason,
-    GOOGLE_PROVIDER_ID, GOOGLE_PROVIDER_NAME, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelCompletionStream, LanguageModelEffortLevel,
-    LanguageModelId, LanguageModelName, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelRequest, LanguageModelToolChoiceSupport, ModelRateLimiters, OPEN_AI_PROVIDER_ID,
-    OPEN_AI_PROVIDER_NAME, ProviderErrorCategory, RateLimiter, X_AI_PROVIDER_ID,
-    X_AI_PROVIDER_NAME, ZED_CLOUD_PROVIDER_ID, ZED_CLOUD_PROVIDER_NAME, unavailable_error,
+    ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME, BASETEN_PROVIDER_ID, BASETEN_PROVIDER_NAME,
+    CompactionResult, DisabledReason, GOOGLE_PROVIDER_ID, GOOGLE_PROVIDER_NAME, LanguageModel,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelCompletionStream,
+    LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProviderId,
+    LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoiceSupport,
+    ModelRateLimiters, OPEN_AI_PROVIDER_ID, OPEN_AI_PROVIDER_NAME, ProviderErrorCategory,
+    RateLimiter, X_AI_PROVIDER_ID, X_AI_PROVIDER_NAME, ZED_CLOUD_PROVIDER_ID,
+    ZED_CLOUD_PROVIDER_NAME, unavailable_error,
 };
 
 use schemars::JsonSchema;

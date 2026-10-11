@@ -127,7 +127,9 @@ impl AgentBrowserApi {
     pub async fn open_target(&self, session_id: u64, url: &str) -> Result<Value> {
         let client = {
             let sessions = self.sessions.lock().await;
-            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let session = sessions
+                .get(&session_id)
+                .context("unknown browser session")?;
             session.client.clone()
         };
         let target = create_target(&client, url, &self.background_executor).await?;
@@ -155,7 +157,10 @@ impl AgentBrowserApi {
             (session.client.clone(), target)
         };
         client
-            .send_command("Target.closeTarget", json!({ "targetId": target.target_id }))
+            .send_command(
+                "Target.closeTarget",
+                json!({ "targetId": target.target_id }),
+            )
             .await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions
@@ -204,7 +209,9 @@ impl AgentBrowserApi {
     pub async fn snapshot(&self, session_id: u64, target_id: Option<&str>) -> Result<Value> {
         let (client, target_session_id, resolved_target_id, fallback_url) = {
             let sessions = self.sessions.lock().await;
-            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let session = sessions
+                .get(&session_id)
+                .context("unknown browser session")?;
             let target_session_id = resolve_target_session_id(session, target_id)?;
             let target = get_target(session, target_id)?;
             (
@@ -430,7 +437,9 @@ impl AgentBrowserApi {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let sessions = self.sessions.lock().await;
-        let session = sessions.get(&session_id).context("unknown browser session")?;
+        let session = sessions
+            .get(&session_id)
+            .context("unknown browser session")?;
         let mime_type = session
             .network_store
             .request(request_id)
@@ -632,7 +641,9 @@ impl AgentBrowserApi {
     ) -> Result<Value> {
         let (client, target_session_id, mut conditions) = {
             let sessions = self.sessions.lock().await;
-            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let session = sessions
+                .get(&session_id)
+                .context("unknown browser session")?;
             let target_session_id = resolve_target_session_id(session, target_id)?;
             let conditions = session.control.throttle.clone().unwrap_or_default();
             (session.client.clone(), target_session_id, conditions)
@@ -729,7 +740,9 @@ impl AgentBrowserApi {
     ) -> Result<Value> {
         let (client, target_session_id, merged) = {
             let sessions = self.sessions.lock().await;
-            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let session = sessions
+                .get(&session_id)
+                .context("unknown browser session")?;
             let target_session_id = resolve_target_session_id(session, target_id)?;
             let mut merged = session.control.blocked_urls.clone();
             for url in urls {
@@ -763,7 +776,9 @@ impl AgentBrowserApi {
     ) -> Result<Value> {
         let (client, target_session_id, merged) = {
             let sessions = self.sessions.lock().await;
-            let session = sessions.get(&session_id).context("unknown browser session")?;
+            let session = sessions
+                .get(&session_id)
+                .context("unknown browser session")?;
             let target_session_id = resolve_target_session_id(session, target_id)?;
             let merged = session
                 .control
@@ -1079,7 +1094,9 @@ impl AgentBrowserApi {
         target_id: Option<&str>,
     ) -> Result<(CdpClient, String)> {
         let sessions = self.sessions.lock().await;
-        let session = sessions.get(&session_id).context("unknown browser session")?;
+        let session = sessions
+            .get(&session_id)
+            .context("unknown browser session")?;
         let target_session_id = resolve_target_session_id(session, target_id)?;
         Ok((session.client.clone(), target_session_id))
     }
