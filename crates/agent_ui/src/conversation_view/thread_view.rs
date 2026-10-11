@@ -10166,12 +10166,16 @@ impl ThreadView {
                     .detach();
                 }
                 v_flex()
-                    .child(div().px_3().pt_2().text_ui_sm(cx).child(SharedString::from(
-                        format!(
-                            "Stopped automatically in {}s",
-                            remaining.as_secs().saturating_add(1)
-                        ),
-                    )))
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .text_ui_sm(cx)
+                            .child(SharedString::from(format!(
+                                "Stopped automatically in {}s",
+                                remaining.as_secs().saturating_add(1)
+                            ))),
+                    )
                     .child(buttons)
             }
             None => buttons,
