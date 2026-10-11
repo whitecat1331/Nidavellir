@@ -675,7 +675,10 @@ impl Terminal {
     pub fn was_stopped_by_sampler(&self) -> bool {
         matches!(
             self.sampler_outcome,
-            Some((SamplerOutcome::StoppedByUser | SamplerOutcome::StoppedByTimeout, _))
+            Some((
+                SamplerOutcome::StoppedByUser | SamplerOutcome::StoppedByTimeout,
+                _
+            ))
         )
     }
 

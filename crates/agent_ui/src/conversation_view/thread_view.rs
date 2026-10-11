@@ -8593,25 +8593,23 @@ impl ThreadView {
 
         let sampler_window_secs =
             AgentSettings::get_global(cx).terminal_error_sampler_timeout_seconds;
-        let sampler_banner = terminal_data
-            .sampler_outcome()
-            .map(|(outcome, reason)| {
-                let text = match outcome {
-                    acp_thread::SamplerOutcome::StoppedByUser => format!(
-                        "Stopped: you stopped the command after its output looked like a \
+        let sampler_banner = terminal_data.sampler_outcome().map(|(outcome, reason)| {
+            let text = match outcome {
+                acp_thread::SamplerOutcome::StoppedByUser => format!(
+                    "Stopped: you stopped the command after its output looked like a \
                          failure ({reason})."
-                    ),
-                    acp_thread::SamplerOutcome::StoppedByTimeout => format!(
-                        "Stopped automatically: no answer within {sampler_window_secs}s after \
+                ),
+                acp_thread::SamplerOutcome::StoppedByTimeout => format!(
+                    "Stopped automatically: no answer within {sampler_window_secs}s after \
                          its output looked like a failure ({reason})."
-                    ),
-                    acp_thread::SamplerOutcome::Continued => format!(
-                        "Continued: the output looked like a failure ({reason}), but you \
+                ),
+                acp_thread::SamplerOutcome::Continued => format!(
+                    "Continued: the output looked like a failure ({reason}), but you \
                          chose to continue."
-                    ),
-                };
-                SharedString::from(text)
-            });
+                ),
+            };
+            SharedString::from(text)
+        });
 
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
@@ -8672,38 +8670,41 @@ impl ThreadView {
             })
             .overflow_hidden()
             .child(header)
-            .when((is_expanded || sampler_fired) && terminal_view.is_some(), |this| {
-                this.child(
-                    div()
-                        .pt_2()
-                        .border_t_1()
-                        .when(tool_failed || command_failed, |card| card.border_dashed())
-                        .border_color(border_color)
-                        .bg(cx.theme().colors().editor_background)
-                        .rounded_b_md()
-                        .text_ui_sm(cx)
-                        .h_full()
-                        .children(terminal_view.map(|terminal_view| {
-                            let element = if terminal_view
-                                .read(cx)
-                                .content_mode(window, cx)
-                                .is_scrollable()
-                            {
-                                div().h_72().child(terminal_view).into_any_element()
-                            } else {
-                                terminal_view.into_any_element()
-                            };
+            .when(
+                (is_expanded || sampler_fired) && terminal_view.is_some(),
+                |this| {
+                    this.child(
+                        div()
+                            .pt_2()
+                            .border_t_1()
+                            .when(tool_failed || command_failed, |card| card.border_dashed())
+                            .border_color(border_color)
+                            .bg(cx.theme().colors().editor_background)
+                            .rounded_b_md()
+                            .text_ui_sm(cx)
+                            .h_full()
+                            .children(terminal_view.map(|terminal_view| {
+                                let element = if terminal_view
+                                    .read(cx)
+                                    .content_mode(window, cx)
+                                    .is_scrollable()
+                                {
+                                    div().h_72().child(terminal_view).into_any_element()
+                                } else {
+                                    terminal_view.into_any_element()
+                                };
 
-                            div()
-                                .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
-                                    window.dispatch_action(NewThread.boxed_clone(), cx);
-                                    cx.stop_propagation();
-                                }))
-                                .child(element)
-                                .into_any_element()
-                        })),
-                )
-            })
+                                div()
+                                    .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
+                                        window.dispatch_action(NewThread.boxed_clone(), cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(element)
+                                    .into_any_element()
+                            })),
+                    )
+                },
+            )
             .when_some(sampler_banner, |this, banner| {
                 this.child(
                     div()
@@ -8722,23 +8723,17 @@ impl ThreadView {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining > Duration::ZERO {
                         cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_secs(1))
-                                .await;
+                            cx.background_executor().timer(Duration::from_secs(1)).await;
                             this.update(cx, |_this, cx| cx.notify()).ok();
                         })
                         .detach();
                     }
-                    this.child(
-                        div()
-                            .px_3()
-                            .pt_2()
-                            .text_ui_sm(cx)
-                            .child(SharedString::from(format!(
-                                "Stopped automatically in {}s",
-                                remaining.as_secs().saturating_add(1)
-                            ))),
-                    )
+                    this.child(div().px_3().pt_2().text_ui_sm(cx).child(SharedString::from(
+                        format!(
+                            "Stopped automatically in {}s",
+                            remaining.as_secs().saturating_add(1)
+                        ),
+                    )))
                 })
                 .child(self.render_permission_buttons(
                     self.thread.read(cx).session_id().clone(),

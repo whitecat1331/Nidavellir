@@ -1014,9 +1014,8 @@ async fn run_terminal_tool(
 
     // How long to leave the sampler's kill/continue prompt open before stopping
     // the command automatically (`agent.terminal_error_sampler_timeout_seconds`).
-    let sampler_window = cx.update(|cx| {
-        AgentSettings::get_global(cx).terminal_error_sampler_timeout_seconds
-    });
+    let sampler_window =
+        cx.update(|cx| AgentSettings::get_global(cx).terminal_error_sampler_timeout_seconds);
     let sampler_window = Duration::from_secs(sampler_window);
 
     let timeout_task = cx.background_executor().timer(timeout).shared();
