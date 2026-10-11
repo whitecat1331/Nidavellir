@@ -1259,27 +1259,32 @@ impl AgentPanel {
                     }
                 })
                 .or_else(|| {
-                    // The active view may be in `Loading` or `LoadError` — for
-                    // example, while a restored thread is waiting for a custom
-                    // agent to finish registering. Without this fallback, a
-                    // stray `serialize()` triggered during that window would
-                    // write `session_id=None` and wipe the restored session
-                    if is_draft_active {
-                        return None;
-                    }
-                    let conversation_view = self.active_conversation_view()?;
-                    let session_id = conversation_view.read(cx).root_session_id.clone()?;
+                    // The active view has no live thread yet — either a
+                    // restored session still loading (waiting for a custom
+                    // agent to finish registering, say) or a thread created
+                    // moments ago whose connection hasn't completed (a
+                    // fork-and-continue sibling). Fall back to the metadata
+                    // store so a serialize in this window still records the
+                    // active thread: a restored session keeps its session id,
+                    // and a row-less thread is a draft by construction (rows
+                    // are written once the native thread connects).
+                    let active_thread_id = active_thread_id?;
                     let metadata = ThreadMetadataStore::try_global(cx)
-                        .and_then(|store| store.read(cx).entry_by_session(&session_id).cloned());
+                        .and_then(|store| store.read(cx).entry(active_thread_id).cloned());
+                    let (session_id, title, work_dirs) = match metadata {
+                        Some(metadata) => (
+                            metadata.session_id.as_ref().map(|s| s.0.to_string()),
+                            metadata.title.as_ref().map(|t| t.to_string()),
+                            Some(metadata.folder_paths().serialize()),
+                        ),
+                        None => (None, None, None),
+                    };
                     Some(SerializedActiveThread {
-                        session_id: Some(session_id.0.to_string()),
-                        thread_id: active_thread_id,
+                        session_id,
+                        thread_id: Some(active_thread_id),
                         agent_type: active_thread_agent.clone(),
-                        title: metadata
-                            .as_ref()
-                            .and_then(|m| m.title.as_ref())
-                            .map(|t| t.to_string()),
-                        work_dirs: metadata.map(|m| m.folder_paths().serialize()),
+                        title,
+                        work_dirs,
                     })
                 })
         };
@@ -3649,16 +3654,17 @@ impl AgentPanel {
                 "Continued from thread \"{title}\":\n\n{summary}"
             )))];
             this.update_in(cx, |this, window, cx| {
-                this.external_thread(
-                    Some(Agent::NativeAgent),
-                    None,
-                    None,
-                    None,
-                    Some(AgentInitialContent::ContentBlock {
-                        blocks,
-                        auto_submit: false,
-                    }),
-                    true,
+                this.create_thread_with_options(
+                    CreateThreadOptions {
+                        title: Some(format!("{title} (continued)").into()),
+                        initial_content: Some(AgentInitialContent::ContentBlock {
+                            blocks,
+                            auto_submit: false,
+                        }),
+                        agent: Some(Agent::NativeAgent),
+                        focus: true,
+                        ..CreateThreadOptions::default()
+                    },
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -4861,9 +4867,14 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A draft thread's unsent prompt is reseeded from the kvp store.
+        // When the metadata row isn't readable yet (the store is still
+        // loading, or the row was recreated after the seed was written),
+        // still try the kvp store — a promoted thread's key is deleted on
+        // promotion, so a session thread has nothing to seed.
         let is_draft = ThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).entry(thread_id).map(|m| m.is_draft()))
-            .unwrap_or(false);
+            .unwrap_or(true);
         let initial_content = is_draft
             .then(|| crate::draft_prompt_store::read(thread_id, cx))
             .flatten()
@@ -10855,6 +10866,83 @@ mod tests {
                 "reopening the draft via the sidebar path should reseed the editor"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_fork_serializes_active_draft_before_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        // No connection is registered: the fork's conversation view stays in
+        // `Loading`, exactly the window a restart can land in when the user
+        // acts quickly after `/truncate` (or Continue in New Thread).
+        let fork_thread_id = panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.create_thread_with_options(
+                CreateThreadOptions {
+                    initial_content: Some(AgentInitialContent::ContentBlock {
+                        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "Continued from thread \"Parent\":\n\ncompressed summary",
+                        ))],
+                        auto_submit: false,
+                    }),
+                    focus: true,
+                    ..CreateThreadOptions::default()
+                },
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+
+        // Serialize before the connection completes; the fork must still be
+        // recorded as the active thread so a restart in this window restores
+        // it (and reseeds its editor) instead of dropping the pointer.
+        panel.update(cx, |panel, cx| panel.serialize(cx));
+        cx.run_until_parked();
+
+        let workspace_id = workspace
+            .read_with(cx, |workspace, _cx| workspace.database_id())
+            .expect("workspace should have a database id");
+        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
+        let serialized: SerializedAgentPanel = cx
+            .background_spawn(async move { read_serialized_panel(workspace_id, &kvp) })
+            .await
+            .expect("panel should serialize its state");
+        let last_active = serialized
+            .last_active_thread
+            .as_ref()
+            .expect("serialize should record the fork as the last active thread");
+        assert_eq!(
+            last_active.thread_id,
+            Some(fork_thread_id),
+            "serialized state should point at the fork even before it connects"
+        );
+        assert_eq!(
+            last_active.session_id, None,
+            "an unconnected fork is a draft and must serialize with no session id"
+        );
     }
 
     #[gpui::test]
