@@ -10718,6 +10718,146 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_forked_seed_draft_survives_reload(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        stub_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("ok".into()),
+        )]);
+
+        // 1. A real thread is active — the fork's parent, mirroring the
+        //    live `/truncate` flow.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        crate::test_support::send_message(&panel, cx);
+        let parent_thread_id = crate::test_support::active_thread_id(&panel, cx);
+        cx.run_until_parked();
+
+        // 2. Fork a continuation thread exactly like `AgentPanelSiblingHost`
+        //    does for `/truncate`: seeded content, not auto-submitted, focused.
+        let seed_text = "Continued from thread \"Parent\":\n\ncompressed summary";
+        let seed_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+            seed_text.to_string(),
+        ))];
+        let fork_thread_id = panel.update_in(cx, |panel, window, cx| {
+            panel.create_thread_with_options(
+                CreateThreadOptions {
+                    title: Some("Parent (continued)".into()),
+                    initial_content: Some(AgentInitialContent::ContentBlock {
+                        blocks: seed_blocks.clone(),
+                        auto_submit: false,
+                    }),
+                    focus: true,
+                    ..CreateThreadOptions::default()
+                },
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // 3. The fork takes focus, keeps the parent untouched, and its seed is
+        //    visible in the editor and persisted to the kvp draft store.
+        panel.read_with(cx, |panel, cx| {
+            assert_ne!(fork_thread_id, parent_thread_id);
+            assert_eq!(
+                panel.active_thread_id(cx),
+                Some(fork_thread_id),
+                "fork with `focus` should become the active view"
+            );
+            assert!(
+                panel.retained_threads.contains_key(&fork_thread_id),
+                "fork should be retained in the sidebar"
+            );
+            assert_eq!(
+                panel.editor_text(fork_thread_id, cx).as_deref(),
+                Some(seed_text),
+                "seed should be visible in the fork's editor"
+            );
+        });
+        cx.update(|_window, cx| {
+            assert!(
+                crate::draft_prompt_store::read(fork_thread_id, cx).is_some(),
+                "seed should be persisted in the kvp draft store"
+            );
+        });
+
+        // 4. Serialize and reload, as a restart does.
+        panel.update(cx, |panel, cx| panel.serialize(cx));
+        cx.run_until_parked();
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let loaded_panel = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        cx.run_until_parked();
+
+        // 5. The reload restores the fork as the active draft, reseeded from
+        //    the kvp store.
+        loaded_panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.active_thread_id(cx),
+                Some(fork_thread_id),
+                "reload should restore the fork as the active thread"
+            );
+            assert_eq!(
+                panel.editor_text(fork_thread_id, cx).as_deref(),
+                Some(seed_text),
+                "reload should reseed the fork's editor from the kvp store"
+            );
+        });
+
+        // 6. A sidebar-style reopen of the draft after reload also reseeds.
+        loaded_panel.update_in(cx, |panel, window, cx| {
+            panel.load_agent_thread(
+                Agent::Stub,
+                fork_thread_id,
+                None,
+                None,
+                true,
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        loaded_panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editor_text(fork_thread_id, cx).as_deref(),
+                Some(seed_text),
+                "reopening the draft via the sidebar path should reseed the editor"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_reloaded_ephemeral_draft_preserves_original_agent(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
