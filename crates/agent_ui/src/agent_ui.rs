@@ -223,6 +223,8 @@ actions!(
         ToggleProfileSelector,
         /// Toggles plan mode for the current thread.
         TogglePlanMode,
+        /// Toggles REA (reverse-engineering) mode for the current thread.
+        ToggleReaMode,
         /// Cycles through available session modes.
         CycleModeSelector,
         /// Cycles through favorited models in the ACP model selector.
