@@ -5821,6 +5821,12 @@ const MAP_REDUCE_CONCURRENCY: usize = 3;
 /// stream that stalls must surface as an error instead of hanging the turn.
 const MAP_REDUCE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Hard bound on how long a single condense/merge stream may sit without
+/// yielding an event. A provider that stops emitting mid-stream errors here
+/// (with the stream's label) instead of only at the pass-level
+/// [`MAP_REDUCE_TOTAL_TIMEOUT`].
+const MAP_REDUCE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Cap on merge levels. The summaries are already condensed by then, so if a
 /// pathological thread still refuses to shrink, the remaining summaries are
 /// concatenated rather than summarized indefinitely.
@@ -6008,17 +6014,37 @@ fn build_merge_request(
 async fn collect_summary_text(
     result: Result<LanguageModelCompletionStream, LanguageModelCompletionError>,
     label: &str,
+    cx: &AsyncApp,
 ) -> Result<String> {
     let mut stream = result?;
     let mut text = String::new();
     let mut events = 0usize;
-    while let Some(event) = stream.next().await {
-        events += 1;
-        if events == 1 {
-            log::info!("[MR] first completion event received ({label})");
-        }
-        if let LanguageModelCompletionEvent::Text(text_chunk) = event? {
-            text.push_str(&text_chunk);
+    loop {
+        // Bound each wait for an event so a provider stream that stalls
+        // mid-flight errors here (with its label) instead of hanging the turn
+        // until the pass-level timeout fires.
+        let next_event = stream.next();
+        futures::pin_mut!(next_event);
+        let idle_timer = cx.background_executor().timer(MAP_REDUCE_STREAM_IDLE_TIMEOUT);
+        match futures::future::select(next_event, idle_timer).await {
+            futures::future::Either::Left((event, _idle_timer)) => {
+                let Some(event) = event else {
+                    break;
+                };
+                events += 1;
+                if events == 1 {
+                    log::info!("[MR] first completion event received ({label})");
+                }
+                if let LanguageModelCompletionEvent::Text(text_chunk) = event? {
+                    text.push_str(&text_chunk);
+                }
+            }
+            futures::future::Either::Right(_) => {
+                return Err(anyhow::anyhow!(
+                    "Map-reduce stream stalled: no event for {}s ({label})",
+                    MAP_REDUCE_STREAM_IDLE_TIMEOUT.as_secs()
+                ));
+            }
         }
     }
     log::info!("[MR] completion stream drained ({label}, {events} events)");
@@ -6079,7 +6105,7 @@ async fn merge_summaries(
 
         let mut merged = Vec::with_capacity(stream_results.len());
         for result in stream_results {
-            merged.push(collect_summary_text(result, &format!("merge level {depth}")).await?);
+            merged.push(collect_summary_text(result, &format!("merge level {depth}"), cx).await?);
         }
         summaries = merged;
 
@@ -6183,6 +6209,7 @@ async fn map_reduce_summaries_inner(
             collect_summary_text(
                 result,
                 &format!("condense chunk {}/{}", ix + 1, chunks.len()),
+                cx,
             )
             .await?,
         );
@@ -9515,6 +9542,31 @@ mod tests {
                 }
             });
         });
+    }
+
+    /// A provider stream that stops emitting mid-condense/merge must be
+    /// aborted by the per-stream idle timeout with a labeled error, rather
+    /// than hanging the turn until the pass-level timeout fires.
+    #[gpui::test]
+    async fn test_map_reduce_stream_idle_timeout_errors(cx: &mut TestAppContext) {
+        let stalled = futures::stream::pending::<
+            Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+        >()
+        .boxed();
+        let task = cx.spawn(async move |cx| {
+            collect_summary_text(Ok(stalled), "test stream", &cx).await
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(MAP_REDUCE_STREAM_IDLE_TIMEOUT + Duration::from_secs(1));
+        cx.run_until_parked();
+        let error = task
+            .await
+            .expect_err("a stalled stream should error out via the idle timeout");
+        assert!(
+            error.to_string().contains("stalled"),
+            "unexpected error: {error}"
+        );
     }
 
     /// When a send-path compaction needs map-reduce and the environment
