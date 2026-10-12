@@ -42,6 +42,8 @@ pub struct SerializedThread {
     pub profile: Option<AgentProfileId>,
     #[serde(default)]
     pub planning: bool,
+    #[serde(default)]
+    pub rea_mode: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -188,6 +190,7 @@ impl LegacySerializedThread {
             model: None,
             tool_use_limit_reached: false,
             planning: false,
+            rea_mode: false,
             profile: None,
         }
     }
@@ -277,6 +280,7 @@ mod tests {
                 model: None,
                 tool_use_limit_reached: false,
                 planning: false,
+                rea_mode: false,
                 profile: None
             }
         )
@@ -343,6 +347,7 @@ mod tests {
             model: None,
             tool_use_limit_reached: false,
             planning: false,
+            rea_mode: false,
             profile: None,
         });
         let upgraded = thread_v0_1_0.upgrade();
@@ -395,6 +400,7 @@ mod tests {
                 model: None,
                 tool_use_limit_reached: false,
                 planning: false,
+                rea_mode: false,
                 profile: None
             }
         )

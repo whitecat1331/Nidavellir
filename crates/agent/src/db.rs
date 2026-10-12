@@ -73,6 +73,8 @@ pub struct DbThread {
     #[serde(default)]
     pub planning: bool,
     #[serde(default)]
+    pub rea_mode: bool,
+    #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
     #[serde(default)]
     pub speed: Option<Speed>,
@@ -167,6 +169,7 @@ impl SharedThread {
             model: self.model,
             profile: None,
             planning: false,
+            rea_mode: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -204,6 +207,7 @@ struct DbThreadContentProjection<'a> {
     model: &'a Option<DbLanguageModel>,
     profile: &'a Option<AgentProfileId>,
     planning: bool,
+    rea_mode: bool,
     subagent_context: &'a Option<crate::SubagentContext>,
     speed: &'a Option<Speed>,
     thinking_enabled: bool,
@@ -259,6 +263,7 @@ impl DbThread {
             model: &self.model,
             profile: &self.profile,
             planning: self.planning,
+            rea_mode: self.rea_mode,
             subagent_context: &self.subagent_context,
             speed: &self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -446,6 +451,7 @@ impl DbThread {
             model: thread.model,
             profile: thread.profile,
             planning: false,
+            rea_mode: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -1758,6 +1764,7 @@ mod tests {
             model: None,
             profile: None,
             planning: false,
+            rea_mode: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,

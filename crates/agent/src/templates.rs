@@ -121,6 +121,18 @@ pub fn plan_framing() -> &'static str {
      each returned suite, and cite the results in the plan."
 }
 
+/// The REA (reverse-engineering) overlay. Unlike plan mode (framing-only),
+/// the `rea_mode` toggle also exposes the `rea` context server's tools; this
+/// text only tells the model how to use them.
+pub fn rea_framing() -> &'static str {
+    "## REA mode\n\n\
+     You have REA (reverse-engineering) tools available. Load the \
+     `reverse-engineer-anything` skill and follow its workflow: pick the \
+     tool that directly answers the question, cite the Evidence each result \
+     returns, and state each conclusion's coverage and limitations. Analysis \
+     runs locally on the `rea` host."
+}
+
 /// Handlebars helper for checking if an item is in a list
 fn contains(
     h: &handlebars::Helper,
