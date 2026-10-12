@@ -1604,9 +1604,8 @@ impl Thread {
     /// variable so a headless launch (e.g. an acceptance run) can start with
     /// REA tools already exposed.
     fn rea_mode_from_environment() -> bool {
-        std::env::var("ZED_AGENT_REA_MODE").is_ok_and(|value| {
-            value == "1" || value.eq_ignore_ascii_case("true")
-        })
+        std::env::var("ZED_AGENT_REA_MODE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     }
 
     /// Copies runtime-mutable settings from the parent thread so that
@@ -4842,9 +4841,17 @@ impl Thread {
         let mut duplicate_tool_names = HashSet::default();
         for (server_id, server_tools) in self.context_server_registry.read(cx).servers() {
             for (tool_name, tool) in server_tools {
-                if profile.is_context_server_tool_enabled(&server_id.0, &tool_name)
-                    || (self.rea_mode && server_id.0.as_ref() == Self::REA_CONTEXT_SERVER_ID)
-                {
+                // The REA overlay server is exposed solely by `rea_mode`. Its
+                // tools must not fall through to the profile's
+                // `enable_all_context_servers` default (which is `true` for the
+                // built-in profiles), or toggling REA off would leave them
+                // exposed.
+                let tool_enabled = if server_id.0.as_ref() == Self::REA_CONTEXT_SERVER_ID {
+                    self.rea_mode
+                } else {
+                    profile.is_context_server_tool_enabled(&server_id.0, &tool_name)
+                };
+                if tool_enabled {
                     let tool_name: SharedString =
                         provider_compatible_tool_name(tool_name.as_ref()).into();
                     if !seen_tools.insert(tool_name.clone()) {
