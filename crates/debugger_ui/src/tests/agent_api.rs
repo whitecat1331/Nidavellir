@@ -5,15 +5,18 @@ use dap::{
     adapters::DebugTaskDefinition,
     requests::{
         Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, LoadedSources,
+        Pause,
         Modules, ReadMemory, Restart, RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints,
         SetVariable, StackTrace, StepBack, Threads, Variables,
     },
 };
+use dap::transport::RequestHandling;
 use gpui::{BackgroundExecutor, TestAppContext};
 use project::debugger::{
     agent_api::{
         AgentDataBreakpointInput, AgentDebuggerApi, AgentDebuggerSessionStatus,
         AgentDebuggerSnapshotLimits, AgentDebuggerStepKind, AgentDebuggerThreadStatus,
+        AgentDebuggerWaitStatus,
         AgentExceptionBreakpointInput, AgentSourceBreakpointInput,
     },
     session::ThreadId,
@@ -648,6 +651,53 @@ async fn test_agent_run_to_line_removes_temporary_breakpoint_when_continue_fails
     assert!(result.is_err());
     let breakpoint_requests = breakpoint_requests.lock().unwrap();
     assert_eq!(&*breakpoint_requests, &[vec![2], Vec::<u64>::new()]);
+}
+
+/// ISSUE-0046: a control request whose response never arrives must not wedge the
+/// tool. `pause_thread` must return within the caller's timeout (reported as
+/// `TimedOut`) instead of awaiting the adapter's acknowledgement forever.
+#[gpui::test]
+async fn test_agent_pause_is_bounded_when_adapter_never_acknowledges(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;\nlet b = 2;\n" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    // The adapter accepts the request but never answers it, which is exactly the
+    // wedged-debuggee condition.
+    client.on_request_ext::<Pause, _>(|_, _| RequestHandling::Defer);
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+    let pause =
+        cx.update(|cx| api.pause_thread(session_id, ThreadId(1), Duration::from_millis(50), cx));
+    futures::pin_mut!(pause);
+    let outcome = futures::future::select(
+        pause,
+        executor.timer(Duration::from_secs(2)),
+    )
+    .await;
+    match outcome {
+        futures::future::Either::Left((result, _)) => {
+            let result = result.expect("pause_thread should report a bounded outcome");
+            assert_eq!(result.status, AgentDebuggerWaitStatus::TimedOut);
+        }
+        futures::future::Either::Right(_) => {
+            panic!("pause_thread hung: the request send is not bounded by the timeout")
+        }
+    }
 }
 
 #[gpui::test]

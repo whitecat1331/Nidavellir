@@ -629,11 +629,12 @@ impl AgentDebuggerApi {
                 });
             }
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
-            session
-                .update(cx, |session, cx| {
-                    session.agent_continue_thread(thread_id, cx)
-                })
-                .await?;
+            let send = session.update(cx, |session, cx| {
+                session.agent_continue_thread(thread_id, cx)
+            });
+            if let ControlSendOutcome::TimedOut = send_control_request(send, timeout, cx).await? {
+                return Ok(unacknowledged_control_result("continue"));
+            }
             wait_for_stop_or_timeout(stop_wait, timeout, cx).await
         })
     }
@@ -671,9 +672,11 @@ impl AgentDebuggerApi {
             let mut last_result = None;
             for _attempt in 0..3 {
                 let stop_wait = subscribe_to_stop(session.clone(), cx)?;
-                session
-                    .update(cx, |session, cx| session.agent_pause_thread(thread_id, cx))
-                    .await?;
+                let send = session
+                    .update(cx, |session, cx| session.agent_pause_thread(thread_id, cx));
+                if let ControlSendOutcome::TimedOut = send_control_request(send, timeout, cx).await? {
+                    return Ok(unacknowledged_control_result("pause"));
+                }
                 let result = wait_for_stop_or_timeout(stop_wait, timeout, cx).await?;
                 match result.status {
                     AgentDebuggerWaitStatus::Stopped => {
@@ -734,20 +737,21 @@ impl AgentDebuggerApi {
                 });
             }
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
-            session
-                .update(cx, |session, cx| match step_kind {
-                    AgentDebuggerStepKind::In => session.agent_step_in(thread_id, granularity, cx),
-                    AgentDebuggerStepKind::Out => {
-                        session.agent_step_out(thread_id, granularity, cx)
-                    }
-                    AgentDebuggerStepKind::Over => {
-                        session.agent_step_over(thread_id, granularity, cx)
-                    }
-                    AgentDebuggerStepKind::Back => {
-                        session.agent_step_back(thread_id, granularity, cx)
-                    }
-                })
-                .await?;
+            let send = session.update(cx, |session, cx| match step_kind {
+                AgentDebuggerStepKind::In => session.agent_step_in(thread_id, granularity, cx),
+                AgentDebuggerStepKind::Out => {
+                    session.agent_step_out(thread_id, granularity, cx)
+                }
+                AgentDebuggerStepKind::Over => {
+                    session.agent_step_over(thread_id, granularity, cx)
+                }
+                AgentDebuggerStepKind::Back => {
+                    session.agent_step_back(thread_id, granularity, cx)
+                }
+            });
+            if let ControlSendOutcome::TimedOut = send_control_request(send, timeout, cx).await? {
+                return Ok(unacknowledged_control_result("step"));
+            }
             wait_for_stop_or_timeout(stop_wait, timeout, cx).await
         })
     }
@@ -781,11 +785,12 @@ impl AgentDebuggerApi {
                 hit_condition: None,
                 state: BreakpointState::Enabled,
             };
-            session
-                .update(cx, |session, cx| {
-                    session.agent_run_to_position(breakpoint, thread_id, cx)
-                })
-                .await?;
+            let send = session.update(cx, |session, cx| {
+                session.agent_run_to_position(breakpoint, thread_id, cx)
+            });
+            if let ControlSendOutcome::TimedOut = send_control_request(send, timeout, cx).await? {
+                return Ok(unacknowledged_control_result("run_to_line"));
+            }
             let mut result = wait_for_stop_or_timeout(stop_wait, timeout, cx).await?;
             if result.status == AgentDebuggerWaitStatus::Stopped
                 && let Some(stopped_thread_id) = result.stopped_thread_id
@@ -1867,6 +1872,46 @@ async fn wait_for_boot_stop(
     let stopped = session.read_with(cx, |session, _| session.thread_status(thread_id))
         == ThreadStatus::Stopped;
     Ok(stopped.then_some(thread_id))
+}
+
+/// Outcome of sending a control request to the adapter.
+enum ControlSendOutcome {
+    /// The adapter acknowledged the request.
+    Acked,
+    /// The adapter did not answer within the timeout.
+    TimedOut,
+}
+
+/// Bounds the wait for a control *request* to be acknowledged by the adapter.
+///
+/// `dap`'s `DebugAdapterClient::request` awaits its response with no timeout, so
+/// against an adapter that never answers (a wedged debuggee) the whole control
+/// operation would otherwise block forever — the caller's `timeout` only bounded
+/// the subsequent stop wait (ISSUE-0046). Racing the send against the same
+/// timeout keeps the operation bounded.
+async fn send_control_request(
+    send: Task<Result<()>>,
+    timeout: Duration,
+    cx: &mut AsyncApp,
+) -> Result<ControlSendOutcome> {
+    let mut send = send.fuse();
+    let mut timer = cx.background_executor().timer(timeout).fuse();
+    select_biased! {
+        result = send => result.map(|()| ControlSendOutcome::Acked),
+        _ = timer => Ok(ControlSendOutcome::TimedOut),
+    }
+}
+
+/// The `TimedOut` control result reported when the adapter does not acknowledge a
+/// control request within the caller's timeout.
+fn unacknowledged_control_result(action: &str) -> AgentDebuggerControlResult {
+    AgentDebuggerControlResult {
+        status: AgentDebuggerWaitStatus::TimedOut,
+        stopped_thread_id: None,
+        notes: vec![format!(
+            "the debug adapter did not acknowledge the {action} request within the timeout"
+        )],
+    }
 }
 
 async fn wait_for_stop_or_timeout(

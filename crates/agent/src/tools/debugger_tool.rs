@@ -715,7 +715,18 @@ impl DebuggerTool {
                         dap_store.shutdown_session(SessionId::from_proto(session_id), cx)
                     })
                 });
-                shutdown.await?;
+                // Bound the wait for the adapter to confirm the disconnect: a
+                // wedged debuggee must not block the tool (ISSUE-0046).
+                futures::pin_mut!(shutdown);
+                match futures::future::select(
+                    shutdown,
+                    cx.background_executor().timer(Duration::from_secs(5)),
+                )
+                .await
+                {
+                    futures::future::Either::Left((result, _)) => result?,
+                    futures::future::Either::Right(_) => {}
+                }
                 Ok(success(
                     operation,
                     "stopped debug session",
