@@ -4999,6 +4999,9 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if self.is_subagent() {
+            system_prompt = format!("{}\n\n{system_prompt}", crate::subagent_framing());
+        }
         if let Some(framing) = crate::mode_framing(self.profile_id.as_str()) {
             system_prompt = format!("{framing}\n\n{system_prompt}");
         }
