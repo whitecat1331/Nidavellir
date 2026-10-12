@@ -2377,7 +2377,7 @@ impl Thread {
 
         self.add_tool(MemoryTool);
 
-        self.add_tool(ThreadSearchTool);
+        self.add_tool(ThreadSearchTool::new());
 
         self.add_tool(WaitForReportTool::new(self.project.clone()));
 
