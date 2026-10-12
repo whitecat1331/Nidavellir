@@ -2697,6 +2697,130 @@ async fn test_rea_mode_controls_rea_context_server_tools(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_mcp_tool_result_is_truncated_to_a_cap(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        context_server_store,
+        fs,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "tool_permissions": { "default": "allow" },
+                "profiles": {
+                    "test": {
+                        "name": "Test Profile",
+                        "enable_all_context_servers": true,
+                        "tools": {}
+                    },
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+    thread.update(cx, |thread, cx| {
+        thread.set_profile(AgentProfileId("test".into()), cx)
+    });
+
+    let mut tool_calls = setup_context_server(
+        "big_server",
+        vec![context_server::types::Tool {
+            name: "big".into(),
+            title: None,
+            description: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            annotations: None,
+        }],
+        &context_server_store,
+        cx,
+    );
+
+    let events = thread.update(cx, |thread, cx| {
+        thread.send(ClientUserMessageId::new(), ["Go"], cx).unwrap()
+    });
+    cx.run_until_parked();
+
+    let completion = fake.pending_completions().pop().unwrap();
+    assert_eq!(tool_names_for_completion(&completion), vec!["big"]);
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "tool_1".into(),
+            name: "big".into(),
+            raw_input: json!({}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let (tool_call_params, tool_call_response) = tool_calls.next().await.unwrap();
+    assert_eq!(tool_call_params.name, "big");
+    let huge = "x".repeat(100 * 1024);
+    tool_call_response
+        .send(context_server::types::CallToolResponse {
+            content: vec![context_server::types::ToolResponseContent::Text { text: huge }],
+            is_error: None,
+            meta: None,
+            structured_content: None,
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The truncated result is what reaches the model on the next completion.
+    let completion = fake.pending_completions().pop().unwrap();
+    let result_text: String = completion
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .iter()
+        .find_map(|content| match content {
+            MessageContent::ToolResult(result) if result.tool_use_id.to_string() == "tool_1" => {
+                Some(
+                    result
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            language_model::LanguageModelToolResultContent::Text(text) => {
+                                Some(text.as_ref())
+                            }
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                )
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    assert!(
+        result_text.len() < 100 * 1024,
+        "expected a truncated result, got {} bytes",
+        result_text.len()
+    );
+    assert!(
+        result_text.contains("truncated"),
+        "missing truncation note: {result_text}"
+    );
+
+    fake.send_last_text(&model, "Done!");
+    fake.end_last(&model);
+    events.collect::<Vec<_>>().await;
+}
+
+#[gpui::test]
 async fn test_mcp_tool_names_are_sanitized_for_providers(cx: &mut TestAppContext) {
     let ThreadTest {
         model,
