@@ -1577,7 +1577,7 @@ impl Thread {
             context_server_registry,
             profile_id,
             planning,
-            rea_mode: false,
+            rea_mode: Self::rea_mode_from_environment(),
             profile_downgraded_for_restricted_workspace,
             project_context,
             templates,
@@ -1598,6 +1598,15 @@ impl Thread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
         }
+    }
+
+    /// Seeds `rea_mode` for freshly created threads from an environment
+    /// variable so a headless launch (e.g. an acceptance run) can start with
+    /// REA tools already exposed.
+    fn rea_mode_from_environment() -> bool {
+        std::env::var("ZED_AGENT_REA_MODE").is_ok_and(|value| {
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
     }
 
     /// Copies runtime-mutable settings from the parent thread so that
