@@ -14,6 +14,13 @@ use util::{ResultExt, markdown::MarkdownEscaped};
 /// collapsed tool-call header. Longer values are truncated with an ellipsis.
 const MAX_INLINE_ARG_LEN: usize = 120;
 
+/// Maximum bytes of an MCP tool result's text that are sent to the model.
+/// Larger results are truncated (with a note) so a single context-server call
+/// (e.g. REA returning a multi-megabyte analysis) cannot exhaust the turn's
+/// context window. The full result is still rendered in the UI, where the
+/// render guard collapses the display.
+const MAX_MCP_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
 /// Generates a tool ID for an MCP tool that can be used in settings.
 ///
 /// The format is `mcp:<server_id>:<tool_name>` to avoid collisions with built-in tools.
@@ -457,6 +464,24 @@ impl AnyAgentTool for ContextServerTool {
                 event_stream
                     .update_fields(acp::ToolCallUpdateFields::new().content(tool_call_content));
             }
+            // Bound the text that reaches the model: a context server can
+            // return a single result larger than the model's context window.
+            // Keep a preview and drop the rest; the full result is still shown
+            // in the UI (collapsed by the render guard).
+            if concatenated_text.len() > MAX_MCP_TOOL_RESULT_BYTES {
+                let total_bytes = concatenated_text.len();
+                let mut truncated = truncate_bytes(&concatenated_text, MAX_MCP_TOOL_RESULT_BYTES);
+                truncated.push_str(&format!(
+                    "\n\n[... MCP tool result truncated to {} bytes of {} total ...]",
+                    MAX_MCP_TOOL_RESULT_BYTES, total_bytes,
+                ));
+                llm_output.retain(|content| {
+                    matches!(content, LanguageModelToolResultContent::Image(_))
+                });
+                llm_output.push(LanguageModelToolResultContent::Text(truncated.clone().into()));
+                concatenated_text = truncated;
+            }
+
             let raw_output = serde_json::Value::String(concatenated_text);
             Ok(AgentToolOutput {
                 raw_output,
@@ -506,6 +531,19 @@ fn truncate_chars(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Truncates `text` to at most `max_bytes` bytes, landing on a UTF-8 character
+/// boundary so the result is always valid UTF-8.
+fn truncate_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 pub fn get_prompt(
