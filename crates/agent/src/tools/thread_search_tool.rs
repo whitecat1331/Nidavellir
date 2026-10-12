@@ -470,6 +470,7 @@ mod tests {
             model: None,
             profile: None,
             planning: false,
+            rea_mode: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
