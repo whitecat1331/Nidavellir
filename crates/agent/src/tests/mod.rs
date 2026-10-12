@@ -2594,6 +2594,109 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_rea_mode_controls_rea_context_server_tools(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        context_server_store,
+        fs,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    // `enable_all_context_servers: true` would otherwise auto-expose every
+    // context server — including `rea`. The toggle must be the only thing that
+    // exposes the `rea` server's tools.
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "tool_permissions": { "default": "allow" },
+                "profiles": {
+                    "test": {
+                        "name": "Test Profile",
+                        "enable_all_context_servers": true,
+                        "tools": {}
+                    },
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+    thread.update(cx, |thread, cx| {
+        thread.set_profile(AgentProfileId("test".into()), cx)
+    });
+
+    let _rea_tool_calls = setup_context_server(
+        "rea",
+        vec![context_server::types::Tool {
+            name: "open_binary".into(),
+            title: None,
+            description: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            annotations: None,
+        }],
+        &context_server_store,
+        cx,
+    );
+
+    // With `rea_mode` off, the `rea` server's tools must stay hidden.
+    let events = thread.update(cx, |thread, cx| {
+        thread
+            .send(ClientUserMessageId::new(), ["Hey"], cx)
+            .unwrap()
+    });
+    cx.run_until_parked();
+    let completion = fake.pending_completions().pop().unwrap();
+    let names = tool_names_for_completion(&completion);
+    assert!(
+        !names.iter().any(|name| name.as_str() == "open_binary"),
+        "rea tools leaked while rea_mode was off: {names:?}"
+    );
+    fake.send_last_text(&model, "Done!");
+    fake.end_last(&model);
+    events.collect::<Vec<_>>().await;
+
+    // Toggling `rea_mode` on must expose them.
+    thread.update(cx, |thread, cx| thread.set_rea_mode(true, cx));
+    let events = thread.update(cx, |thread, cx| {
+        thread.send(ClientUserMessageId::new(), ["Go"], cx).unwrap()
+    });
+    cx.run_until_parked();
+    let completion = fake.pending_completions().pop().unwrap();
+    let names = tool_names_for_completion(&completion);
+    assert!(
+        names.iter().any(|name| name.as_str() == "open_binary"),
+        "rea tools missing with rea_mode on: {names:?}"
+    );
+    fake.send_last_text(&model, "Done!");
+    fake.end_last(&model);
+    events.collect::<Vec<_>>().await;
+
+    // Toggling back off must drop them again.
+    thread.update(cx, |thread, cx| thread.set_rea_mode(false, cx));
+    let events = thread.update(cx, |thread, cx| {
+        thread
+            .send(ClientUserMessageId::new(), ["Stop"], cx)
+            .unwrap()
+    });
+    cx.run_until_parked();
+    let completion = fake.pending_completions().pop().unwrap();
+    let names = tool_names_for_completion(&completion);
+    assert!(
+        !names.iter().any(|name| name.as_str() == "open_binary"),
+        "rea tools leaked after toggling rea_mode back off: {names:?}"
+    );
+    fake.send_last_text(&model, "Done!");
+    fake.end_last(&model);
+    events.collect::<Vec<_>>().await;
+}
+
+#[gpui::test]
 async fn test_mcp_tool_names_are_sanitized_for_providers(cx: &mut TestAppContext) {
     let ThreadTest {
         model,
