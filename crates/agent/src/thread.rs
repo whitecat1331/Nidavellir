@@ -1418,6 +1418,10 @@ pub struct Thread {
     /// over `profile_id` (which still governs the tool set); it injects plan-mode
     /// framing and routes the model to validate plans against the dispatch suites.
     planning: bool,
+    /// Whether REA (reverse-engineering) mode is on for this thread. When on,
+    /// the `rea` context server's tools are exposed regardless of the active
+    /// profile's context-server settings, and REA framing is injected.
+    rea_mode: bool,
     /// Whether `profile_id` was downgraded to `minimal` at thread start because
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
@@ -1573,6 +1577,7 @@ impl Thread {
             context_server_registry,
             profile_id,
             planning,
+            rea_mode: Self::rea_mode_from_environment(),
             profile_downgraded_for_restricted_workspace,
             project_context,
             templates,
@@ -1595,6 +1600,15 @@ impl Thread {
         }
     }
 
+    /// Seeds `rea_mode` for freshly created threads from an environment
+    /// variable so a headless launch (e.g. an acceptance run) can start with
+    /// REA tools already exposed.
+    fn rea_mode_from_environment() -> bool {
+        std::env::var("ZED_AGENT_REA_MODE").is_ok_and(|value| {
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+    }
+
     /// Copies runtime-mutable settings from the parent thread so that
     /// subagents start with the same configuration the user selected.
     /// Every property that `set_*` propagates to `running_subagents`
@@ -1607,6 +1621,7 @@ impl Thread {
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
         self.planning = parent.planning;
+        self.rea_mode = parent.rea_mode;
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -1900,6 +1915,7 @@ impl Thread {
             .profile
             .unwrap_or_else(|| settings.default_profile.clone());
         let (profile_id, planning) = Self::migrate_plan_profile(profile_id, db_thread.planning);
+        let rea_mode = db_thread.rea_mode;
 
         let saved_selection = db_thread.model.map(|model| SelectedModel {
             provider: model.provider.into(),
@@ -1955,6 +1971,7 @@ impl Thread {
             context_server_registry,
             profile_id,
             planning,
+            rea_mode,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
             templates,
@@ -2065,6 +2082,7 @@ impl Thread {
             model: (&self.model).into(),
             profile: Some(self.profile_id.clone()),
             planning: self.planning,
+            rea_mode: self.rea_mode,
             subagent_context: self.subagent_context.clone(),
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -2429,6 +2447,21 @@ impl Thread {
             return;
         }
         self.planning = planning;
+        cx.notify();
+    }
+
+    /// Whether REA mode is on for this thread.
+    pub fn is_rea_mode(&self) -> bool {
+        self.rea_mode
+    }
+
+    /// Turns REA mode on or off. Notifies so the change persists, mirroring
+    /// `set_planning`.
+    pub fn set_rea_mode(&mut self, rea_mode: bool, cx: &mut Context<Self>) {
+        if self.rea_mode == rea_mode {
+            return;
+        }
+        self.rea_mode = rea_mode;
         cx.notify();
     }
 
@@ -4740,6 +4773,11 @@ impl Thread {
         Ok(request)
     }
 
+    /// The `context_servers` id of the REA reverse-engineering MCP server.
+    /// When `rea_mode` is on, this server's tools are exposed regardless of
+    /// the active profile's context-server settings.
+    const REA_CONTEXT_SERVER_ID: &str = "rea";
+
     fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
@@ -4804,7 +4842,9 @@ impl Thread {
         let mut duplicate_tool_names = HashSet::default();
         for (server_id, server_tools) in self.context_server_registry.read(cx).servers() {
             for (tool_name, tool) in server_tools {
-                if profile.is_context_server_tool_enabled(&server_id.0, &tool_name) {
+                if profile.is_context_server_tool_enabled(&server_id.0, &tool_name)
+                    || (self.rea_mode && server_id.0.as_ref() == Self::REA_CONTEXT_SERVER_ID)
+                {
                     let tool_name: SharedString =
                         provider_compatible_tool_name(tool_name.as_ref()).into();
                     if !seen_tools.insert(tool_name.clone()) {
@@ -4957,6 +4997,9 @@ impl Thread {
         }
         if self.planning {
             system_prompt = format!("{}\n\n{system_prompt}", crate::plan_framing());
+        }
+        if self.rea_mode {
+            system_prompt = format!("{}\n\n{system_prompt}", crate::rea_framing());
         }
         if !memory_index.is_empty() {
             system_prompt.push_str("\n## Persistent Memory\n\n");

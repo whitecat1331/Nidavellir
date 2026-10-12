@@ -4938,6 +4938,7 @@ impl ThreadView {
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .children(self.render_plan_toggle(cx))
+                                    .children(self.render_rea_toggle(cx))
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
                                         None => this
@@ -5520,6 +5521,50 @@ impl ThreadView {
                     if let Some(thread) = this.as_native_thread(cx) {
                         thread.update(cx, |thread, cx| {
                             thread.set_planning(!thread.is_planning(), cx);
+                        });
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_rea_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.as_native_thread(cx)?.read(cx);
+
+        // REA is a tool overlay, not an intent: offer it over every work
+        // profile (including `debug`, so `debug`+REA can diagnose-then-decompile),
+        // but not over `minimal`/custom profiles.
+        if !matches!(
+            thread.profile().as_str(),
+            "read" | "write" | "execute" | "debug"
+        ) {
+            return None;
+        }
+
+        let rea_mode = thread.is_rea_mode();
+
+        let (tooltip_label, color) = if rea_mode {
+            ("Disable REA Mode", Color::Accent)
+        } else {
+            (
+                "Enable REA Mode",
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+            )
+        };
+
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        Some(
+            IconButton::new("rea-mode", IconName::MagnifyingGlass)
+                .icon_size(IconSize::Small)
+                .icon_color(color)
+                .tooltip(move |_, cx| {
+                    Tooltip::for_action_in(tooltip_label, &ToggleReaMode, &focus_handle, cx)
+                })
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(thread) = this.as_native_thread(cx) {
+                        thread.update(cx, |thread, cx| {
+                            thread.set_rea_mode(!thread.is_rea_mode(), cx);
                         });
                     }
                 }))
@@ -13342,6 +13387,13 @@ impl Render for ThreadView {
                 if let Some(thread) = this.as_native_thread(cx) {
                     thread.update(cx, |thread, cx| {
                         thread.set_planning(!thread.is_planning(), cx);
+                    });
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleReaMode, _window, cx| {
+                if let Some(thread) = this.as_native_thread(cx) {
+                    thread.update(cx, |thread, cx| {
+                        thread.set_rea_mode(!thread.is_rea_mode(), cx);
                     });
                 }
             }))
