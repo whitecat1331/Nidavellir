@@ -52,7 +52,7 @@ use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
     NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, ResetFastModeWarnings,
     ResetTrialEndUpsell, ResetTrialUpsell, ReviewThreadInWorktree, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu, TogglePlanMode, ToggleReaMode,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -6328,9 +6328,11 @@ fn window_control_action(name: &str) -> Result<Box<dyn Action>> {
             })
         }
         "agent::Chat" => Box::new(zed_actions::agent::Chat),
+        "agent::TogglePlanMode" => Box::new(TogglePlanMode),
+        "agent::ToggleReaMode" => Box::new(ToggleReaMode),
         "workspace::SaveAll" => Box::new(workspace::SaveAll { save_intent: None }),
         other => bail!(
-            "Unsupported action {other:?}. Supported actions: agent::NewThread,              agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle,              agent::FocusAgent, agent::CopyThreadToClipboard,              agent::LoadThreadFromClipboard, agent::NewNativeAgentThreadFromTruncate,              agent::Chat, workspace::SaveAll."
+            "Unsupported action {other:?}. Supported actions: agent::NewThread,              agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle,              agent::FocusAgent, agent::CopyThreadToClipboard,              agent::LoadThreadFromClipboard, agent::NewNativeAgentThreadFromTruncate,              agent::Chat, agent::TogglePlanMode, agent::ToggleReaMode, workspace::SaveAll."
         ),
     };
     Ok(action)
@@ -8373,6 +8375,8 @@ mod tests {
             "agent::CopyThreadToClipboard",
             "agent::LoadThreadFromClipboard",
             "agent::NewNativeAgentThreadFromTruncate",
+            "agent::TogglePlanMode",
+            "agent::ToggleReaMode",
             "workspace::SaveAll",
         ] {
             assert!(
