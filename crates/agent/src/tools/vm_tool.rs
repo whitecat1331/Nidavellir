@@ -473,9 +473,13 @@ async fn call_api(
         .await
         .map_err(|error| VmToolOutput::Error {
             error: format!(
-                "Proxmox API request to {full_url} failed: {error}. \
-                 The node control plane may be down — use `transport: \"ssh\"` for \
-                 out-of-band recovery. This tool never fails over automatically."
+                "Proxmox API request to {full_url} failed: {}. \
+                 (Timeout/unreachable => network or VPN down — check `tailscale status`; \
+                 certificate/UnknownIssuer => TLS pinning or CA mismatch; \
+                 connection refused => node up but its control plane is down.) \
+                 Use `transport: \"ssh\"` for out-of-band recovery. This tool \
+                 never fails over automatically.",
+                root_cause(&error)
             ),
         })?;
 
@@ -548,4 +552,16 @@ fn format_proxmox_error(status: StatusCode, value: &serde_json::Value) -> String
         .map(|errors| errors.to_string())
         .unwrap_or_else(|| value.to_string());
     format!("Proxmox API error (HTTP {}): {detail}", status.as_u16())
+}
+
+/// Walks an error's source chain and returns the deepest, most specific cause —
+/// e.g. the OS error for a failed connection (`timed out`, `connection
+/// refused`) or the TLS verifier's message (`UnknownIssuer`). This turns a
+/// generic `reqwest` "error sending request" into an actionable root cause.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut current = error;
+    while let Some(source) = current.source() {
+        current = source;
+    }
+    current.to_string()
 }
