@@ -342,7 +342,11 @@ async fn run_api(
         Some(upid) if upid.starts_with("UPID:") => {
             let status_request = ProxmoxApiRequest {
                 method: Method::GET,
-                path: format!("/cluster/tasks/{upid}/status"),
+                // Task status is node-scoped: the cluster-scoped
+                // `/cluster/tasks/{upid}/status` endpoint returns HTTP 501
+                // ("No 'get' handler") on PVE 8.x, so poll the node the VM
+                // (and therefore the task) lives on.
+                path: format!("/nodes/{}/tasks/{upid}/status", target.node),
                 body: None,
                 write: false,
             };
