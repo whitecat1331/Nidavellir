@@ -1,5 +1,5 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContextServerRegistry,
+    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContainerTool, ContextServerRegistry,
     CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
@@ -2380,6 +2380,8 @@ impl Thread {
         self.add_tool(ThreadSearchTool::new());
 
         self.add_tool(WaitForReportTool::new(self.project.clone()));
+
+        self.add_tool(ContainerTool);
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
