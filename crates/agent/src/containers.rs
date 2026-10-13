@@ -60,8 +60,9 @@ impl ContainerStore {
             Ok(contents) => serde_json::from_str(&contents)
                 .with_context(|| format!("parsing container config {}", path.display())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error)
-                .with_context(|| format!("reading container config {}", path.display())),
+            Err(error) => {
+                Err(error).with_context(|| format!("reading container config {}", path.display()))
+            }
         }
     }
 
@@ -126,13 +127,7 @@ impl ContainerOperation {
     pub fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::Pull
-                | Self::Up
-                | Self::Down
-                | Self::Restart
-                | Self::Exec
-                | Self::Rm
-                | Self::Run
+            Self::Pull | Self::Up | Self::Down | Self::Restart | Self::Exec | Self::Rm | Self::Run
         )
     }
 }
@@ -208,7 +203,9 @@ pub fn assemble_command(
                 .ok_or_else(|| anyhow!("systemd target is missing `service`"))?;
             if !matches!(
                 operation,
-                ContainerOperation::Status | ContainerOperation::IsActive | ContainerOperation::Restart
+                ContainerOperation::Status
+                    | ContainerOperation::IsActive
+                    | ContainerOperation::Restart
             ) {
                 bail!(
                     "operation `{}` is not valid for a systemd target",
@@ -224,31 +221,45 @@ pub fn assemble_command(
         }
     };
 
+    Ok(assemble_ssh(
+        &target.host,
+        target.identity_file.as_deref(),
+        remote,
+    ))
+}
+
+/// Assembles the `ssh` invocation that runs `remote` on `host`.
+///
+/// Shared by the `container` and `vm` tools so both reuse the same SSH
+/// assembly/escaping path. The returned command is argv-only (no shell): `ssh`
+/// plus flags, the host, and the remote command as a single argument that `ssh`
+/// forwards to the remote shell verbatim.
+pub(crate) fn assemble_ssh(
+    host: &str,
+    identity_file: Option<&str>,
+    remote: impl Into<String>,
+) -> AssembledCommand {
     let mut ssh_args = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
         "ConnectTimeout=15".to_string(),
     ];
-    if let Some(identity) = target.identity_file.as_deref() {
+    if let Some(identity) = identity_file {
         ssh_args.push("-i".to_string());
         ssh_args.push(expand_home(identity));
     }
-    ssh_args.push(target.host.clone());
-    ssh_args.push(remote);
-
-    Ok(AssembledCommand {
+    ssh_args.push(host.to_string());
+    ssh_args.push(remote.into());
+    AssembledCommand {
         program: "ssh".to_string(),
         args: ssh_args,
-    })
+    }
 }
 
 fn expand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        paths::home_dir()
-            .join(rest)
-            .to_string_lossy()
-            .into_owned()
+        paths::home_dir().join(rest).to_string_lossy().into_owned()
     } else {
         path.to_string()
     }
@@ -292,7 +303,10 @@ mod tests {
             ContainerOperation::Status,
             ContainerOperation::IsActive,
         ] {
-            assert!(!read_only.is_mutating(), "{read_only:?} should be read-only");
+            assert!(
+                !read_only.is_mutating(),
+                "{read_only:?} should be read-only"
+            );
         }
         for mutating in [
             ContainerOperation::Pull,
@@ -309,9 +323,13 @@ mod tests {
 
     #[test]
     fn compose_ps_assembles_ssh_invocation() {
-        let command =
-            assemble_command(&compose_target("/opt/app"), ContainerOperation::Ps, None, &[])
-                .unwrap();
+        let command = assemble_command(
+            &compose_target("/opt/app"),
+            ContainerOperation::Ps,
+            None,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(command.program, "ssh");
         assert_eq!(
@@ -341,7 +359,9 @@ mod tests {
 
         assert_eq!(
             command.args.last().map(String::as_str),
-            Some("cd /opt/app && docker compose -f deploy/docker-compose.yml exec gallery bash -c ls")
+            Some(
+                "cd /opt/app && docker compose -f deploy/docker-compose.yml exec gallery bash -c ls"
+            )
         );
     }
 
@@ -349,8 +369,7 @@ mod tests {
     fn compose_env_file_is_emitted() {
         let mut target = compose_target("/opt/app");
         target.env_file = Some("/opt/app/.env".to_string());
-        let command =
-            assemble_command(&target, ContainerOperation::Ps, None, &[]).unwrap();
+        let command = assemble_command(&target, ContainerOperation::Ps, None, &[]).unwrap();
 
         assert_eq!(
             command.args.last().map(String::as_str),
@@ -389,8 +408,7 @@ mod tests {
     fn identity_file_is_appended() {
         let mut target = compose_target("/opt/app");
         target.identity_file = Some("/abs/key".to_string());
-        let command =
-            assemble_command(&target, ContainerOperation::Ps, None, &[]).unwrap();
+        let command = assemble_command(&target, ContainerOperation::Ps, None, &[]).unwrap();
 
         assert_eq!(
             &command.args[..6],
