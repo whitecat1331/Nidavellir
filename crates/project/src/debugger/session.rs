@@ -3544,6 +3544,14 @@ impl Session {
         cx.spawn(async move |this, cx| {
             let response = request.await?;
             this.update(cx, |this, cx| {
+                // `setVariable` is a while-stopped request, but several adapters
+                // implement it by briefly resuming and re-stopping the debuggee.
+                // That resume/re-stop can race this response and leave the
+                // optimistic thread state marked Running/Stepping, which makes the
+                // next control op reject the thread as "not stopped". A successful
+                // `setVariable` implies the debuggee is halted, so reconcile the
+                // state back to Stopped.
+                this.active_snapshot.thread_states.stop_all_threads();
                 this.invalidate_command_type::<VariablesCommand>();
                 this.invalidate_command_type::<ReadMemory>();
                 this.memory.clear(cx.background_executor());

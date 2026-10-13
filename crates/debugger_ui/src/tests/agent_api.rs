@@ -19,7 +19,7 @@ use project::debugger::{
         AgentDebuggerWaitStatus,
         AgentExceptionBreakpointInput, AgentSourceBreakpointInput,
     },
-    session::ThreadId,
+    session::{ThreadId, ThreadStatus},
 };
 use project::{FakeFs, Project, WorktreeId};
 use serde_json::json;
@@ -1080,6 +1080,82 @@ async fn test_agent_api_set_variable(executor: BackgroundExecutor, cx: &mut Test
     assert_eq!(result.value, "2");
     assert_eq!(result.type_name.as_deref(), Some("int"));
     assert_eq!(result.variables_reference, Some(0));
+}
+
+#[gpui::test]
+async fn test_agent_api_set_variable_reconciles_thread_state(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.js": "let a = 1;" } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let session = start_debug_session(&workspace, cx, |client| {
+        client.on_request::<Initialize, _>(move |_, _| {
+            Ok(dap::Capabilities {
+                supports_set_variable: Some(true),
+                ..Default::default()
+            })
+        });
+        client.on_request::<SetVariable, _>(move |_, args| {
+            assert_eq!(args.name, "a");
+            assert_eq!(args.value, "2");
+            assert_eq!(args.variables_reference, 100);
+            Ok(dap::SetVariableResponse {
+                value: "2".into(),
+                type_: Some("int".into()),
+                variables_reference: Some(0),
+                named_variables: None,
+                indexed_variables: None,
+                memory_reference: None,
+                value_location_reference: None,
+            })
+        });
+    })
+    .unwrap();
+    let session_id = session.read_with(cx, |session, _| session.session_id());
+
+    cx.run_until_parked();
+
+    // Several adapters implement `setVariable` by briefly resuming the debuggee:
+    // a `continued` event flips the thread to Running before the adapter
+    // re-stops. A successful `setVariable` must reconcile the thread back to
+    // Stopped so the next control op is not rejected as "thread not stopped".
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    client
+        .fake_event(dap::messages::Events::Stopped(dap::StoppedEvent {
+            reason: dap::StoppedEventReason::Pause,
+            description: None,
+            thread_id: Some(1),
+            preserve_focus_hint: None,
+            text: None,
+            all_threads_stopped: Some(true),
+            hit_breakpoint_ids: None,
+        }))
+        .await;
+    client
+        .fake_event(dap::messages::Events::Continued(dap::ContinuedEvent {
+            thread_id: 1,
+            all_threads_continued: Some(true),
+        }))
+        .await;
+    cx.run_until_parked();
+
+    let api = agent_api(&project, cx);
+    cx.update(|cx| api.set_variable(session_id, None, 100, "a".into(), "2".into(), cx))
+        .await
+        .unwrap();
+
+    let status = session.read_with(cx, |session, _| session.thread_status(ThreadId(1)));
+    assert_eq!(status, ThreadStatus::Stopped);
 }
 
 #[gpui::test]
