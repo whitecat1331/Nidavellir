@@ -122,12 +122,12 @@ impl AgentTool for VmTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        let http_client = cx.http_client();
+        let shared_http_client = cx.http_client();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|error| VmToolOutput::Error {
                 error: format!("Failed to receive vm tool input: {error}"),
             })?;
-            run_operation(input, http_client, cx).await
+            run_operation(input, shared_http_client, cx).await
         })
     }
 }
@@ -135,7 +135,7 @@ impl AgentTool for VmTool {
 /// Performs a VM operation against the configured targets on disk.
 async fn run_operation(
     input: VmToolInput,
-    http_client: Arc<dyn HttpClient>,
+    shared_http_client: Arc<dyn HttpClient>,
     cx: &AsyncApp,
 ) -> Result<VmToolOutput, VmToolOutput> {
     let store = VmStore::load(VmStore::default_path()).map_err(|error| VmToolOutput::Error {
@@ -173,6 +173,8 @@ async fn run_operation(
     let tier = gating_tier(input.operation, transport, &target, vmid);
     enforce_tier(tier, &input)?;
 
+    let http_client = resolve_http_client(&target, shared_http_client)?;
+
     match transport {
         VmTransport::Api => {
             run_api(
@@ -198,6 +200,29 @@ async fn run_operation(
             .await
         }
     }
+}
+
+/// Resolves the HTTP client for the API transport: the shared client by
+/// default, or a pinned client when the target's `tls_ca` names a PEM file of
+/// certificates to trust (e.g. a hypervisor's self-signed node certs).
+/// Verification is never disabled — the pinned client simply restricts the trust
+/// anchors to those certs.
+fn resolve_http_client(
+    target: &VmTarget,
+    shared: Arc<dyn HttpClient>,
+) -> Result<Arc<dyn HttpClient>, VmToolOutput> {
+    let Some(tls_ca) = target.api.as_ref().and_then(|api| api.tls_ca.as_deref()) else {
+        return Ok(shared);
+    };
+
+    let pem = std::fs::read(tls_ca).map_err(|error| VmToolOutput::Error {
+        error: format!("Failed to read pinned certificate file {tls_ca:?}: {error}"),
+    })?;
+    let client =
+        reqwest_client::ReqwestClient::pinned(&pem).map_err(|error| VmToolOutput::Error {
+            error: format!("Failed to build pinned TLS client for {tls_ca:?}: {error}"),
+        })?;
+    Ok(Arc::new(client))
 }
 
 fn enforce_tier(tier: GatingTier, input: &VmToolInput) -> Result<(), VmToolOutput> {

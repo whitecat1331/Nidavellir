@@ -58,6 +58,7 @@ quick-xml.workspace = true
 rand.workspace = true
 regex.workspace = true
 release_channel.workspace = true
+reqwest_client.workspace = true
 sandbox.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -107,7 +108,6 @@ lsp = { workspace = true, "features" = ["test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, "features" = ["test-support"] }
 proptest.workspace = true
-reqwest_client.workspace = true
 semver.workspace = true
 settings = { workspace = true, "features" = ["test-support"] }
 
