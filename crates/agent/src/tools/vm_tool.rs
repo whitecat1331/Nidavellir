@@ -1,0 +1,526 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::proxmox::{ProxmoxApiRequest, assemble_api_request, assemble_ssh_command};
+use crate::vms::{
+    GatingTier, VmOperation, VmStore, VmTarget, VmTransport, gating_tier, resolve_vmid,
+    validate_input,
+};
+use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use agent_client_protocol::schema::v1 as acp;
+use futures::AsyncReadExt as _;
+use gpui::{App, AsyncApp, SharedString, Task};
+use http_client::{AsyncBody, HttpClient, Method, StatusCode};
+use language_model::LanguageModelToolResultContent;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// How often to poll a Proxmox task before giving up.
+const TASK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum task polls (≈ 60s). Snapshot/rollback/migrate can outlive this; the
+/// tool reports the still-running task rather than hanging forever.
+const TASK_POLL_MAX: usize = 120;
+
+/// Operate a VM or its hypervisor node on a configured Proxmox cluster.
+///
+/// Targets are defined by the operator in `vms.json` (next to `containers.json`
+/// and `automations.json`); this tool only resolves a target id to a node/VMID
+/// and assembles the request or command. The default `api` transport talks to
+/// the Proxmox REST API with a scoped API token; the `ssh` transport is an
+/// explicit escalation to a root shell (always confirmed) for the surface the
+/// API does not model and for out-of-band recovery. There is never a silent
+/// `api` → `ssh` failover.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct VmToolInput {
+    /// The target id from `vms.json` (a Proxmox node).
+    pub target: String,
+    /// The operation to perform.
+    pub operation: VmOperation,
+    /// Which transport to use. Defaults to `api`; set `ssh` for an explicit
+    /// root-shell escalation. SSH-only operations (`shell`) require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<VmTransport>,
+    /// The VMID to operate on (required for VM-level operations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmid: Option<u32>,
+    /// Snapshot name (required for `snapshot`/`rollback`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapname: Option<String>,
+    /// Target node (required for `migrate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrate_target: Option<String>,
+    /// Extra arguments (for `shell`: the node command to run).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Set to `true` to confirm a mutating or SSH operation.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Required explanation for danger-tier operations (stop/reboot of an
+    /// infra-critical VM or node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VmToolOutput {
+    Success { message: String },
+    Error { error: String },
+}
+
+impl From<VmToolOutput> for LanguageModelToolResultContent {
+    fn from(value: VmToolOutput) -> Self {
+        match value {
+            VmToolOutput::Success { message } => message.into(),
+            VmToolOutput::Error { error } => error.into(),
+        }
+    }
+}
+
+pub struct VmTool;
+
+impl AgentTool for VmTool {
+    type Input = VmToolInput;
+    type Output = VmToolOutput;
+
+    const NAME: &'static str = "vm";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Execute
+    }
+
+    fn allow_in_restricted_mode() -> bool {
+        false
+    }
+
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        match input {
+            Ok(input) => {
+                let vmid = input
+                    .vmid
+                    .map(|vmid| format!(":{vmid}"))
+                    .unwrap_or_default();
+                format!(
+                    "VM {} on {}{}",
+                    input.operation.as_str(),
+                    input.target,
+                    vmid
+                )
+                .into()
+            }
+            Err(_) => "Running VM operation".into(),
+        }
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        let http_client = cx.http_client();
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(|error| VmToolOutput::Error {
+                error: format!("Failed to receive vm tool input: {error}"),
+            })?;
+            run_operation(input, http_client, cx).await
+        })
+    }
+}
+
+/// Performs a VM operation against the configured targets on disk.
+async fn run_operation(
+    input: VmToolInput,
+    http_client: Arc<dyn HttpClient>,
+    cx: &AsyncApp,
+) -> Result<VmToolOutput, VmToolOutput> {
+    let store = VmStore::load(VmStore::default_path()).map_err(|error| VmToolOutput::Error {
+        error: format!("Failed to load vm config: {error}"),
+    })?;
+
+    let target = store
+        .target(&input.target)
+        .cloned()
+        .ok_or_else(|| VmToolOutput::Error {
+            error: format!(
+                "Unknown vm target \"{}\". Configured targets: {}",
+                input.target,
+                store.targets.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        })?;
+
+    let transport = input.transport.unwrap_or(VmTransport::Api);
+
+    validate_input(
+        input.operation,
+        input.vmid,
+        input.snapname.as_deref(),
+        input.migrate_target.as_deref(),
+        &input.args,
+    )
+    .map_err(|error| VmToolOutput::Error {
+        error: error.to_string(),
+    })?;
+
+    let vmid = resolve_vmid(&target, input.vmid).map_err(|error| VmToolOutput::Error {
+        error: error.to_string(),
+    })?;
+
+    let tier = gating_tier(input.operation, transport, &target, vmid);
+    enforce_tier(tier, &input)?;
+
+    match transport {
+        VmTransport::Api => {
+            run_api(
+                http_client,
+                cx,
+                target,
+                input.operation,
+                vmid,
+                input.snapname,
+                input.migrate_target,
+            )
+            .await
+        }
+        VmTransport::Ssh => {
+            run_ssh(
+                target,
+                input.operation,
+                vmid,
+                input.snapname,
+                input.migrate_target,
+                input.args,
+            )
+            .await
+        }
+    }
+}
+
+fn enforce_tier(tier: GatingTier, input: &VmToolInput) -> Result<(), VmToolOutput> {
+    let operation = input.operation.as_str();
+    let target = &input.target;
+    let vmid = input
+        .vmid
+        .map(|vmid| format!(":{vmid}"))
+        .unwrap_or_default();
+
+    let missing = |requirement: &str| VmToolOutput::Error {
+        error: format!(
+            "`{operation}` on `{target}{vmid}` {requirement}; re-run with `confirm: true` to proceed."
+        ),
+    };
+
+    match tier {
+        GatingTier::Read => Ok(()),
+        GatingTier::Confirm => {
+            if input.confirm {
+                Ok(())
+            } else {
+                Err(missing("is mutating"))
+            }
+        }
+        GatingTier::Danger => {
+            if !input.confirm {
+                Err(missing("targets an infra-critical VM or node"))
+            } else if input
+                .reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+            {
+                Err(VmToolOutput::Error {
+                    error: format!(
+                        "`{operation}` on `{target}{vmid}` targets an infra-critical VM or node; \
+                         re-run with a non-empty `reason` explaining why."
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        GatingTier::Ssh => {
+            if input.confirm {
+                Ok(())
+            } else {
+                Err(missing(
+                    "is a root-shell escalation over the `ssh` transport",
+                ))
+            }
+        }
+    }
+}
+
+/// Runs an operation over the Proxmox REST API, polling async tasks to
+/// completion and returning the JSON result as a human-readable message.
+async fn run_api(
+    http_client: Arc<dyn HttpClient>,
+    cx: &AsyncApp,
+    target: VmTarget,
+    operation: VmOperation,
+    vmid: Option<u32>,
+    snapname: Option<String>,
+    migrate_target: Option<String>,
+) -> Result<VmToolOutput, VmToolOutput> {
+    let api = target.api.as_ref().ok_or_else(|| VmToolOutput::Error {
+        error: format!(
+            "target \"{}\" has no `api` transport configured",
+            target.node
+        ),
+    })?;
+    let base_url = api.base_url.clone();
+
+    let request = assemble_api_request(
+        &target,
+        operation,
+        vmid,
+        snapname.as_deref(),
+        migrate_target.as_deref(),
+    )
+    .map_err(|error| VmToolOutput::Error {
+        error: error.to_string(),
+    })?;
+
+    let (token_id, secret_url) = if request.write {
+        let id = api
+            .write_token_id
+            .as_ref()
+            .ok_or_else(|| VmToolOutput::Error {
+                error: format!(
+                    "`{}` requires a write token, but target \"{}\" has none configured",
+                    operation.as_str(),
+                    target.node
+                ),
+            })?;
+        let url = api
+            .write_token_secret_url
+            .as_ref()
+            .ok_or_else(|| VmToolOutput::Error {
+                error: format!(
+                    "target \"{}\" has a write token id but no write token secret URL",
+                    target.node
+                ),
+            })?;
+        (id.clone(), url.clone())
+    } else {
+        (api.token_id.clone(), api.token_secret_url.clone())
+    };
+
+    let secret = read_secret(cx, &secret_url).await?;
+    let value = call_api(&http_client, &request, &token_id, &secret, &base_url).await?;
+
+    // Async tasks return a UPID string; poll them to completion so the result
+    // reflects the final state rather than just "task accepted".
+    let message = match value.get("data").and_then(|data| data.as_str()) {
+        Some(upid) if upid.starts_with("UPID:") => {
+            let status_request = ProxmoxApiRequest {
+                method: Method::GET,
+                path: format!("/cluster/tasks/{upid}/status"),
+                body: None,
+                write: false,
+            };
+            let final_value = poll_task(
+                &http_client,
+                cx,
+                &status_request,
+                &token_id,
+                &secret,
+                &base_url,
+                upid,
+            )
+            .await?;
+            serde_json::to_string_pretty(final_value.get("data").unwrap_or(&final_value))
+                .unwrap_or_else(|_| final_value.to_string())
+        }
+        _ => serde_json::to_string_pretty(value.get("data").unwrap_or(&value))
+            .unwrap_or_else(|_| value.to_string()),
+    };
+
+    Ok(VmToolOutput::Success { message })
+}
+
+/// Runs an operation over SSH by assembling and executing an `ssh` command.
+async fn run_ssh(
+    target: VmTarget,
+    operation: VmOperation,
+    vmid: Option<u32>,
+    snapname: Option<String>,
+    migrate_target: Option<String>,
+    args: Vec<String>,
+) -> Result<VmToolOutput, VmToolOutput> {
+    let assembled = assemble_ssh_command(
+        &target,
+        operation,
+        vmid,
+        snapname.as_deref(),
+        migrate_target.as_deref(),
+        &args,
+    )
+    .map_err(|error| VmToolOutput::Error {
+        error: error.to_string(),
+    })?;
+
+    let output = util::command::new_command(&assembled.program)
+        .args(&assembled.args)
+        .output()
+        .await
+        .map_err(|error| VmToolOutput::Error {
+            error: format!("Failed to run `{}`: {error}", assembled.display()),
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut message = String::new();
+    if !stdout.trim().is_empty() {
+        message.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !message.is_empty() {
+            message.push('\n');
+        }
+        message.push_str(stderr.trim());
+    }
+    if !output.status.success() {
+        return Err(VmToolOutput::Error {
+            error: format!(
+                "`{}` exited with {}: {message}",
+                assembled.display(),
+                output.status
+            ),
+        });
+    }
+    if message.is_empty() {
+        message = format!("`{}` completed successfully.", assembled.display());
+    }
+    Ok(VmToolOutput::Success { message })
+}
+
+/// Reads a token secret from the platform keychain. Secrets are never stored in
+/// `vms.json`; the config only carries the keychain URL they live at.
+async fn read_secret(cx: &AsyncApp, url: &str) -> Result<String, VmToolOutput> {
+    let credentials = cx
+        .update(|cx| cx.read_credentials(url))
+        .await
+        .map_err(|error| VmToolOutput::Error {
+            error: format!("Failed to read token secret from keychain ({url}): {error}"),
+        })?;
+    let Some((_username, secret)) = credentials else {
+        return Err(VmToolOutput::Error {
+            error: format!(
+                "No token secret stored under keychain URL {url}; seed it before using the `vm` tool."
+            ),
+        });
+    };
+    Ok(String::from_utf8_lossy(&secret).into_owned())
+}
+
+/// Sends one Proxmox API request and returns the parsed JSON response.
+async fn call_api(
+    http_client: &Arc<dyn HttpClient>,
+    request: &ProxmoxApiRequest,
+    token_id: &str,
+    token_secret: &str,
+    base_url: &str,
+) -> Result<serde_json::Value, VmToolOutput> {
+    let full_url = format!("{}{}", base_url.trim_end_matches('/'), request.path);
+    let mut builder = http_client::Request::builder()
+        .method(request.method.clone())
+        .uri(full_url.as_str())
+        .header(
+            "Authorization",
+            format!("PVEAPIToken={token_id}={token_secret}"),
+        );
+    let body = match &request.body {
+        Some(value) => {
+            builder = builder.header("Content-Type", "application/json");
+            AsyncBody::from(http_client::Json(value.clone()))
+        }
+        None => AsyncBody::empty(),
+    };
+    let request = builder.body(body).map_err(|error| VmToolOutput::Error {
+        error: format!("Failed to build Proxmox API request for {full_url}: {error}"),
+    })?;
+
+    let mut response = http_client
+        .send(request)
+        .await
+        .map_err(|error| VmToolOutput::Error {
+            error: format!(
+                "Proxmox API request to {full_url} failed: {error}. \
+                 The node control plane may be down — use `transport: \"ssh\"` for \
+                 out-of-band recovery. This tool never fails over automatically."
+            ),
+        })?;
+
+    let status = response.status();
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| VmToolOutput::Error {
+            error: format!("Failed to read Proxmox API response: {error}"),
+        })?;
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| VmToolOutput::Error {
+            error: format!(
+                "Proxmox API returned non-JSON (HTTP {status}): {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+        })?;
+
+    if !status.is_success() {
+        return Err(VmToolOutput::Error {
+            error: format_proxmox_error(status, &value),
+        });
+    }
+    Ok(value)
+}
+
+/// Polls a Proxmox task (`UPID:…`) until it reaches a terminal state.
+async fn poll_task(
+    http_client: &Arc<dyn HttpClient>,
+    cx: &AsyncApp,
+    status_request: &ProxmoxApiRequest,
+    token_id: &str,
+    token_secret: &str,
+    base_url: &str,
+    upid: &str,
+) -> Result<serde_json::Value, VmToolOutput> {
+    for _ in 0..TASK_POLL_MAX {
+        cx.background_executor().timer(TASK_POLL_INTERVAL).await;
+        let value = call_api(
+            http_client,
+            status_request,
+            token_id,
+            token_secret,
+            base_url,
+        )
+        .await?;
+        let status = value
+            .get("data")
+            .and_then(|data| data.get("status"))
+            .and_then(|status| status.as_str())
+            .unwrap_or("unknown");
+        if status == "stopped" {
+            return Ok(value);
+        }
+    }
+    Err(VmToolOutput::Error {
+        error: format!(
+            "task {upid} did not reach a terminal state within {}s; poll it again with `tasks`",
+            TASK_POLL_MAX * TASK_POLL_INTERVAL.as_millis() as usize / 1000
+        ),
+    })
+}
+
+fn format_proxmox_error(status: StatusCode, value: &serde_json::Value) -> String {
+    let detail = value
+        .get("errors")
+        .map(|errors| errors.to_string())
+        .unwrap_or_else(|| value.to_string());
+    format!("Proxmox API error (HTTP {}): {detail}", status.as_u16())
+}

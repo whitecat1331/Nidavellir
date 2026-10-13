@@ -1288,6 +1288,7 @@
           "search_web": true,
           "terminal": true,
           "container": true,
+          "vm": true,
         },
       },
       "write": {
@@ -1360,6 +1361,7 @@
           "spawn_agent": true,
           "terminal": true,
           "container": true,
+          "vm": true,
           "search_web": true,
         },
       },
@@ -1398,6 +1400,7 @@
           "spawn_agent": true,
           "terminal": true,
           "container": true,
+          "vm": true,
           "search_web": true,
         },
       },

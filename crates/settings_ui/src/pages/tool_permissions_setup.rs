@@ -1416,6 +1416,7 @@ mod tests {
             // Self-contained confirm gate: mutating ops require confirm:true in the
             // tool input, not a settings-driven permission rule.
             "container",
+            "vm",
             "diagnostics",
             "find_path",
             "find_references",
