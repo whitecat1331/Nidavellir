@@ -56,6 +56,16 @@ impl ReqwestClient {
             .into()
     }
 
+    /// Builds a client that trusts *only* the PEM-encoded certificates in
+    /// `ca_pem`, for pinning a service's self-signed certificate without ever
+    /// disabling TLS verification.
+    pub fn pinned(ca_pem: &[u8]) -> anyhow::Result<Self> {
+        let client = Self::builder(None)
+            .use_preconfigured_tls(http_client_tls::pinned_tls_config(ca_pem)?)
+            .build()?;
+        Ok(client.into())
+    }
+
     pub fn user_agent(agent: &str) -> anyhow::Result<Self> {
         let mut map = HeaderMap::new();
         map.insert(http::header::USER_AGENT, HeaderValue::from_str(agent)?);

@@ -1,8 +1,8 @@
 mod apply_code_action_tool;
 mod ask_user_tool;
 mod browser_tool;
-mod context_server_registry;
 mod container_tool;
+mod context_server_registry;
 mod copy_path_tool;
 mod create_directory_tool;
 mod create_thread_tool;
@@ -32,6 +32,7 @@ mod symbol_locator;
 mod terminal_tool;
 mod thread_search_tool;
 mod tool_permissions;
+mod vm_tool;
 mod wait_for_report_tool;
 mod web_search_tool;
 mod window_control_tool;
@@ -81,8 +82,8 @@ where
 pub use apply_code_action_tool::*;
 pub use ask_user_tool::*;
 pub use browser_tool::*;
-pub use context_server_registry::*;
 pub use container_tool::*;
+pub use context_server_registry::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
 pub use create_thread_tool::*;
@@ -110,6 +111,7 @@ pub use symbol_locator::*;
 pub use terminal_tool::*;
 pub use thread_search_tool::*;
 pub use tool_permissions::*;
+pub use vm_tool::*;
 pub use wait_for_report_tool::*;
 pub use web_search_tool::*;
 pub use window_control_tool::*;
@@ -239,6 +241,7 @@ tools! {
     SpawnAgentTool,
     TerminalTool,
     ThreadSearchTool,
+    VmTool,
     WaitForReportTool,
     WebSearchTool,
     WindowControlTool,
@@ -304,12 +307,14 @@ mod tests {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(ContainerTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(VmTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
             let expected = *name != FetchTool::NAME
                 && *name != TerminalTool::NAME
-                && *name != ContainerTool::NAME;
+                && *name != ContainerTool::NAME
+                && *name != VmTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

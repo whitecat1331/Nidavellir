@@ -1,12 +1,13 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContainerTool, ContextServerRegistry,
-    CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DebuggerTool,
-    DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
-    GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
-    MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot, ReadFileTool, RenameTool,
-    SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ThreadSearchTool, ToolPermissionDecision, WaitForReportTool, WebSearchTool, WindowControlTool,
-    WriteFileTool, decide_permission_from_settings,
+    ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContainerTool,
+    ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel,
+    DbThread, DebuggerTool, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
+    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
+    ListDirectoryTool, MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot,
+    ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate,
+    Template, Templates, TerminalTool, ThreadSearchTool, ToolPermissionDecision, VmTool,
+    WaitForReportTool, WebSearchTool, WindowControlTool, WriteFileTool,
+    decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -2382,6 +2383,8 @@ impl Thread {
         self.add_tool(WaitForReportTool::new(self.project.clone()));
 
         self.add_tool(ContainerTool);
+
+        self.add_tool(VmTool);
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -6030,7 +6033,9 @@ async fn collect_summary_text(
         // until the pass-level timeout fires.
         let next_event = stream.next();
         futures::pin_mut!(next_event);
-        let idle_timer = cx.background_executor().timer(MAP_REDUCE_STREAM_IDLE_TIMEOUT);
+        let idle_timer = cx
+            .background_executor()
+            .timer(MAP_REDUCE_STREAM_IDLE_TIMEOUT);
         match futures::future::select(next_event, idle_timer).await {
             futures::future::Either::Left((event, _idle_timer)) => {
                 let Some(event) = event else {
@@ -9558,9 +9563,8 @@ mod tests {
             Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
         >()
         .boxed();
-        let task = cx.spawn(async move |cx| {
-            collect_summary_text(Ok(stalled), "test stream", &cx).await
-        });
+        let task =
+            cx.spawn(async move |cx| collect_summary_text(Ok(stalled), "test stream", &cx).await);
         cx.run_until_parked();
         cx.executor()
             .advance_clock(MAP_REDUCE_STREAM_IDLE_TIMEOUT + Duration::from_secs(1));

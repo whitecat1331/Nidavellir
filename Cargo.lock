@@ -8323,8 +8323,10 @@ dependencies = [
 name = "http_client_tls"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "log",
  "rustls",
+ "rustls-pemfile 2.2.0",
  "rustls-platform-verifier",
  "webpki-roots 1.0.8",
 ]
