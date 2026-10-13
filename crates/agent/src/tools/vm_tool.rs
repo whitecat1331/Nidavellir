@@ -473,9 +473,13 @@ async fn call_api(
         .await
         .map_err(|error| VmToolOutput::Error {
             error: format!(
-                "Proxmox API request to {full_url} failed: {error}. \
-                 The node control plane may be down — use `transport: \"ssh\"` for \
-                 out-of-band recovery. This tool never fails over automatically."
+                "Proxmox API request to {full_url} failed: {}. \
+                 (Timeout/unreachable => network or VPN down — check `tailscale status`; \
+                 certificate/UnknownIssuer => TLS pinning or CA mismatch; \
+                 connection refused => node up but its control plane is down.) \
+                 Use `transport: \"ssh\"` for out-of-band recovery. This tool \
+                 never fails over automatically.",
+                error.root_cause()
             ),
         })?;
 
