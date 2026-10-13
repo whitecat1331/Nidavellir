@@ -6,6 +6,7 @@ mod memory;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
+mod proxmox;
 mod sandboxing;
 mod templates;
 #[cfg(test)]
@@ -14,6 +15,7 @@ mod thread;
 mod thread_store;
 mod tool_permissions;
 mod tools;
+mod vms;
 mod window_control;
 
 use context_server::ContextServerId;
