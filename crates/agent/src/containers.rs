@@ -31,6 +31,10 @@ pub struct ContainerTarget {
     /// Compose: the compose file, relative to `dir`. Defaults to the driver default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Compose: an env file passed via `--env-file` (e.g. a repo-root `.env`
+    /// that is not auto-loaded when the compose file lives in a subdirectory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
     /// Systemd: the unit name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
@@ -182,6 +186,9 @@ pub fn assemble_command(
             if let Some(file) = target.file.as_deref() {
                 remote.push_str(&format!(" -f {file}"));
             }
+            if let Some(env_file) = target.env_file.as_deref() {
+                remote.push_str(&format!(" --env-file {env_file}"));
+            }
             remote.push(' ');
             remote.push_str(operation.as_str());
             if let Some(service) = service {
@@ -258,6 +265,7 @@ mod tests {
             driver: ContainerDriver::Compose,
             dir: Some(dir.to_string()),
             file: None,
+            env_file: None,
             service: None,
         }
     }
@@ -269,6 +277,7 @@ mod tests {
             driver: ContainerDriver::Systemd,
             dir: None,
             file: None,
+            env_file: None,
             service: Some(service.to_string()),
         }
     }
@@ -333,6 +342,19 @@ mod tests {
         assert_eq!(
             command.args.last().map(String::as_str),
             Some("cd /opt/app && docker compose -f deploy/docker-compose.yml exec gallery bash -c ls")
+        );
+    }
+
+    #[test]
+    fn compose_env_file_is_emitted() {
+        let mut target = compose_target("/opt/app");
+        target.env_file = Some("/opt/app/.env".to_string());
+        let command =
+            assemble_command(&target, ContainerOperation::Ps, None, &[]).unwrap();
+
+        assert_eq!(
+            command.args.last().map(String::as_str),
+            Some("cd /opt/app && docker compose --env-file /opt/app/.env ps")
         );
     }
 
