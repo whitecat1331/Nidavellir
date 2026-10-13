@@ -133,6 +133,20 @@ pub fn rea_framing() -> &'static str {
      runs locally on the `rea` host."
 }
 
+/// The sub-agent overlay. A sub-agent is spawned for one task and only its
+/// final message reaches the parent, so it must execute the task and report
+/// back rather than explore, narrate, or re-derive the parent's context.
+pub fn subagent_framing() -> &'static str {
+    "## Sub-agent\n\n\
+     You are a sub-agent spawned by the Zed coding agent to complete one \
+     specific task. The user message contains that task and any context you \
+     need. Do exactly that task and report the result concisely. Your final \
+     message is all the parent agent receives, so make it a direct answer or \
+     result, not a narrative of your process. Do not explore the codebase, \
+     make changes, or re-derive the parent's work unless the task explicitly \
+     asks for it."
+}
+
 /// Handlebars helper for checking if an item is in a list
 fn contains(
     h: &handlebars::Helper,

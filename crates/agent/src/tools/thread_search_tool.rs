@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::db::truncate_at_char_boundary;
 use crate::{
@@ -20,6 +21,10 @@ const MAX_SHOW_MAX_BYTES: usize = 256 * 1024;
 const SEARCH_CONTENT_BUDGET_BYTES: usize = 64 * 1024;
 /// Preview length for each `outline` entry.
 const OUTLINE_PREVIEW_BYTES: usize = 120;
+/// Per-thread budget for the total past-thread transcript bytes a single thread
+/// may pull through `thread_search` before `show` refuses. Aligned with
+/// `MAX_SHOW_MAX_BYTES` — one maximum-size `show` page.
+const THREAD_SEARCH_READ_BUDGET_BYTES: usize = 256 * 1024;
 
 /// The operation to perform against the persisted agent thread store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -87,7 +92,69 @@ impl From<ThreadSearchToolOutput> for LanguageModelToolResultContent {
     }
 }
 
-pub struct ThreadSearchTool;
+/// Tracks how many past-thread transcript bytes this thread has already pulled
+/// through `thread_search`, refusing further `show` reads once the cap is
+/// reached so repeated deep reads cannot inflate the parent window by
+/// accumulation. Each `Thread` owns one `ThreadSearchTool`, so a sub-agent gets
+/// its own budget.
+struct ReadBudget {
+    spent: AtomicUsize,
+    cap: usize,
+}
+
+impl ReadBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            spent: AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.spent.load(Ordering::Relaxed) >= self.cap
+    }
+
+    /// Spends `bytes` against the budget, returning an actionable refusal when
+    /// the read would push this thread past its cap.
+    fn try_spend(&self, bytes: usize) -> Result<(), String> {
+        let mut current = self.spent.load(Ordering::Relaxed);
+        loop {
+            if current.saturating_add(bytes) > self.cap {
+                return Err(self.exhaustion_message());
+            }
+            match self.spent.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn exhaustion_message(&self) -> String {
+        let spent = self.spent.load(Ordering::Relaxed);
+        format!(
+            "thread_search deep-read budget exhausted ({}/{} KiB). Delegate the deep read to a `spawn_agent` sub-agent; `list`/`outline` remain available to choose a thread to hand off.",
+            spent / 1024,
+            self.cap / 1024,
+        )
+    }
+}
+
+pub struct ThreadSearchTool {
+    budget: ReadBudget,
+}
+
+impl ThreadSearchTool {
+    pub fn new() -> Self {
+        Self {
+            budget: ReadBudget::new(THREAD_SEARCH_READ_BUDGET_BYTES),
+        }
+    }
+}
 
 impl AgentTool for ThreadSearchTool {
     type Input = ThreadSearchToolInput;
@@ -135,7 +202,7 @@ impl AgentTool for ThreadSearchTool {
                     .map_err(|error| ThreadSearchToolOutput::Error {
                         error: format!("Failed to open the thread store: {error}"),
                     })?;
-            run_action(input, database.as_ref()).await
+            run_action(input, database.as_ref(), &self.budget).await
         })
     }
 }
@@ -143,6 +210,7 @@ impl AgentTool for ThreadSearchTool {
 async fn run_action(
     input: ThreadSearchToolInput,
     database: &ThreadsDatabase,
+    budget: &ReadBudget,
 ) -> Result<ThreadSearchToolOutput, ThreadSearchToolOutput> {
     let threads = database
         .list_threads()
@@ -177,7 +245,7 @@ async fn run_action(
                 ),
                 None => None,
             };
-            show_thread(&id, &threads, database, max_bytes, input.offset).await
+            show_thread(&id, &threads, database, max_bytes, input.offset, budget).await
         }
         ThreadSearchAction::Outline => {
             let id = input.id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
@@ -265,7 +333,14 @@ async fn show_thread(
     database: &ThreadsDatabase,
     max_bytes: Option<usize>,
     offset: Option<usize>,
+    budget: &ReadBudget,
 ) -> Result<ThreadSearchToolOutput, ThreadSearchToolOutput> {
+    if budget.is_exhausted() {
+        return Err(ThreadSearchToolOutput::Error {
+            error: budget.exhaustion_message(),
+        });
+    }
+
     let metadata =
         resolve_thread(id, threads).map_err(|error| ThreadSearchToolOutput::Error { error })?;
 
@@ -296,6 +371,10 @@ async fn show_thread(
             ),
         });
     }
+
+    budget
+        .try_spend(shown.len())
+        .map_err(|error| ThreadSearchToolOutput::Error { error })?;
 
     let mut message = shown.to_string();
     if truncated {
@@ -452,6 +531,7 @@ mod tests {
     use acp_thread::ClientUserMessageId;
     use chrono::{DateTime, TimeZone, Utc};
     use collections::HashMap;
+    use std::sync::atomic::Ordering;
     use util::path_list::PathList;
 
     fn session_id(value: &str) -> acp::SessionId {
@@ -499,6 +579,18 @@ mod tests {
             folder_paths: PathList::default(),
             workspace_id: None,
         }
+    }
+
+    /// Test convenience: `run_action` with a fresh full-size budget, so the
+    /// existing round-trip tests exercise the default path without threading a
+    /// budget at every call site. Budget-specific behavior is covered by the
+    /// dedicated tests at the bottom of this module.
+    async fn run_action(
+        input: ThreadSearchToolInput,
+        database: &ThreadsDatabase,
+    ) -> Result<ThreadSearchToolOutput, ThreadSearchToolOutput> {
+        let budget = ReadBudget::new(THREAD_SEARCH_READ_BUDGET_BYTES);
+        super::run_action(input, database, &budget).await
     }
 
     #[test]
@@ -951,5 +1043,117 @@ mod tests {
             message.contains("No threads matched"),
             "a term beyond the 64 KiB content budget should not match, got: {message}"
         );
+    }
+
+    #[test]
+    fn read_budget_allows_under_cap_and_refuses_over_cap() {
+        let budget = ReadBudget::new(1024);
+        assert!(budget.try_spend(1024).is_ok());
+        assert!(budget.is_exhausted());
+        let error = budget.try_spend(1).unwrap_err();
+        assert!(error.contains("thread_search deep-read budget exhausted"));
+        assert!(error.contains("spawn_agent"));
+    }
+
+    #[test]
+    fn fresh_tool_instance_starts_at_zero() {
+        let tool = ThreadSearchTool::new();
+        assert_eq!(tool.budget.spent.load(Ordering::Relaxed), 0);
+    }
+
+    #[gpui::test]
+    async fn show_refuses_once_budget_is_spent(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let mut thread = make_thread("Big", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
+        thread.messages.push(user_message(&"a".repeat(64 * 1024)));
+        database
+            .save_thread(session_id("thread-big"), thread, PathList::default(), None)
+            .await
+            .unwrap();
+
+        // A budget smaller than one default `show` page refuses the read.
+        let budget = ReadBudget::new(1024);
+        let result = super::run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-big".to_string()),
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+            &budget,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ThreadSearchToolOutput::Error { error })
+                if error.contains("thread_search deep-read budget exhausted")
+                    && error.contains("spawn_agent")
+        ));
+    }
+
+    #[gpui::test]
+    async fn list_and_outline_still_work_when_budget_spent(cx: &mut gpui::TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let mut thread = make_thread("T", Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
+        thread.messages.push(user_message("hello"));
+        database
+            .save_thread(session_id("thread-t"), thread, PathList::default(), None)
+            .await
+            .unwrap();
+
+        // An exhausted budget leaves the cheap navigation ops available.
+        let budget = ReadBudget::new(0);
+
+        let list = super::run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::List,
+                query: None,
+                id: None,
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(list, ThreadSearchToolOutput::Success { .. }));
+
+        let outline = super::run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Outline,
+                query: None,
+                id: Some("thread-t".to_string()),
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outline, ThreadSearchToolOutput::Success { .. }));
+
+        let show = super::run_action(
+            ThreadSearchToolInput {
+                action: ThreadSearchAction::Show,
+                query: None,
+                id: Some("thread-t".to_string()),
+                max_bytes: None,
+                offset: None,
+            },
+            &database,
+            &budget,
+        )
+        .await;
+        assert!(matches!(
+            show,
+            Err(ThreadSearchToolOutput::Error { error })
+                if error.contains("thread_search deep-read budget exhausted")
+        ));
     }
 }

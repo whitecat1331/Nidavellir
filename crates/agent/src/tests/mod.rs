@@ -7351,7 +7351,28 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
             .build_completion_request(CompletionIntent::UserPrompt, cx)
             .unwrap();
         assert_eq!(request.intent, Some(CompletionIntent::Subagent));
+        let subagent_system_prompt = request.messages[0].string_contents();
+        assert!(
+            subagent_system_prompt.contains("## Sub-agent"),
+            "sub-agent system prompt should carry sub-agent framing, got: {subagent_system_prompt}"
+        );
+        assert!(
+            subagent_system_prompt.contains("report the result"),
+            "sub-agent framing should instruct reporting back, got: {subagent_system_prompt}"
+        );
     });
+
+    let parent_request = parent_thread
+        .read_with(cx, |parent, cx| {
+            parent.build_completion_request(CompletionIntent::UserPrompt, cx)
+        })
+        .unwrap();
+    assert!(
+        !parent_request.messages[0]
+            .string_contents()
+            .contains("## Sub-agent"),
+        "parent system prompt should not carry sub-agent framing"
+    );
 }
 
 #[gpui::test]
