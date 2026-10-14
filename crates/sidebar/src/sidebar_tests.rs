@@ -15325,7 +15325,7 @@ async fn test_neighbor_selection_skips_archived_threads(cx: &mut TestAppContext)
                 Some(acp::SessionId::new(Arc::from("last"))),
                 "neighbor selection must skip archived threads"
             ),
-            other => panic!("expected a thread neighbor, got {other:?}"),
+            _ => panic!("expected a thread neighbor"),
         }
 
         // `activate_entry` must refuse an archived entry outright.
