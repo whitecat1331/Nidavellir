@@ -437,6 +437,22 @@ impl RenameTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoveredEntry {
+    Thread(ThreadId),
+    Terminal(TerminalId),
+}
+
+impl HoveredEntry {
+    fn from_list_entry(entry: &ListEntry) -> Option<Self> {
+        match entry {
+            ListEntry::Thread(thread) => Some(Self::Thread(thread.metadata.thread_id)),
+            ListEntry::Terminal(terminal) => Some(Self::Terminal(terminal.metadata.terminal_id)),
+            ListEntry::ProjectHeader { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ActivatableEntry {
     Thread {
@@ -451,9 +467,14 @@ enum ActivatableEntry {
 impl ActivatableEntry {
     fn from_list_entry(entry: &ListEntry) -> Option<Self> {
         match entry {
-            ListEntry::Thread(thread) => Some(Self::Thread {
-                metadata: thread.metadata.clone(),
-            }),
+            ListEntry::Thread(thread) => {
+                if thread.metadata.archived {
+                    return None;
+                }
+                Some(Self::Thread {
+                    metadata: thread.metadata.clone(),
+                })
+            }
             ListEntry::Terminal(terminal) => Some(Self::Terminal {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
@@ -2084,7 +2105,24 @@ impl Sidebar {
         let previous_shapes: Vec<EntryShape> =
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
+        // Capture the hovered entry's identity before rebuilding, then remap it
+        // to its (possibly shifted) index afterward. Clearing unconditionally
+        // would make the hover action buttons flicker off on every rebuild even
+        // while the cursor is still over the row.
+        let hovered_entry = self
+            .hovered_thread_index
+            .and_then(|ix| self.contents.entries.get(ix))
+            .and_then(HoveredEntry::from_list_entry);
+
         self.rebuild_contents(cx);
+
+        let hovered_index = hovered_entry.and_then(|hovered| {
+            self.contents
+                .entries
+                .iter()
+                .position(|entry| HoveredEntry::from_list_entry(entry) == Some(hovered))
+        });
+        self.hovered_thread_index = hovered_index;
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -4578,6 +4616,17 @@ impl Sidebar {
     ) -> bool {
         match entry {
             ActivatableEntry::Thread { metadata, .. } => {
+                // Never re-activate an archived thread: the neighbor list can
+                // be a stale snapshot, so guard against both the snapshot flag
+                // and the live store flag.
+                if metadata.archived
+                    || ThreadMetadataStore::global(cx)
+                        .read(cx)
+                        .entry(metadata.thread_id)
+                        .is_some_and(|m| m.archived)
+                {
+                    return false;
+                }
                 let Some(workspace) = self.multi_workspace.upgrade().and_then(|multi_workspace| {
                     multi_workspace
                         .read(cx)
@@ -4591,6 +4640,7 @@ impl Sidebar {
                     session_id: metadata.session_id.clone(),
                     workspace: workspace.clone(),
                 });
+                self.pending_thread_activation = Some(metadata.thread_id);
                 self.activate_workspace(&workspace, window, cx);
                 Self::load_agent_thread_in_workspace(&workspace, metadata, true, window, cx);
                 true
@@ -5505,13 +5555,6 @@ impl Sidebar {
             })
             .unwrap_or_default();
 
-        let current_pos = self.contents.entries.iter().position(|entry| match entry {
-            ListEntry::Thread(thread) => thread.metadata.thread_id == thread_id,
-            _ => false,
-        });
-        let neighbor =
-            current_pos.and_then(|position| self.neighboring_activatable_entry(position));
-
         // Check if archiving this thread would leave its worktree workspace
         // with no threads, requiring workspace removal.
         let workspace_to_remove = thread_folder_paths.as_ref().and_then(|folder_paths| {
@@ -5565,7 +5608,6 @@ impl Sidebar {
                 let in_flight = this.start_archive_worktree_task(thread_id, roots_to_archive, cx);
                 this.archive_and_activate(
                     thread_id,
-                    neighbor.as_ref(),
                     thread_folder_paths.as_ref(),
                     thread_remote_connection.as_ref(),
                     in_flight,
@@ -5595,7 +5637,6 @@ impl Sidebar {
     fn archive_and_activate(
         &mut self,
         thread_id: ThreadId,
-        neighbor: Option<&ActivatableEntry>,
         thread_folder_paths: Option<&PathList>,
         thread_remote_connection: Option<&RemoteConnectionOptions>,
         in_flight_archive: Option<(Task<()>, async_channel::Sender<()>)>,
@@ -5605,6 +5646,24 @@ impl Sidebar {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.archive(thread_id, in_flight_archive, cx);
         });
+
+        // Compute the neighbor now, after the archive has been marked, rather
+        // than at click time. Rapid archive clicks race, and a neighbor chosen
+        // from the pre-click list can point at a thread that has since been
+        // archived. `neighboring_activatable_entry` skips archived entries and
+        // `activate_entry` re-checks the store, so this reflects the
+        // post-archive state as closely as the snapshot allows.
+        let neighbor = self
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id
+                )
+            })
+            .and_then(|position| self.neighboring_activatable_entry(position));
 
         let is_active = self
             .active_entry
@@ -5641,7 +5700,10 @@ impl Sidebar {
             return;
         }
 
-        if neighbor.is_some_and(|neighbor| self.activate_entry(neighbor, window, cx)) {
+        if neighbor
+            .as_ref()
+            .is_some_and(|neighbor| self.activate_entry(neighbor, window, cx))
+        {
             return;
         }
 

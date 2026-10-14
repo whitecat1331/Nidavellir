@@ -15269,3 +15269,141 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
         "the local workspace should have re-activated during the open"
     );
 }
+
+
+#[gpui::test]
+async fn test_neighbor_selection_skips_archived_threads(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let thread = |name: &str, archived: bool| {
+        ListEntry::Thread(Arc::new(ThreadEntry {
+            metadata: ThreadMetadata {
+                thread_id: ThreadId::new(),
+                session_id: Some(acp::SessionId::new(Arc::from(name))),
+                agent_id: AgentId::new("zed-agent"),
+                worktree_paths: WorktreePaths::default(),
+                title: Some(name.to_string().into()),
+                title_override: None,
+                updated_at: Utc::now(),
+                created_at: Some(Utc::now()),
+                interacted_at: None,
+                archived,
+                remote_connection: None,
+                workspace_id: None,
+            },
+            icon: IconName::ZedAgent,
+            icon_from_external_svg: None,
+            status: AgentThreadStatus::Completed,
+            workspace: ThreadEntryWorkspace::Open(workspace.clone()),
+            is_live: false,
+            is_background: false,
+            is_title_generating: false,
+            draft: None,
+            highlight_positions: Vec::new(),
+            worktrees: Vec::new(),
+            diff_stats: DiffStats::default(),
+        }))
+    };
+
+    sidebar.update_in(cx, |s, window, cx| {
+        s.contents.entries = vec![
+            thread("first", false),
+            thread("archived-middle", true),
+            thread("last", false),
+        ];
+
+        // Archiving "first" must skip the already-archived "archived-middle"
+        // entry and land on "last" instead of re-opening an archived thread.
+        let neighbor = s.neighboring_activatable_entry(0);
+        match neighbor {
+            Some(ActivatableEntry::Thread { metadata, .. }) => assert_eq!(
+                metadata.session_id,
+                Some(acp::SessionId::new(Arc::from("last"))),
+                "neighbor selection must skip archived threads"
+            ),
+            _ => panic!("expected a thread neighbor"),
+        }
+
+        // `activate_entry` must refuse an archived entry outright.
+        let archived_entry = ActivatableEntry::Thread {
+            metadata: ThreadMetadata {
+                thread_id: ThreadId::new(),
+                session_id: Some(acp::SessionId::new(Arc::from("archived"))),
+                agent_id: AgentId::new("zed-agent"),
+                worktree_paths: WorktreePaths::default(),
+                title: Some("archived".into()),
+                title_override: None,
+                updated_at: Utc::now(),
+                created_at: Some(Utc::now()),
+                interacted_at: None,
+                archived: true,
+                remote_connection: None,
+                workspace_id: None,
+            },
+        };
+        assert!(
+            !s.activate_entry(&archived_entry, window, cx),
+            "activate_entry must refuse to activate an archived thread"
+        );
+    });
+}
+
+
+#[gpui::test]
+async fn test_hover_survives_rebuild(cx: &mut TestAppContext) {
+    // Regression test: `update_entries` used to unconditionally clear
+    // `hovered_thread_index`, which made the hover-only action buttons
+    // (rename/archive) flicker off on every rebuild while the cursor was still
+    // over the row. It must remap the hover to the same thread instead.
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_n_test_threads(2, &project, cx).await;
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let hovered_thread_id = sidebar.read_with(cx, |sidebar, _app| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
+                _ => None,
+            })
+            .expect("expected at least one thread entry after rebuild")
+    });
+
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        let ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(t) if t.metadata.thread_id == hovered_thread_id)
+            })
+            .expect("hovered thread should be present in contents");
+        sidebar.hovered_thread_index = Some(ix);
+    });
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _app| {
+        let hovered_ix = sidebar
+            .hovered_thread_index
+            .expect("hover should survive a rebuild, not be cleared");
+        match &sidebar.contents.entries[hovered_ix] {
+            ListEntry::Thread(thread) => assert_eq!(thread.metadata.thread_id, hovered_thread_id),
+            _ => panic!("hovered index should point at a thread entry"),
+        }
+    });
+}
