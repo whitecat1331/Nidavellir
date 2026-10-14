@@ -15351,3 +15351,59 @@ async fn test_neighbor_selection_skips_archived_threads(cx: &mut TestAppContext)
         );
     });
 }
+
+
+#[gpui::test]
+async fn test_hover_survives_rebuild(cx: &mut TestAppContext) {
+    // Regression test: `update_entries` used to unconditionally clear
+    // `hovered_thread_index`, which made the hover-only action buttons
+    // (rename/archive) flicker off on every rebuild while the cursor was still
+    // over the row. It must remap the hover to the same thread instead.
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_n_test_threads(2, &project, cx).await;
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let hovered_thread_id = sidebar.read_with(cx, |sidebar, _app| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
+                _ => None,
+            })
+            .expect("expected at least one thread entry after rebuild")
+    });
+
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        let ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(t) if t.metadata.thread_id == hovered_thread_id)
+            })
+            .expect("hovered thread should be present in contents");
+        sidebar.hovered_thread_index = Some(ix);
+    });
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _app| {
+        let hovered_ix = sidebar
+            .hovered_thread_index
+            .expect("hover should survive a rebuild, not be cleared");
+        match &sidebar.contents.entries[hovered_ix] {
+            ListEntry::Thread(thread) => assert_eq!(thread.metadata.thread_id, hovered_thread_id),
+            _ => panic!("hovered index should point at a thread entry"),
+        }
+    });
+}
