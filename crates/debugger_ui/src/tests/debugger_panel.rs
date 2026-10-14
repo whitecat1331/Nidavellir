@@ -31,6 +31,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
+use task::TcpArgumentsTemplate;
 use terminal_view::terminal_panel::TerminalPanel;
 use tests::{active_debug_session_panel, init_test, init_test_workspace};
 use util::{path, rel_path::rel_path};
@@ -2690,4 +2691,84 @@ async fn test_restart_request_is_not_sent_more_than_once_until_response(
         2,
         "A second restart should be allowed after the first one completes"
     );
+}
+
+#[gpui::test]
+async fn test_restart_reresolves_adapter_binary_instead_of_reusing_stale_port(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "main.rs": "First line\nSecond line\nThird line\nFourth line",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+    // Start a session whose adapter is configured with a fixed TCP connection,
+    // so its resolved binary carries a concrete port (the shape Debugpy produces
+    // at launch time).
+    let session = start_debug_session_with(
+        &workspace,
+        cx,
+        DebugTaskDefinition {
+            adapter: "fake-adapter".into(),
+            label: "test".into(),
+            config: json!({ "request": "launch" }),
+            tcp_connection: Some(TcpArgumentsTemplate {
+                host: Some("127.0.0.1".parse().unwrap()),
+                port: Some(17),
+                timeout: None,
+            }),
+        },
+        |_| {},
+    )
+    .unwrap();
+
+    // The initial session's resolved binary carries the fixed TCP connection.
+    assert!(
+        session.update(cx, |session, _| session
+            .binary()
+            .unwrap()
+            .connection
+            .is_some()),
+        "expected the initial session to carry a TCP connection"
+    );
+
+    let dap_store = project.update(cx, |project, _| project.dap_store());
+    let session_id = session.update(cx, |session, _| session.session_id());
+
+    // Handle the session created by the manual relaunch (the default handlers
+    // are only registered for sessions observed via `intercept_debug_sessions`).
+    let _restart_intercept = project::debugger::test::intercept_debug_sessions(cx, |_| {});
+
+    // With no `supports_restart_request` capability the session emits `Restart`,
+    // which the panel handles via `handle_restart_request` (the manual relaunch
+    // path that `control restart` also takes).
+    session.update(cx, |session, cx| session.restart(None, cx));
+
+    cx.run_until_parked();
+
+    // The relaunched session must have re-resolved its adapter binary (the fake
+    // adapter returns `connection: None` when `tcp_connection` is not
+    // re-supplied) rather than reusing the old session's fixed TCP port.
+    dap_store.update(cx, |dap_store, cx| {
+        let restarted = dap_store
+            .sessions()
+            .find(|candidate| candidate.read(cx).session_id() != session_id)
+            .expect("expected a relaunched session to exist");
+
+        assert!(
+            restarted.read(cx).binary().unwrap().connection.is_none(),
+            "expected the relaunched session to re-resolve its adapter binary, not reuse the stale port"
+        );
+    });
 }
