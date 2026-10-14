@@ -437,6 +437,22 @@ impl RenameTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoveredEntry {
+    Thread(ThreadId),
+    Terminal(TerminalId),
+}
+
+impl HoveredEntry {
+    fn from_list_entry(entry: &ListEntry) -> Option<Self> {
+        match entry {
+            ListEntry::Thread(thread) => Some(Self::Thread(thread.metadata.thread_id)),
+            ListEntry::Terminal(terminal) => Some(Self::Terminal(terminal.metadata.terminal_id)),
+            ListEntry::ProjectHeader { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ActivatableEntry {
     Thread {
@@ -2089,10 +2105,24 @@ impl Sidebar {
         let previous_shapes: Vec<EntryShape> =
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
+        // Capture the hovered entry's identity before rebuilding, then remap it
+        // to its (possibly shifted) index afterward. Clearing unconditionally
+        // would make the hover action buttons flicker off on every rebuild even
+        // while the cursor is still over the row.
+        let hovered_entry = self
+            .hovered_thread_index
+            .and_then(|ix| self.contents.entries.get(ix))
+            .and_then(HoveredEntry::from_list_entry);
+
         self.rebuild_contents(cx);
-        // A rebuilt list shifts indices, so a stale hover index would attach to
-        // the wrong row. Clear it; the next hover event re-establishes it.
-        self.hovered_thread_index = None;
+
+        let hovered_index = hovered_entry.and_then(|hovered| {
+            self.contents
+                .entries
+                .iter()
+                .position(|entry| HoveredEntry::from_list_entry(entry) == Some(hovered))
+        });
+        self.hovered_thread_index = hovered_index;
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
