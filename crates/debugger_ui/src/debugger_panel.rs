@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::IndexMap;
-use dap::adapters::DebugAdapterName;
+use dap::adapters::{DebugAdapterName, DebugTaskDefinition};
 use dap::{DapRegistry, StartDebuggingRequestArguments};
 use dap::{client::SessionId, debugger_settings::DebuggerSettings};
 use editor::Editor;
@@ -429,6 +429,19 @@ impl DebugPanel {
         };
         let task_context = curr_session.read(cx).task_context().clone();
 
+        // Re-resolve the adapter binary on relaunch rather than reusing the
+        // running session's resolved binary. That binary carries the previous
+        // adapter process's fixed TCP port; reusing it makes the freshly
+        // spawned adapter (e.g. Debugpy) bind to a stale port the dying
+        // adapter is still holding, which surfaces as a connection reset
+        // (`os error 10054`) instead of a clean relaunch.
+        let definition = DebugTaskDefinition {
+            label: label.clone().unwrap_or_default(),
+            adapter: adapter.clone(),
+            config: binary.request_args.configuration,
+            tcp_connection: None,
+        };
+
         let curr_session_id = curr_session.read(cx).session_id();
         self.sessions_with_children
             .retain(|session, _| session.read(cx).session_id(cx) != curr_session_id);
@@ -441,10 +454,7 @@ impl DebugPanel {
 
             let (session, task) = dap_store_handle.update(cx, |dap_store, cx| {
                 let session = dap_store.new_session(label, adapter, task_context, None, quirks, cx);
-
-                let task = session.update(cx, |session, cx| {
-                    session.boot(binary, worktree, dap_store_handle.downgrade(), cx)
-                });
+                let task = dap_store.boot_session(session.clone(), definition, worktree, cx);
                 (session, task)
             });
             Self::register_session(this.clone(), session.clone(), true, cx).await?;
