@@ -451,9 +451,14 @@ enum ActivatableEntry {
 impl ActivatableEntry {
     fn from_list_entry(entry: &ListEntry) -> Option<Self> {
         match entry {
-            ListEntry::Thread(thread) => Some(Self::Thread {
-                metadata: thread.metadata.clone(),
-            }),
+            ListEntry::Thread(thread) => {
+                if thread.metadata.archived {
+                    return None;
+                }
+                Some(Self::Thread {
+                    metadata: thread.metadata.clone(),
+                })
+            }
             ListEntry::Terminal(terminal) => Some(Self::Terminal {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
@@ -4578,6 +4583,11 @@ impl Sidebar {
     ) -> bool {
         match entry {
             ActivatableEntry::Thread { metadata, .. } => {
+                // Never re-activate an archived thread: the neighbor list can
+                // be computed from a stale `contents.entries`, so guard here.
+                if metadata.archived {
+                    return false;
+                }
                 let Some(workspace) = self.multi_workspace.upgrade().and_then(|multi_workspace| {
                     multi_workspace
                         .read(cx)
@@ -4591,6 +4601,7 @@ impl Sidebar {
                     session_id: metadata.session_id.clone(),
                     workspace: workspace.clone(),
                 });
+                self.pending_thread_activation = Some(metadata.thread_id);
                 self.activate_workspace(&workspace, window, cx);
                 Self::load_agent_thread_in_workspace(&workspace, metadata, true, window, cx);
                 true
