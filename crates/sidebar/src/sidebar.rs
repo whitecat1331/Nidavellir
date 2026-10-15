@@ -2113,15 +2113,26 @@ impl Sidebar {
             .hovered_thread_index
             .and_then(|ix| self.contents.entries.get(ix))
             .and_then(HoveredEntry::from_list_entry);
+        let previous_hovered_index = self.hovered_thread_index;
 
         self.rebuild_contents(cx);
 
-        let hovered_index = hovered_entry.and_then(|hovered| {
-            self.contents
-                .entries
-                .iter()
-                .position(|entry| HoveredEntry::from_list_entry(entry) == Some(hovered))
-        });
+        // Prefer remapping by identity so the hovered row survives a rebuild that
+        // reorders entries. When the hovered entry is gone — e.g. the row was just
+        // archived and `rebuild_contents` drops archived threads — fall back to its
+        // former slot: any rows below it have shifted up into that slot, and that
+        // row is now under the stationary cursor. GPUI only re-fires `on_hover` on
+        // a pointer move, so without this the action buttons would stay hidden until
+        // the pointer moved. If the removed row was the last one, its slot no longer
+        // exists and the hover clears, as before.
+        let hovered_index = hovered_entry
+            .and_then(|hovered| {
+                self.contents
+                    .entries
+                    .iter()
+                    .position(|entry| HoveredEntry::from_list_entry(entry) == Some(hovered))
+            })
+            .or_else(|| previous_hovered_index.filter(|&ix| ix < self.contents.entries.len()));
         self.hovered_thread_index = hovered_index;
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
