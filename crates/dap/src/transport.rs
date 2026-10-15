@@ -403,64 +403,75 @@ impl TransportDelegate {
     where
         Stdout: AsyncRead + Unpin + Send + 'static,
     {
-        let mut content_length = None;
         loop {
-            buffer.clear();
-            match reader.read_line(buffer).await {
-                Ok(0) => return ConnectionResult::ConnectionReset,
-                Ok(_) => {}
-                Err(e) => return ConnectionResult::Result(Err(e.into())),
-            };
+            let mut content_length = None;
+            loop {
+                buffer.clear();
+                match reader.read_line(buffer).await {
+                    Ok(0) => return ConnectionResult::ConnectionReset,
+                    Ok(_) => {}
+                    Err(e) => return ConnectionResult::Result(Err(e.into())),
+                };
 
-            if buffer == "\r\n" {
-                break;
+                if buffer == "\r\n" {
+                    break;
+                }
+
+                if let Some(("Content-Length", value)) = buffer.trim().split_once(": ") {
+                    match value.parse().context("invalid content length") {
+                        Ok(length) => content_length = Some(length),
+                        Err(e) => return ConnectionResult::Result(Err(e)),
+                    }
+                }
             }
 
-            if let Some(("Content-Length", value)) = buffer.trim().split_once(": ") {
-                match value.parse().context("invalid content length") {
-                    Ok(length) => content_length = Some(length),
+            let content_length = match content_length.context("missing content length") {
+                Ok(length) => length,
+                Err(e) => return ConnectionResult::Result(Err(e)),
+            };
+
+            let mut content = vec![0; content_length];
+            if let Err(e) = reader
+                .read_exact(&mut content)
+                .await
+                .with_context(|| "reading after a loop")
+            {
+                return ConnectionResult::Result(Err(e));
+            }
+
+            let message_str =
+                match std::str::from_utf8(&content).context("invalid utf8 from server") {
+                    Ok(str) => str,
                     Err(e) => return ConnectionResult::Result(Err(e)),
+                };
+
+            // Some adapters (e.g. CodeLLDB) occasionally emit an empty or
+            // whitespace-only message; skip it instead of failing the whole
+            // session, which would otherwise kill the connection.
+            if message_str.trim().is_empty() {
+                log::warn!("skipping empty DAP message from adapter");
+                continue;
+            }
+
+            let message =
+                serde_json::from_str::<Message>(message_str).context("deserializing server message");
+
+            if let Some(log_handlers) = log_handlers {
+                let command = match &message {
+                    Ok(Message::Request(request)) => Some(request.command.as_str()),
+                    Ok(Message::Response(response)) => Some(response.command.as_str()),
+                    _ => None,
+                };
+
+                for (kind, log_handler) in log_handlers.lock().iter_mut() {
+                    if matches!(kind, LogKind::Rpc) {
+                        log_handler(IoKind::StdOut, command, message_str);
+                    }
                 }
             }
+
+            return ConnectionResult::Result(message);
         }
-
-        let content_length = match content_length.context("missing content length") {
-            Ok(length) => length,
-            Err(e) => return ConnectionResult::Result(Err(e)),
-        };
-
-        let mut content = vec![0; content_length];
-        if let Err(e) = reader
-            .read_exact(&mut content)
-            .await
-            .with_context(|| "reading after a loop")
-        {
-            return ConnectionResult::Result(Err(e));
-        }
-
-        let message_str = match std::str::from_utf8(&content).context("invalid utf8 from server") {
-            Ok(str) => str,
-            Err(e) => return ConnectionResult::Result(Err(e)),
-        };
-
-        let message =
-            serde_json::from_str::<Message>(message_str).context("deserializing server message");
-
-        if let Some(log_handlers) = log_handlers {
-            let command = match &message {
-                Ok(Message::Request(request)) => Some(request.command.as_str()),
-                Ok(Message::Response(response)) => Some(response.command.as_str()),
-                _ => None,
-            };
-
-            for (kind, log_handler) in log_handlers.lock().iter_mut() {
-                if matches!(kind, LogKind::Rpc) {
-                    log_handler(IoKind::StdOut, command, message_str);
-                }
-            }
-        }
-
-        ConnectionResult::Result(message)
     }
 
     pub fn has_adapter_logs(&self) -> bool {
@@ -1026,5 +1037,39 @@ impl Transport for FakeTransport {
     #[cfg(any(test, feature = "test-support"))]
     fn as_fake(&self) -> &FakeTransport {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportDelegate;
+    use dap_types::messages::{Events, Message};
+    use serde_json::json;
+    use smol::io::Cursor;
+    use util::ConnectionResult;
+
+    #[gpui::test]
+    async fn test_skips_empty_server_messages(_cx: &mut gpui::TestAppContext) {
+        let event = json!({"seq": 1, "type": "event", "event": "initialized", "body": {}});
+        let event_str = event.to_string();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        bytes.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{}", event_str.len(), event_str).as_bytes(),
+        );
+
+        let mut reader = smol::io::BufReader::new(Cursor::new(bytes));
+        let mut buffer = String::new();
+
+        let message =
+            TransportDelegate::receive_server_message(&mut reader, &mut buffer, None).await;
+
+        match message {
+            ConnectionResult::Result(Ok(Message::Event(event))) => {
+                assert!(matches!(*event, Events::Initialized(_)));
+            }
+            _ => panic!("expected the initialized event after skipping the empty message"),
+        }
     }
 }
