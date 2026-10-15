@@ -15270,7 +15270,6 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
     );
 }
 
-
 #[gpui::test]
 async fn test_neighbor_selection_skips_archived_threads(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
@@ -15352,7 +15351,6 @@ async fn test_neighbor_selection_skips_archived_threads(cx: &mut TestAppContext)
     });
 }
 
-
 #[gpui::test]
 async fn test_hover_survives_rebuild(cx: &mut TestAppContext) {
     // Regression test: `update_entries` used to unconditionally clear
@@ -15403,6 +15401,75 @@ async fn test_hover_survives_rebuild(cx: &mut TestAppContext) {
             .expect("hover should survive a rebuild, not be cleared");
         match &sidebar.contents.entries[hovered_ix] {
             ListEntry::Thread(thread) => assert_eq!(thread.metadata.thread_id, hovered_thread_id),
+            _ => panic!("hovered index should point at a thread entry"),
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_hover_rearms_on_row_shifted_up_by_archive(cx: &mut TestAppContext) {
+    // Regression test: archiving the hovered row removes it from
+    // `contents.entries`, so an identity-only hover remap cleared
+    // `hovered_thread_index` and the row that shifted up into the cursor's slot
+    // showed none of its hover actions until the pointer moved. `update_entries`
+    // must keep the hover on that slot.
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_n_test_threads(3, &project, cx).await;
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let (archived_thread_id, hovered_ix) = sidebar.read_with(cx, |sidebar, _app| {
+        let thread_indices: Vec<usize> = sidebar
+            .contents
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, entry)| matches!(entry, ListEntry::Thread(_)).then_some(ix))
+            .collect();
+        // Hover a thread that has another thread below it, so the removed slot
+        // is refilled by a row that shifts up.
+        let first = *thread_indices
+            .first()
+            .expect("expected at least one thread entry after rebuild");
+        assert!(
+            thread_indices.iter().any(|&ix| ix > first),
+            "test needs a thread below the hovered one"
+        );
+        let ListEntry::Thread(thread) = &sidebar.contents.entries[first] else {
+            unreachable!("thread_indices only contains thread entries")
+        };
+        (thread.metadata.thread_id, first)
+    });
+
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.hovered_thread_index = Some(hovered_ix);
+    });
+
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.archive(archived_thread_id, None, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _app| {
+        let hovered_ix = sidebar
+            .hovered_thread_index
+            .expect("hover must re-arm on the row that shifted up, not clear");
+        match &sidebar.contents.entries[hovered_ix] {
+            ListEntry::Thread(thread) => assert_ne!(
+                thread.metadata.thread_id, archived_thread_id,
+                "hover must not stay on the archived thread"
+            ),
             _ => panic!("hovered index should point at a thread entry"),
         }
     });
