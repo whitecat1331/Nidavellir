@@ -1043,6 +1043,7 @@ impl AgentBrowserApi {
         fields: Value,
     ) -> Result<Value> {
         let (client, target_session_id) = self.session_client(session_id, target_id).await?;
+        let fields = normalize_fetch_disposition_fields(method, &fields);
         let mut params = json!({ "requestId": request_id });
         if let Some(object) = fields.as_object() {
             for (key, value) in object {
@@ -1133,6 +1134,49 @@ fn resolve_target_session_id(session: &BrowserSession, target_id: Option<&str>) 
         .get(&resolved)
         .map(|target| target.session_id.clone())
         .context("unknown browser target")
+}
+
+/// Map the tool's `fulfill_request`/`continue_request` fields to the CDP
+/// `Fetch` schema: CDP expects camelCase (`responseCode`, `postData`) and header
+/// arrays (`responseHeaders`, `headers` as `[{name, value}]`), while the tool
+/// accepts snake_case names and a header object. Unknown fields pass through.
+fn normalize_fetch_disposition_fields(method: &str, fields: &Value) -> Value {
+    let Some(object) = fields.as_object() else {
+        return fields.clone();
+    };
+    let mut normalized = serde_json::Map::new();
+    for (key, value) in object {
+        let (key, value) = match (method, key.as_str()) {
+            ("Fetch.fulfillRequest", "response_code") => {
+                ("responseCode".to_string(), value.clone())
+            }
+            ("Fetch.fulfillRequest", "response_headers") => {
+                ("responseHeaders".to_string(), headers_to_cdp_array(value))
+            }
+            ("Fetch.continueRequest", "post_data") => {
+                ("postData".to_string(), value.clone())
+            }
+            ("Fetch.continueRequest", "headers") => {
+                ("headers".to_string(), headers_to_cdp_array(value))
+            }
+            _ => (key.clone(), value.clone()),
+        };
+        normalized.insert(key, value);
+    }
+    Value::Object(normalized)
+}
+
+/// Convert a header map to CDP's `[{name, value}]` array shape. An already-array
+/// value (or any non-object) passes through unchanged.
+fn headers_to_cdp_array(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Array(
+            map.iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn get_target<'a>(
@@ -1489,6 +1533,61 @@ mod control_state_tests {
         assert!(session_id_matches(&event, Some("s1")));
         assert!(!session_id_matches(&event, Some("s2")));
         assert!(session_id_matches(&event, None));
+    }
+}
+
+#[cfg(test)]
+mod fetch_disposition_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn fulfill_request_maps_snake_case_and_header_object_to_cdp() {
+        let response = json!({
+            "response_code": 200,
+            "response_headers": { "Content-Type": "application/json" },
+            "body": "eyJvayI6dHJ1ZX0="
+        });
+        let normalized = normalize_fetch_disposition_fields("Fetch.fulfillRequest", &response);
+        assert_eq!(normalized["responseCode"], json!(200));
+        assert!(normalized.get("response_code").is_none());
+        let headers = normalized["responseHeaders"]
+            .as_array()
+            .expect("responseHeaders array");
+        assert_eq!(
+            headers[0],
+            json!({ "name": "Content-Type", "value": "application/json" })
+        );
+        assert_eq!(normalized["body"], json!("eyJvayI6dHJ1ZX0="));
+    }
+
+    #[test]
+    fn continue_request_maps_post_data_and_headers_to_cdp() {
+        let modifications = json!({
+            "url": "https://example.com/new",
+            "post_data": "x=1",
+            "headers": { "X-Custom": "yes" }
+        });
+        let normalized =
+            normalize_fetch_disposition_fields("Fetch.continueRequest", &modifications);
+        assert_eq!(normalized["url"], json!("https://example.com/new"));
+        assert_eq!(normalized["postData"], json!("x=1"));
+        assert!(normalized.get("post_data").is_none());
+        let headers = normalized["headers"].as_array().expect("headers array");
+        assert_eq!(headers[0], json!({ "name": "X-Custom", "value": "yes" }));
+    }
+
+    #[test]
+    fn unknown_fields_pass_through_unchanged() {
+        let fields = json!({ "requestId": "abc", "method": "GET" });
+        let normalized = normalize_fetch_disposition_fields("Fetch.continueRequest", &fields);
+        assert_eq!(normalized, fields);
+    }
+
+    #[test]
+    fn header_array_passes_through_unchanged() {
+        let headers = json!([{ "name": "A", "value": "1" }]);
+        assert_eq!(headers_to_cdp_array(&headers), headers);
     }
 }
 
