@@ -118,7 +118,10 @@ pub fn plan_framing() -> &'static str {
      Before finalizing a plan, state which crate tags it touches (e.g. `dap`, \
      `browser_tools`), map those tags to validation suites with \
      `python zed-debugger-demo/zed-tools/loop/run-suites.py --tags <tags>`, run \
-     each returned suite, and cite the results in the plan."
+     each returned suite, and cite the results in the plan. Always load the \
+     `dev-flow` skill and follow its end-to-end route: mark the plan's \
+     `## Checklist` items as each completes (in the same edit, never in bulk), \
+     and never merge or release before every gate has actually run and passed."
 }
 
 /// The REA (reverse-engineering) overlay. Unlike plan mode (framing-only),
