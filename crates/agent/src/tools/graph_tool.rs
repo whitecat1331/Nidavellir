@@ -68,8 +68,17 @@ impl From<GraphToolOutput> for LanguageModelToolResultContent {
 
 /// The fixed dev-flow route (D6) — the `dev-flow` #1–12 stages in order.
 const ROUTE: &[&str] = &[
-    "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept", "merge",
-    "release", "complete",
+    "plan",
+    "promote",
+    "claim",
+    "fork",
+    "implement",
+    "verify",
+    "compile",
+    "accept",
+    "merge",
+    "release",
+    "complete",
 ];
 
 /// Incoming edges for each node. `merge` has exactly one: `accept`.
@@ -209,12 +218,9 @@ impl AgentTool for GraphTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.background_spawn(async move {
-            let input = input
-                .recv()
-                .await
-                .map_err(|error| GraphToolOutput::Error {
-                    error: format!("Failed to receive graph tool input: {error}"),
-                })?;
+            let input = input.recv().await.map_err(|error| GraphToolOutput::Error {
+                error: format!("Failed to receive graph tool input: {error}"),
+            })?;
             let path = PathBuf::from(&input.path);
             run_operation(input, path)
         })
