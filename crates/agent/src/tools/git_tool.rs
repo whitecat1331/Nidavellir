@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
-use gpui::{App, AsyncApp, Entity, SharedString, Task};
+use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use project::Project;
 use schemars::JsonSchema;
