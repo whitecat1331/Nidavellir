@@ -1498,11 +1498,10 @@ fn test_window_control_permission_rules_split_worktree_and_project() {
         WindowControlTool::NAME.into(),
         agent_settings::ToolRules {
             default: Some(settings::ToolPermissionMode::Confirm),
-            always_allow: vec![agent_settings::CompiledRegex::new(
-                r"^add_worktree_root\s",
-                false,
-            )
-            .expect("worktree allow regex should compile")],
+            always_allow: vec![
+                agent_settings::CompiledRegex::new(r"^add_worktree_root\s", false)
+                    .expect("worktree allow regex should compile"),
+            ],
             always_deny: vec![],
             always_confirm: vec![],
             invalid_patterns: vec![],
@@ -1540,17 +1539,15 @@ fn test_window_control_worktree_allow_can_be_overridden() {
         WindowControlTool::NAME.into(),
         agent_settings::ToolRules {
             default: Some(settings::ToolPermissionMode::Confirm),
-            always_allow: vec![agent_settings::CompiledRegex::new(
-                r"^add_worktree_root\s",
-                false,
-            )
-            .expect("worktree allow regex should compile")],
+            always_allow: vec![
+                agent_settings::CompiledRegex::new(r"^add_worktree_root\s", false)
+                    .expect("worktree allow regex should compile"),
+            ],
             always_deny: vec![],
-            always_confirm: vec![agent_settings::CompiledRegex::new(
-                r"^add_worktree_root\s",
-                false,
-            )
-            .expect("worktree confirm regex should compile")],
+            always_confirm: vec![
+                agent_settings::CompiledRegex::new(r"^add_worktree_root\s", false)
+                    .expect("worktree confirm regex should compile"),
+            ],
             invalid_patterns: vec![],
         },
     );
