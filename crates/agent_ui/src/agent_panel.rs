@@ -6322,11 +6322,9 @@ fn window_control_action(name: &str) -> Result<Box<dyn Action>> {
         "agent::FocusAgent" => Box::new(zed_actions::assistant::FocusAgent),
         "agent::CopyThreadToClipboard" => Box::new(CopyThreadToClipboard),
         "agent::LoadThreadFromClipboard" => Box::new(LoadThreadFromClipboard),
-        "agent::NewNativeAgentThreadFromTruncate" => {
-            Box::new(NewNativeAgentThreadFromTruncate {
-                from_session_id: acp::SessionId::new(""),
-            })
-        }
+        "agent::NewNativeAgentThreadFromTruncate" => Box::new(NewNativeAgentThreadFromTruncate {
+            from_session_id: acp::SessionId::new(""),
+        }),
         "agent::Chat" => Box::new(zed_actions::agent::Chat),
         "agent::TogglePlanMode" => Box::new(TogglePlanMode),
         "agent::ToggleReaMode" => Box::new(ToggleReaMode),
