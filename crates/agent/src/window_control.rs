@@ -49,6 +49,16 @@ pub enum WindowControlOperation {
     Click,
     /// Assert on a selector's visibility or text.
     Assert,
+    /// Add a git worktree as a workspace root, so the agent can reach a
+    /// `../zed-wip-<slug>` worktree it just created. Skips the interactive
+    /// folder picker. Auto-allowed by default (the agent created the worktree);
+    /// the host additionally validates that `path` resolves under the configured
+    /// worktree directory.
+    AddWorktreeRoot,
+    /// Add a non-worktree folder as a workspace root. Skips the interactive
+    /// folder picker. Prompts by default, since this exposes a new file tree to
+    /// the agent.
+    AddProjectRoot,
 }
 
 impl WindowControlOperation {
@@ -63,6 +73,8 @@ impl WindowControlOperation {
             Self::Find => "find",
             Self::Click => "click",
             Self::Assert => "assert",
+            Self::AddWorktreeRoot => "add_worktree_root",
+            Self::AddProjectRoot => "add_project_root",
         }
     }
 }
@@ -123,6 +135,11 @@ pub struct WindowControlRequest {
     /// For `assert`: the visibility the selector must currently have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_visible: Option<bool>,
+
+    /// For `add_worktree_root` / `add_project_root`: the absolute path of an
+    /// existing directory to add as a workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl WindowControlRequest {
@@ -149,6 +166,7 @@ impl Default for WindowControlRequest {
             selector: None,
             expect_text: None,
             expect_visible: None,
+            path: None,
         }
     }
 }
@@ -390,5 +408,27 @@ mod tests {
         assert_eq!(parsed.token, "deadbeef");
         assert_eq!(parsed.request.operation, WindowControlOperation::Type);
         assert!(parsed.request.submit);
+    }
+
+    #[test]
+    fn workspace_root_operations_serialize() {
+        let worktree = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::AddWorktreeRoot,
+            path: Some("/tmp/zed-wip-example".into()),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(worktree["operation"], "add_worktree_root");
+        assert_eq!(worktree["path"], "/tmp/zed-wip-example");
+        assert!(worktree.get("selector").is_none());
+
+        let project = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::AddProjectRoot,
+            path: Some("/tmp/some-project".into()),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(project["operation"], "add_project_root");
+        assert_eq!(project["path"], "/tmp/some-project");
     }
 }

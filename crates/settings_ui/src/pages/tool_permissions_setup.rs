@@ -75,6 +75,12 @@ const TOOLS: &[ToolInfo] = &[
         regex_explanation: "Patterns are matched against debugger operation details such as full `start_session` config/build/tcp_connection values, breakpoint paths/lines/conditions/log messages, `run_to_line` source paths/lines, session ids, and thread ids. Read-only debugger inspections do not request permission.",
     },
     ToolInfo {
+        id: "window_control",
+        name: "Window Control",
+        description: "Adding folders as workspace roots",
+        regex_explanation: "Patterns are matched against `add_worktree_root path:<path>` and `add_project_root path:<path>`. Only the two root-add operations request permission; the read/control operations do not.",
+    },
+    ToolInfo {
         id: "search_web",
         name: "Web Search",
         description: "Web search queries",
@@ -1432,8 +1438,6 @@ mod tests {
             "thread_search",
             // Read-only report-file polling; no project or command access.
             "wait_for_report",
-            // Dev-channel-only UI driver; does not call decide_permission_from_settings.
-            "window_control",
             "open",
             "read_file",
             "rename_symbol",

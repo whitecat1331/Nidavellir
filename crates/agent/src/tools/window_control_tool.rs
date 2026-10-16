@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{
-    AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput, WindowControlOperation,
-    WindowControlRequest,
+    AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput, ToolPermissionContext,
+    WindowControlOperation, WindowControlRequest,
 };
 
 /// Drive the Zed UI by command: read structured state and dispatch
@@ -99,7 +99,7 @@ impl AgentTool for WindowControlTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
@@ -112,6 +112,22 @@ impl AgentTool for WindowControlTool {
                 })?;
 
             let operation = request.operation.label().to_string();
+
+            // The two root-add operations mutate workspace membership, so they
+            // are settings-permission-gated; the read/control operations stay
+            // dev-channel gated only.
+            if matches!(
+                request.operation,
+                WindowControlOperation::AddWorktreeRoot | WindowControlOperation::AddProjectRoot
+            ) {
+                authorize_workspace_root_operation(&event_stream, &request, cx)
+                    .await
+                    .map_err(|error| WindowControlToolOutput::Error {
+                        operation: operation.clone(),
+                        error: error.to_string(),
+                    })?;
+            }
+
             match self.environment.window_control(request, cx).await {
                 Ok(data) => Ok(WindowControlToolOutput::Success {
                     operation,
@@ -125,4 +141,29 @@ impl AgentTool for WindowControlTool {
             }
         })
     }
+}
+
+/// Authorize a workspace-root add through the settings permission system.
+///
+/// The permission string encodes the operation name, so the user can target
+/// worktree vs. project adds independently (`always_allow`/`always_confirm`/
+/// `always_deny` patterns on the `add_worktree_root` / `add_project_root`
+/// prefix). Mirrors `debugger_tool.rs::authorize_debugger_operation`.
+async fn authorize_workspace_root_operation(
+    event_stream: &ToolCallEventStream,
+    request: &WindowControlRequest,
+    cx: &mut gpui::AsyncApp,
+) -> Result<()> {
+    let operation = request.operation.label();
+    let path = request.path.as_deref().unwrap_or_default();
+    let input = format!("{operation} path:{path}");
+    let title = format!("Window control: {operation}");
+    let task = cx.update(|cx| {
+        event_stream.authorize(
+            title,
+            ToolPermissionContext::new(WindowControlTool::NAME, vec![input]),
+            cx,
+        )
+    });
+    task.await
 }
