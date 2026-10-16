@@ -5839,12 +5839,13 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
             let panel = panel
                 .upgrade()
                 .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
-            // `add_workspace_root` mutates the worktree set and must await the open
-            // to report the resulting roots, so it is handled here rather than in
-            // the synchronous `window_control_dispatch`.
+            // The two root-add operations mutate the worktree set and must await
+            // the open to report the resulting roots, so they are handled here
+            // rather than in the synchronous `window_control_dispatch`.
             if matches!(
                 request.operation,
-                agent::WindowControlOperation::AddWorkspaceRoot
+                agent::WindowControlOperation::AddWorktreeRoot
+                    | agent::WindowControlOperation::AddProjectRoot
             ) {
                 return window_control_add_workspace_root(&panel, request, window, cx).await;
             }
@@ -5861,28 +5862,61 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
 /// a managed workspace, then add the root to the live worktree set — but takes
 /// the path directly instead of opening the interactive folder picker. Runs
 /// outside any panel update, like every other mutating `window_control` op.
+///
+/// The two operations differ only in validation: `add_worktree_root` is
+/// auto-allowed, so it is constrained to directories whose name matches the
+/// configured worktree prefix (default `zed-wip-`); `add_project_root` accepts
+/// any existing directory.
 async fn window_control_add_workspace_root(
     panel: &Entity<AgentPanel>,
     request: agent::WindowControlRequest,
     window: gpui::AnyWindowHandle,
     cx: &mut gpui::AsyncApp,
 ) -> Result<serde_json::Value> {
+    let operation = request.operation.label();
+    let is_worktree = matches!(
+        request.operation,
+        agent::WindowControlOperation::AddWorktreeRoot
+    );
     let path = request
         .path
         .clone()
-        .ok_or_else(|| anyhow!("`add_workspace_root` requires `path`"))?;
+        .ok_or_else(|| anyhow!("`{operation}` requires `path`"))?;
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         bail!(
-            "`add_workspace_root` requires an absolute path, got `{}`",
+            "`{operation}` requires an absolute path, got `{}`",
             path.display()
         );
     }
     if !path.is_dir() {
         bail!(
-            "`add_workspace_root` path is not an existing directory: `{}`",
+            "`{operation}` path is not an existing directory: `{}`",
             path.display()
         );
+    }
+
+    // `add_worktree_root` is auto-allowed, so constrain it to directories whose
+    // name matches the configured worktree prefix — otherwise the agent could
+    // smuggle an arbitrary folder through the auto-allowed path.
+    if is_worktree {
+        let pattern = window.update(cx, |_root, _window, cx| {
+            AgentSettings::get_global(cx).worktree_root_pattern.clone()
+        })?;
+        let pattern = pattern.as_deref().unwrap_or("zed-wip-");
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name_lower = name.to_lowercase();
+        let pattern_lower = pattern.to_lowercase();
+        if pattern.is_empty() || !name_lower.starts_with(pattern_lower.as_str()) {
+            bail!(
+                "`add_worktree_root` path `{}` does not match the worktree prefix \
+                 `{pattern}`; use `add_project_root` for non-worktree folders",
+                path.display()
+            );
+        }
     }
 
     let workspace = panel
@@ -5890,8 +5924,8 @@ async fn window_control_add_workspace_root(
         .ok_or_else(|| anyhow!("No workspace is available"))?;
 
     // Read the state and start the open inside a window update (which yields a
-    // `&mut App`), then await the open outside it: `add_workspace_root` is the
-    // only op that must await the worktree open to report the resulting roots.
+    // `&mut App`), then await the open outside it: the root-add ops are the only
+    // ops that must await the worktree open to report the resulting roots.
     let (already_root, managed_workspace_id, opened): (
         bool,
         Option<workspace::workspace_manager::ManagedWorkspaceId>,
@@ -6220,10 +6254,11 @@ pub(crate) fn window_control_dispatch(
                 window_control_assert(panel, &selector, &request, window, cx)
             })
         }
-        Operation::AddWorkspaceRoot => {
+        Operation::AddWorktreeRoot | Operation::AddProjectRoot => {
             // Handled by the host, which can await the worktree open
             // (`window_control_add_workspace_root`); this dispatch is synchronous.
-            bail!("`add_workspace_root` is handled by the window-control host")
+            let label = request.operation.label();
+            bail!("`{label}` is handled by the window-control host")
         }
     }
 }

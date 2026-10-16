@@ -1215,6 +1215,14 @@
       // The per-tool "default" also applies to MCP tools.
       // Each tool can have its own default and regex patterns.
       "tools": {
+        "window_control": {
+          // Worktree adds auto-allow (the agent created the worktree); project
+          // adds fall through to `default: confirm` and prompt.
+          "default": "confirm",
+          "always_allow": [
+            { "pattern": "^add_worktree_root\\s" },
+          ],
+        },
         // "terminal": {
         //   "default": "confirm",
         //   "always_confirm": [
