@@ -1602,7 +1602,15 @@ fn process_content(
     content
 }
 
-fn working_dir(cd: &str, project: &Entity<Project>, cx: &mut App) -> Result<Option<PathBuf>> {
+/// Resolves a `cd` argument to an absolute project directory: `"."` or an
+/// empty string selects the single project root; otherwise a root name or an
+/// absolute path into a root. Shared with the `git` tool, which runs git in
+/// the resolved directory.
+pub(crate) fn working_dir(
+    cd: &str,
+    project: &Entity<Project>,
+    cx: &mut App,
+) -> Result<Option<PathBuf>> {
     let project = project.read(cx);
 
     if cd == "." || cd.is_empty() {

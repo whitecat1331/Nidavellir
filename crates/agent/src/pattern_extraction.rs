@@ -90,6 +90,31 @@ pub fn extract_terminal_pattern_display(command: &str) -> Option<String> {
     Some(prefix.display)
 }
 
+/// Extracts the per-operation "always" pattern for the `git` tool.
+///
+/// Git permission inputs are canonical
+/// `operation:<verb> [ref:<ref>] [remote:<remote>] [tag:<tag>] protected:<bool>`
+/// strings; the natural "always allow/deny" granularity is a single operation,
+/// so the pattern keys on the verb.
+pub fn extract_git_pattern(input: &str) -> Option<String> {
+    let verb = git_operation_verb(input)?;
+    Some(format!("^operation:{}\\b", escape_for_pattern(verb)))
+}
+
+/// The human-readable companion to [`extract_git_pattern`].
+pub fn extract_git_pattern_display(input: &str) -> Option<String> {
+    let verb = git_operation_verb(input)?;
+    Some(format!("operation:{verb}"))
+}
+
+fn git_operation_verb(input: &str) -> Option<&str> {
+    let verb = input
+        .strip_prefix("operation:")?
+        .split_whitespace()
+        .next()?;
+    (!verb.is_empty()).then_some(verb)
+}
+
 /// Extracts patterns for ALL commands in a pipeline, not just the first one.
 ///
 /// For a command like `"cargo test 2>&1 | tail"`, this returns patterns for

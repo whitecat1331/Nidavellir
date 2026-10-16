@@ -1223,6 +1223,16 @@
             { "pattern": "^add_worktree_root\\s" },
           ],
         },
+        "git": {
+          // Each git operation prompts on first use; "Always for
+          // `operation:<verb>`" adds an `always_allow` pattern that sticks.
+          // `always_confirm` outranks `always_allow`, so protected refs
+          // (feature, dev, main) keep prompting.
+          "default": "confirm",
+          "always_confirm": [
+            { "pattern": "\\bprotected:true\\b" },
+          ],
+        },
         // "terminal": {
         //   "default": "confirm",
         //   "always_confirm": [
@@ -1280,6 +1290,7 @@
           "network": true,
           "create_thread": true,
           "window_control": true,
+          "git": true,
           "debugger": true,
           "diagnostics": true,
           "ask_user": true,
@@ -1314,6 +1325,7 @@
           "create_directory": true,
           "create_thread": true,
           "window_control": true,
+          "git": true,
           "delete_path": true,
           "diagnostics": true,
           "apply_code_action": true,
@@ -1350,6 +1362,7 @@
           "create_directory": true,
           "create_thread": true,
           "window_control": true,
+          "git": true,
           "delete_path": true,
           "debugger": true,
           "diagnostics": true,
@@ -1390,6 +1403,7 @@
           "create_directory": true,
           "create_thread": true,
           "window_control": true,
+          "git": true,
           "delete_path": true,
           "debugger": true,
           "diagnostics": true,
