@@ -26,9 +26,9 @@ use agent_settings::{
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
 use client::UserStore;
-use context_server::{ContextServer, ContextServerId};
 use cloud_api_types::Plan;
 use collections::{HashMap, HashSet, IndexMap};
+use context_server::{ContextServer, ContextServerId};
 use fs::Fs;
 use futures::{
     FutureExt,
@@ -52,8 +52,8 @@ use language_model::{
     ProviderErrorCategory, Role, SelectedModel, Speed, StopReason, TokenUsage,
     ZED_CLOUD_PROVIDER_ID,
 };
-use project::{Project, WorktreeId, trusted_worktrees::TrustedWorktrees};
 use project::context_server_store::ContextServerStore;
+use project::{Project, WorktreeId, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
@@ -2512,10 +2512,15 @@ impl Thread {
             return;
         }
         let rea_id = ContextServerId(Self::REA_CONTEXT_SERVER_ID.into());
-        let store = self.context_server_registry.read(cx).server_store().downgrade();
+        let store = self
+            .context_server_registry
+            .read(cx)
+            .server_store()
+            .downgrade();
 
         cx.spawn(async move |this, cx| {
-            let server = match ContextServerStore::create_standalone_server(store, rea_id, cx).await {
+            let server = match ContextServerStore::create_standalone_server(store, rea_id, cx).await
+            {
                 Ok(server) => server,
                 Err(error) => {
                     log::error!("[REA] failed to build per-thread REA server: {:#}", error);
@@ -2523,12 +2528,17 @@ impl Thread {
                 }
             };
 
-            this.update(cx, |this, _| this.rea_server = Some(server.clone())).ok();
+            this.update(cx, |this, _| this.rea_server = Some(server.clone()))
+                .ok();
 
             if let Err(error) = server.start(cx).await {
                 log::error!("[REA] failed to start per-thread REA server: {:#}", error);
                 this.update(cx, |this, cx| {
-                    if this.rea_server.as_ref().is_some_and(|s| Arc::ptr_eq(s, &server)) {
+                    if this
+                        .rea_server
+                        .as_ref()
+                        .is_some_and(|s| Arc::ptr_eq(s, &server))
+                    {
                         this.rea_server = None;
                     }
                     this.rea_tools.clear();
@@ -2542,7 +2552,9 @@ impl Thread {
             // was starting, stop it now so the stdio process isn't leaked.
             let still_wanted = this
                 .update(cx, |this, _| {
-                    this.rea_server.as_ref().is_some_and(|s| Arc::ptr_eq(s, &server))
+                    this.rea_server
+                        .as_ref()
+                        .is_some_and(|s| Arc::ptr_eq(s, &server))
                 })
                 .unwrap_or(false);
             if !still_wanted {

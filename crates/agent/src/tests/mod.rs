@@ -2649,48 +2649,46 @@ async fn test_rea_mode_controls_rea_context_server_tools(cx: &mut TestAppContext
     let executor = cx.executor();
     context_server_store.update(cx, |store, _| {
         store.set_context_server_factory(Box::new(move |id, _| {
-            let fake_transport = context_server::test::create_fake_transport(
-                id.0.to_string(),
-                executor.clone(),
-            )
-            .on_request::<context_server::types::requests::Initialize, _>(move |_params| {
-                async move {
-                    context_server::types::InitializeResponse {
-                        protocol_version: context_server::types::ProtocolVersion(
-                            context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
-                        ),
-                        server_info: context_server::types::Implementation {
-                            name: "rea".into(),
-                            title: None,
-                            version: "1.0.0".to_string(),
-                            description: None,
+            let fake_transport =
+                context_server::test::create_fake_transport(id.0.to_string(), executor.clone())
+                    .on_request::<context_server::types::requests::Initialize, _>(
+                        move |_params| async move {
+                            context_server::types::InitializeResponse {
+                                protocol_version: context_server::types::ProtocolVersion(
+                                    context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                                ),
+                                server_info: context_server::types::Implementation {
+                                    name: "rea".into(),
+                                    title: None,
+                                    version: "1.0.0".to_string(),
+                                    description: None,
+                                },
+                                capabilities: context_server::types::ServerCapabilities {
+                                    tools: Some(context_server::types::ToolsCapabilities {
+                                        list_changed: Some(true),
+                                    }),
+                                    ..Default::default()
+                                },
+                                meta: None,
+                            }
                         },
-                        capabilities: context_server::types::ServerCapabilities {
-                            tools: Some(context_server::types::ToolsCapabilities {
-                                list_changed: Some(true),
-                            }),
-                            ..Default::default()
+                    )
+                    .on_request::<context_server::types::requests::ListTools, _>(
+                        move |_params| async move {
+                            context_server::types::ListToolsResponse {
+                                tools: vec![context_server::types::Tool {
+                                    name: "open_binary".into(),
+                                    title: None,
+                                    description: None,
+                                    input_schema: json!({"type": "object"}),
+                                    output_schema: None,
+                                    annotations: None,
+                                }],
+                                next_cursor: None,
+                                meta: None,
+                            }
                         },
-                        meta: None,
-                    }
-                }
-            })
-            .on_request::<context_server::types::requests::ListTools, _>(move |_params| {
-                async move {
-                    context_server::types::ListToolsResponse {
-                        tools: vec![context_server::types::Tool {
-                            name: "open_binary".into(),
-                            title: None,
-                            description: None,
-                            input_schema: json!({"type": "object"}),
-                            output_schema: None,
-                            annotations: None,
-                        }],
-                        next_cursor: None,
-                        meta: None,
-                    }
-                }
-            });
+                    );
             Arc::new(ContextServer::new(id, Arc::new(fake_transport)))
         }));
     });

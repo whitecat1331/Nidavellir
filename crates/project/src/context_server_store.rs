@@ -1084,7 +1084,9 @@ impl ContextServerStore {
         cx: &mut AsyncApp,
     ) -> Result<Arc<ContextServer>> {
         let settings_entry = this
-            .update(cx, |this, _| this.context_server_settings.get(&id.0).cloned())
+            .update(cx, |this, _| {
+                this.context_server_settings.get(&id.0).cloned()
+            })
             .context("Context server store dropped")?
             .with_context(|| format!("context server `{id}` is not configured"))?;
 
