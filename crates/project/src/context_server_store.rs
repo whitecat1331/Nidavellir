@@ -315,6 +315,11 @@ pub struct ServerStatusChangedEvent {
 
 impl EventEmitter<ServerStatusChangedEvent> for ContextServerStore {}
 
+/// The `context_servers` id of the REA reverse-engineering MCP server. This
+/// server is thread-scoped: each `rea_mode` agent thread spawns its own
+/// instance, so the maintenance loop never auto-starts a shared one.
+pub const REA_CONTEXT_SERVER_ID: &str = "rea";
+
 impl ContextServerStore {
     pub fn local(
         worktree_store: Entity<WorktreeStore>,
@@ -1794,6 +1799,11 @@ impl ContextServerStore {
                     settings: ContextServerSettings::default_extension(),
                 });
         }
+
+        // The `rea` server is thread-scoped: `rea_mode` agent threads spawn
+        // their own instance, so the maintenance loop must never auto-start a
+        // shared one.
+        configured_servers.remove(REA_CONTEXT_SERVER_ID);
 
         let (enabled_servers, disabled_servers): (HashMap<_, _>, HashMap<_, _>) =
             configured_servers

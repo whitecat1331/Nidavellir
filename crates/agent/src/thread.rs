@@ -4898,7 +4898,7 @@ impl Thread {
     /// The `context_servers` id of the REA reverse-engineering MCP server.
     /// When `rea_mode` is on, this server's tools are exposed regardless of
     /// the active profile's context-server settings.
-    const REA_CONTEXT_SERVER_ID: &str = "rea";
+    const REA_CONTEXT_SERVER_ID: &str = project::context_server_store::REA_CONTEXT_SERVER_ID;
 
     fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
