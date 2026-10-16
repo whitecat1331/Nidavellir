@@ -5904,13 +5904,7 @@ async fn window_control_add_workspace_root(
             AgentSettings::get_global(cx).worktree_root_pattern.clone()
         })?;
         let pattern = pattern.as_deref().unwrap_or("zed-wip-");
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let name_lower = name.to_lowercase();
-        let pattern_lower = pattern.to_lowercase();
-        if pattern.is_empty() || !name_lower.starts_with(pattern_lower.as_str()) {
+        if !worktree_path_matches_pattern(&path, pattern) {
             bail!(
                 "`add_worktree_root` path `{}` does not match the worktree prefix \
                  `{pattern}`; use `add_project_root` for non-worktree folders",
@@ -5985,6 +5979,17 @@ async fn window_control_add_workspace_root(
         "already_root": already_root,
         "workspace": { "roots": roots },
     }))
+}
+
+/// Whether `path`'s final component matches the configured worktree prefix.
+fn worktree_path_matches_pattern(path: &std::path::Path, pattern: &str) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name_lower = name.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+    !pattern_lower.is_empty() && name_lower.starts_with(pattern_lower.as_str())
 }
 
 /// A named, addressable UI affordance for the dev-only window-control surface
@@ -8531,6 +8536,25 @@ mod tests {
             );
         }
         assert!(window_control_action("agent::DefinitelyNotAnAction").is_err());
+    }
+
+    #[test]
+    fn worktree_path_matches_pattern_checks_final_component() {
+        let path = std::path::Path::new;
+        assert!(worktree_path_matches_pattern(
+            path("/tmp/zed-wip-native-git-tool"),
+            "zed-wip-"
+        ));
+        assert!(worktree_path_matches_pattern(
+            path("/tmp/Zed-Wip-Mixed-Case"),
+            "zed-wip-"
+        ));
+        assert!(!worktree_path_matches_pattern(
+            path("/tmp/some-project"),
+            "zed-wip-"
+        ));
+        // Fail closed on an empty prefix.
+        assert!(!worktree_path_matches_pattern(path("/tmp/zed-wip-x"), ""));
     }
 
     /// Reproduction of the 2026-10-09 failure that motivated
