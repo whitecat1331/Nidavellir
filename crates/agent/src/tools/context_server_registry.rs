@@ -2,7 +2,7 @@ use crate::{AgentToolOutput, AnyAgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use collections::{BTreeMap, HashMap};
-use context_server::{ContextServerId, client::NotificationSubscription};
+use context_server::{ContextServer, ContextServerId, client::NotificationSubscription};
 use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task};
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
@@ -200,11 +200,7 @@ impl ContextServerRegistry {
                 registered_server.tools.clear();
                 if let Some(response) = response.log_err() {
                     for tool in response.tools {
-                        let tool = Arc::new(ContextServerTool::new(
-                            this.server_store.clone(),
-                            server.id(),
-                            tool,
-                        ));
+                        let tool = Arc::new(ContextServerTool::new(server.clone(), tool));
                         registered_server.tools.insert(tool.name(), tool);
                     }
                     cx.emit(ContextServerRegistryEvent::ToolsChanged);
@@ -288,20 +284,17 @@ impl ContextServerRegistry {
     }
 }
 
-struct ContextServerTool {
-    store: Entity<ContextServerStore>,
+pub(crate) struct ContextServerTool {
+    server: Arc<ContextServer>,
     server_id: ContextServerId,
     tool: context_server::types::Tool,
 }
 
 impl ContextServerTool {
-    fn new(
-        store: Entity<ContextServerStore>,
-        server_id: ContextServerId,
-        tool: context_server::types::Tool,
-    ) -> Self {
+    pub(crate) fn new(server: Arc<ContextServer>, tool: context_server::types::Tool) -> Self {
+        let server_id = server.id();
         Self {
-            store,
+            server,
             server_id,
             tool,
         }
@@ -346,9 +339,7 @@ impl AnyAgentTool for ContextServerTool {
         event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
-        let Some(server) = self.store.read(cx).get_running_server(&self.server_id) else {
-            return Task::ready(Err(anyhow::anyhow!("Context server not found").into()));
-        };
+        let server = self.server.clone();
         let tool_name = self.tool.name.clone();
         let tool_id = mcp_tool_id(&self.server_id.0, &self.tool.name);
         let display_name = self.tool.name.clone();

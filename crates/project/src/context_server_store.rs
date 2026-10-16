@@ -315,6 +315,11 @@ pub struct ServerStatusChangedEvent {
 
 impl EventEmitter<ServerStatusChangedEvent> for ContextServerStore {}
 
+/// The `context_servers` id of the REA reverse-engineering MCP server. This
+/// server is thread-scoped: each `rea_mode` agent thread spawns its own
+/// instance, so the maintenance loop never auto-starts a shared one.
+pub const REA_CONTEXT_SERVER_ID: &str = "rea";
+
 impl ContextServerStore {
     pub fn local(
         worktree_store: Entity<WorktreeStore>,
@@ -1069,6 +1074,45 @@ impl ContextServerStore {
         Ok((server, configuration))
     }
 
+    /// Builds (but does not start or register) a standalone `ContextServer` for
+    /// `id`, through the same settings → configuration → server path as
+    /// `start_server`. Thread-scoped servers (e.g. the per-thread `rea` server)
+    /// use this so they never live in the shared `servers` map.
+    pub async fn create_standalone_server(
+        this: WeakEntity<Self>,
+        id: ContextServerId,
+        cx: &mut AsyncApp,
+    ) -> Result<Arc<ContextServer>> {
+        let settings_entry = this
+            .update(cx, |this, _| {
+                this.context_server_settings.get(&id.0).cloned()
+            })
+            .context("Context server store dropped")?
+            .with_context(|| format!("context server `{id}` is not configured"))?;
+
+        if !settings_entry.settings.enabled() {
+            anyhow::bail!("context server `{id}` is disabled");
+        }
+
+        let (registry, worktree_store) = this.update(cx, |this, _| {
+            (this.registry.clone(), this.worktree_store.clone())
+        })?;
+
+        let configuration = ContextServerConfiguration::from_settings(
+            settings_entry.settings,
+            id.clone(),
+            registry,
+            worktree_store,
+            cx,
+        )
+        .await
+        .with_context(|| format!("failed to build configuration for `{id}`"))?;
+
+        let (server, _) =
+            Self::create_context_server(this, id, Arc::new(configuration), cx).await?;
+        Ok(server)
+    }
+
     async fn handle_get_context_server_command(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GetContextServerCommand>,
@@ -1757,6 +1801,11 @@ impl ContextServerStore {
                     settings: ContextServerSettings::default_extension(),
                 });
         }
+
+        // The `rea` server is thread-scoped: `rea_mode` agent threads spawn
+        // their own instance, so the maintenance loop must never auto-start a
+        // shared one.
+        configured_servers.remove(REA_CONTEXT_SERVER_ID);
 
         let (enabled_servers, disabled_servers): (HashMap<_, _>, HashMap<_, _>) =
             configured_servers
