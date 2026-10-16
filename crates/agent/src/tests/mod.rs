@@ -1491,6 +1491,83 @@ fn test_debugger_tool_permission_rules_match_resolved_control_ids() {
 }
 
 #[test]
+fn test_window_control_permission_rules_split_worktree_and_project() {
+    let mut permissions = agent_settings::ToolPermissions::default();
+    permissions.default = settings::ToolPermissionMode::Confirm;
+    permissions.tools.insert(
+        WindowControlTool::NAME.into(),
+        agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Confirm),
+            always_allow: vec![agent_settings::CompiledRegex::new(
+                r"^add_worktree_root\s",
+                false,
+            )
+            .expect("worktree allow regex should compile")],
+            always_deny: vec![],
+            always_confirm: vec![],
+            invalid_patterns: vec![],
+        },
+    );
+
+    // Worktree adds auto-allow (the agent created the worktree).
+    assert_eq!(
+        ToolPermissionDecision::from_input(
+            WindowControlTool::NAME,
+            &["add_worktree_root path:/tmp/zed-wip-example".to_string()],
+            &permissions,
+            util::shell::ShellKind::system(),
+        ),
+        ToolPermissionDecision::Allow
+    );
+
+    // Project adds fall through to the tool default (confirm).
+    assert_eq!(
+        ToolPermissionDecision::from_input(
+            WindowControlTool::NAME,
+            &["add_project_root path:/tmp/some-project".to_string()],
+            &permissions,
+            util::shell::ShellKind::system(),
+        ),
+        ToolPermissionDecision::Confirm
+    );
+}
+
+#[test]
+fn test_window_control_worktree_allow_can_be_overridden() {
+    let mut permissions = agent_settings::ToolPermissions::default();
+    permissions.default = settings::ToolPermissionMode::Confirm;
+    permissions.tools.insert(
+        WindowControlTool::NAME.into(),
+        agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Confirm),
+            always_allow: vec![agent_settings::CompiledRegex::new(
+                r"^add_worktree_root\s",
+                false,
+            )
+            .expect("worktree allow regex should compile")],
+            always_deny: vec![],
+            always_confirm: vec![agent_settings::CompiledRegex::new(
+                r"^add_worktree_root\s",
+                false,
+            )
+            .expect("worktree confirm regex should compile")],
+            invalid_patterns: vec![],
+        },
+    );
+
+    // `always_confirm` outranks `always_allow`, so a user can re-gate worktrees.
+    assert_eq!(
+        ToolPermissionDecision::from_input(
+            WindowControlTool::NAME,
+            &["add_worktree_root path:/tmp/zed-wip-example".to_string()],
+            &permissions,
+            util::shell::ShellKind::system(),
+        ),
+        ToolPermissionDecision::Confirm
+    );
+}
+
+#[test]
 fn test_debugger_tool_step_back_permission_name() {
     let inputs = control_permission_inputs_for_test(
         "control",
