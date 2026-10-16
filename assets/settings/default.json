@@ -1265,6 +1265,7 @@
         "name": "Read",
         "tools": {
           "memory": true,
+          "graph": true,
           "thread_search": true,
           "wait_for_report": true,
           "browser": true,
@@ -1296,6 +1297,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "memory": true,
+          "graph": true,
           "thread_search": true,
           "wait_for_report": true,
           "browser": true,
@@ -1331,6 +1333,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "memory": true,
+          "graph": true,
           "thread_search": true,
           "wait_for_report": true,
           "browser": true,
@@ -1370,6 +1373,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "memory": true,
+          "graph": true,
           "thread_search": true,
           "wait_for_report": true,
           "browser": true,
