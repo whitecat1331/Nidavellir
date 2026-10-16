@@ -2,7 +2,7 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContainerTool,
     ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel,
     DbThread, DebuggerTool, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
-    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
+    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GraphTool, GrepTool, ListAgentsAndModelsTool,
     ListDirectoryTool, MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot,
     ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate,
     Template, Templates, TerminalTool, ThreadSearchTool, ToolPermissionDecision, VmTool,
@@ -2399,6 +2399,7 @@ impl Thread {
             code_action_store,
         ));
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
+        self.add_tool(GraphTool);
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {

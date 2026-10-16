@@ -1447,6 +1447,8 @@ mod tests {
             // Reads past agent threads; read-only, no permission checks.
             "thread_search",
             "spawn_agent",
+            // Local plan-progress state read/write; no project or command access.
+            "graph",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

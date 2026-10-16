@@ -18,6 +18,7 @@ mod find_path_tool;
 mod find_references_tool;
 mod get_code_actions_tool;
 mod go_to_definition_tool;
+mod graph_tool;
 mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
@@ -96,6 +97,7 @@ pub use find_path_tool::*;
 pub use find_references_tool::*;
 pub use get_code_actions_tool::*;
 pub use go_to_definition_tool::*;
+pub use graph_tool::*;
 pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
@@ -230,6 +232,7 @@ tools! {
     FindReferencesTool,
     GetCodeActionsTool,
     GoToDefinitionTool,
+    GraphTool,
     GrepTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
