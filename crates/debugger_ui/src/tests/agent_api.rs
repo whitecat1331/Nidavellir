@@ -1,23 +1,21 @@
 #![expect(clippy::result_large_err)]
 use crate::tests::{init_test, init_test_workspace, start_debug_session, start_debug_session_with};
+use dap::transport::RequestHandling;
 use dap::{
     ErrorResponse, Message, Scope, StackFrame, Variable,
     adapters::DebugTaskDefinition,
     requests::{
         Attach, Continue, DataBreakpointInfo, Disconnect, Evaluate, Initialize, LoadedSources,
-        Pause,
-        Modules, ReadMemory, Restart, RestartFrame, Scopes, SetBreakpoints, SetDataBreakpoints,
-        SetVariable, StackTrace, StepBack, Threads, Variables,
+        Modules, Pause, ReadMemory, Restart, RestartFrame, Scopes, SetBreakpoints,
+        SetDataBreakpoints, SetVariable, StackTrace, StepBack, Threads, Variables,
     },
 };
-use dap::transport::RequestHandling;
 use gpui::{BackgroundExecutor, TestAppContext};
 use project::debugger::{
     agent_api::{
         AgentDataBreakpointInput, AgentDebuggerApi, AgentDebuggerSessionStatus,
         AgentDebuggerSnapshotLimits, AgentDebuggerStepKind, AgentDebuggerThreadStatus,
-        AgentDebuggerWaitStatus,
-        AgentExceptionBreakpointInput, AgentSourceBreakpointInput,
+        AgentDebuggerWaitStatus, AgentExceptionBreakpointInput, AgentSourceBreakpointInput,
     },
     session::{ThreadId, ThreadStatus},
 };
@@ -684,11 +682,7 @@ async fn test_agent_pause_is_bounded_when_adapter_never_acknowledges(
     let pause =
         cx.update(|cx| api.pause_thread(session_id, ThreadId(1), Duration::from_millis(50), cx));
     futures::pin_mut!(pause);
-    let outcome = futures::future::select(
-        pause,
-        executor.timer(Duration::from_secs(2)),
-    )
-    .await;
+    let outcome = futures::future::select(pause, executor.timer(Duration::from_secs(2))).await;
     match outcome {
         futures::future::Either::Left((result, _)) => {
             let result = result.expect("pause_thread should report a bounded outcome");

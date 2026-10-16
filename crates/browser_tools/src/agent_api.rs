@@ -1153,9 +1153,7 @@ fn normalize_fetch_disposition_fields(method: &str, fields: &Value) -> Value {
             ("Fetch.fulfillRequest", "response_headers") => {
                 ("responseHeaders".to_string(), headers_to_cdp_array(value))
             }
-            ("Fetch.continueRequest", "post_data") => {
-                ("postData".to_string(), value.clone())
-            }
+            ("Fetch.continueRequest", "post_data") => ("postData".to_string(), value.clone()),
             ("Fetch.continueRequest", "headers") => {
                 ("headers".to_string(), headers_to_cdp_array(value))
             }
