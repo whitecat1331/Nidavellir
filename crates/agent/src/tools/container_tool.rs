@@ -106,20 +106,15 @@ async fn run_operation(
         }
     })?;
 
-    let target = store.target(&input.target).ok_or_else(|| {
-        ContainerToolOutput::Error {
+    let target = store
+        .target(&input.target)
+        .ok_or_else(|| ContainerToolOutput::Error {
             error: format!(
                 "Unknown container target \"{}\". Configured targets: {}",
                 input.target,
-                store
-                    .targets
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                store.targets.keys().cloned().collect::<Vec<_>>().join(", ")
             ),
-        }
-    })?;
+        })?;
 
     if input.operation.is_mutating() && !input.confirm {
         return Err(ContainerToolOutput::Error {

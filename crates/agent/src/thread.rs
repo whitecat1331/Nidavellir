@@ -2,12 +2,12 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContainerTool,
     ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel,
     DbThread, DebuggerTool, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
-    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GraphTool, GrepTool, ListAgentsAndModelsTool,
-    ListDirectoryTool, MemoryStore, MemoryTool, MovePathTool, NetworkTool, ProjectSnapshot,
-    ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate,
-    Template, Templates, TerminalTool, ThreadSearchTool, ToolPermissionDecision, VmTool,
-    WaitForReportTool, WebSearchTool, WindowControlTool, WriteFileTool,
-    decide_permission_from_settings,
+    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GraphTool, GrepTool,
+    ListAgentsAndModelsTool, ListDirectoryTool, MemoryStore, MemoryTool, MovePathTool, NetworkTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSearchTool,
+    ToolPermissionDecision, VmTool, WaitForReportTool, WebSearchTool, WindowControlTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
 use action_log::ActionLog;

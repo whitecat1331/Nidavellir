@@ -739,15 +739,9 @@ impl AgentDebuggerApi {
             let stop_wait = subscribe_to_stop(session.clone(), cx)?;
             let send = session.update(cx, |session, cx| match step_kind {
                 AgentDebuggerStepKind::In => session.agent_step_in(thread_id, granularity, cx),
-                AgentDebuggerStepKind::Out => {
-                    session.agent_step_out(thread_id, granularity, cx)
-                }
-                AgentDebuggerStepKind::Over => {
-                    session.agent_step_over(thread_id, granularity, cx)
-                }
-                AgentDebuggerStepKind::Back => {
-                    session.agent_step_back(thread_id, granularity, cx)
-                }
+                AgentDebuggerStepKind::Out => session.agent_step_out(thread_id, granularity, cx),
+                AgentDebuggerStepKind::Over => session.agent_step_over(thread_id, granularity, cx),
+                AgentDebuggerStepKind::Back => session.agent_step_back(thread_id, granularity, cx),
             });
             if let ControlSendOutcome::TimedOut = send_control_request(send, timeout, cx).await? {
                 return Ok(unacknowledged_control_result("step"));

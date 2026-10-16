@@ -453,8 +453,8 @@ impl TransportDelegate {
                 continue;
             }
 
-            let message =
-                serde_json::from_str::<Message>(message_str).context("deserializing server message");
+            let message = serde_json::from_str::<Message>(message_str)
+                .context("deserializing server message");
 
             if let Some(log_handlers) = log_handlers {
                 let command = match &message {
