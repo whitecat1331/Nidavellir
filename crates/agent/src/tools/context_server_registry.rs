@@ -284,14 +284,14 @@ impl ContextServerRegistry {
     }
 }
 
-struct ContextServerTool {
+pub(crate) struct ContextServerTool {
     server: Arc<ContextServer>,
     server_id: ContextServerId,
     tool: context_server::types::Tool,
 }
 
 impl ContextServerTool {
-    fn new(server: Arc<ContextServer>, tool: context_server::types::Tool) -> Self {
+    pub(crate) fn new(server: Arc<ContextServer>, tool: context_server::types::Tool) -> Self {
         let server_id = server.id();
         Self {
             server,

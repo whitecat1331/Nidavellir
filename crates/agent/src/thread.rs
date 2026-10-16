@@ -26,6 +26,7 @@ use agent_settings::{
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
 use client::UserStore;
+use context_server::{ContextServer, ContextServerId};
 use cloud_api_types::Plan;
 use collections::{HashMap, HashSet, IndexMap};
 use fs::Fs;
@@ -52,6 +53,7 @@ use language_model::{
     ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, WorktreeId, trusted_worktrees::TrustedWorktrees};
+use project::context_server_store::ContextServerStore;
 use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
@@ -1423,6 +1425,14 @@ pub struct Thread {
     /// the `rea` context server's tools are exposed regardless of the active
     /// profile's context-server settings, and REA framing is injected.
     rea_mode: bool,
+    /// The per-thread REA MCP server, spawned when `rea_mode` is turned on and
+    /// stopped when it is turned off or the thread is dropped. Thread-scoped so
+    /// two REA threads never share an MCP session.
+    rea_server: Option<Arc<ContextServer>>,
+    /// Tools loaded from the per-thread REA server, injected into the enabled
+    /// tool set while `rea_mode` is on. Empty until the server's `ListTools`
+    /// completes.
+    rea_tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     /// Whether `profile_id` was downgraded to `minimal` at thread start because
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
@@ -1451,6 +1461,12 @@ pub struct Thread {
     /// already-granted permissions skip the approval prompt.
     /// Never persisted — lives and dies with this thread.
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        self.stop_rea_server();
+    }
 }
 
 impl Thread {
@@ -1549,7 +1565,7 @@ impl Thread {
             None => Self::user_configured_model_selection(cx)
                 .map_or(ThreadModel::Unset, ThreadModel::Unresolved),
         };
-        Self {
+        let mut this = Self {
             id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
@@ -1579,6 +1595,8 @@ impl Thread {
             profile_id,
             planning,
             rea_mode: Self::rea_mode_from_environment(),
+            rea_server: None,
+            rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace,
             project_context,
             templates,
@@ -1598,7 +1616,11 @@ impl Thread {
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+        };
+        if this.rea_mode {
+            this.spawn_rea_server(cx);
         }
+        this
     }
 
     /// Seeds `rea_mode` for freshly created threads from an environment
@@ -1944,7 +1966,7 @@ impl Thread {
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
-        Self {
+        let mut this = Self {
             id,
             prompt_id: PromptId::new(),
             title: if db_thread.title.is_empty() {
@@ -1972,6 +1994,8 @@ impl Thread {
             profile_id,
             planning,
             rea_mode,
+            rea_server: None,
+            rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace: false,
             project_context,
             templates,
@@ -1997,7 +2021,11 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
             ))),
+        };
+        if this.rea_mode {
+            this.spawn_rea_server(cx);
         }
+        this
     }
 
     pub fn sandbox_status(&self, cx: &App) -> Option<(ThreadSandbox, ThreadSandbox)> {
@@ -2459,14 +2487,104 @@ impl Thread {
         self.rea_mode
     }
 
-    /// Turns REA mode on or off. Notifies so the change persists, mirroring
-    /// `set_planning`.
+    /// Turns REA mode on or off. Spawns this thread's private REA server when
+    /// turned on and stops it when turned off. Notifies so the change persists,
+    /// mirroring `set_planning`.
     pub fn set_rea_mode(&mut self, rea_mode: bool, cx: &mut Context<Self>) {
         if self.rea_mode == rea_mode {
             return;
         }
         self.rea_mode = rea_mode;
+        if rea_mode {
+            self.spawn_rea_server(cx);
+        } else {
+            self.stop_rea_server();
+            self.refresh_turn_tools(cx);
+        }
         cx.notify();
+    }
+
+    /// Spawns this thread's private REA MCP server and loads its tools. Each
+    /// `rea_mode` thread owns its own server, so concurrent REA threads never
+    /// share a session.
+    fn spawn_rea_server(&mut self, cx: &mut Context<Self>) {
+        if self.rea_server.is_some() {
+            return;
+        }
+        let rea_id = ContextServerId(Self::REA_CONTEXT_SERVER_ID.into());
+        let store = self.context_server_registry.read(cx).server_store().downgrade();
+
+        cx.spawn(async move |this, cx| {
+            let server = match ContextServerStore::create_standalone_server(store, rea_id, cx).await {
+                Ok(server) => server,
+                Err(error) => {
+                    log::error!("[REA] failed to build per-thread REA server: {:#}", error);
+                    return;
+                }
+            };
+
+            this.update(cx, |this, _| this.rea_server = Some(server.clone())).ok();
+
+            if let Err(error) = server.start(cx).await {
+                log::error!("[REA] failed to start per-thread REA server: {:#}", error);
+                this.update(cx, |this, cx| {
+                    if this.rea_server.as_ref().is_some_and(|s| Arc::ptr_eq(s, &server)) {
+                        this.rea_server = None;
+                    }
+                    this.rea_tools.clear();
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+
+            // If the thread toggled REA off (or was dropped) while the server
+            // was starting, stop it now so the stdio process isn't leaked.
+            let still_wanted = this
+                .update(cx, |this, _| {
+                    this.rea_server.as_ref().is_some_and(|s| Arc::ptr_eq(s, &server))
+                })
+                .unwrap_or(false);
+            if !still_wanted {
+                let _ = server.stop();
+                return;
+            }
+
+            let Some(client) = server.client() else {
+                return;
+            };
+            if !client.capable(context_server::protocol::ServerCapability::Tools) {
+                return;
+            }
+            let response = client
+                .request::<context_server::types::requests::ListTools>(())
+                .await;
+
+            this.update(cx, |this, cx| {
+                let mut tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>> = BTreeMap::default();
+                if let Some(response) = response.log_err() {
+                    for tool in response.tools {
+                        let tool = Arc::new(crate::ContextServerTool::new(server.clone(), tool));
+                        tools.insert(tool.name(), tool);
+                    }
+                }
+                this.rea_tools = tools;
+                this.refresh_turn_tools(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops this thread's per-thread REA server and clears its cached tools.
+    fn stop_rea_server(&mut self) {
+        if let Some(server) = self.rea_server.take() {
+            if let Err(error) = server.stop() {
+                log::error!("[REA] failed to stop per-thread REA server: {:#}", error);
+            }
+        }
+        self.rea_tools.clear();
     }
 
     /// Whether this thread's profile was downgraded to `minimal` at thread start
@@ -4845,17 +4963,13 @@ impl Thread {
         let mut seen_tools = tools.keys().cloned().collect::<HashSet<_>>();
         let mut duplicate_tool_names = HashSet::default();
         for (server_id, server_tools) in self.context_server_registry.read(cx).servers() {
+            // The `rea` server is thread-scoped: its tools come from this
+            // thread's own server below, never from the shared registry.
+            if server_id.0.as_ref() == Self::REA_CONTEXT_SERVER_ID {
+                continue;
+            }
             for (tool_name, tool) in server_tools {
-                // The REA overlay server is exposed solely by `rea_mode`. Its
-                // tools must not fall through to the profile's
-                // `enable_all_context_servers` default (which is `true` for the
-                // built-in profiles), or toggling REA off would leave them
-                // exposed.
-                let tool_enabled = if server_id.0.as_ref() == Self::REA_CONTEXT_SERVER_ID {
-                    self.rea_mode
-                } else {
-                    profile.is_context_server_tool_enabled(&server_id.0, &tool_name)
-                };
+                let tool_enabled = profile.is_context_server_tool_enabled(&server_id.0, &tool_name);
                 if tool_enabled {
                     let tool_name: SharedString =
                         provider_compatible_tool_name(tool_name.as_ref()).into();
@@ -4864,6 +4978,20 @@ impl Thread {
                     }
                     context_server_tools.push((server_id.clone(), tool_name, tool.clone()));
                 }
+            }
+        }
+
+        // Inject this thread's own REA server tools, exposed solely by
+        // `rea_mode` and independent of the profile's context-server settings.
+        if self.rea_mode {
+            let server_id = ContextServerId(Self::REA_CONTEXT_SERVER_ID.into());
+            for (tool_name, tool) in &self.rea_tools {
+                let tool_name: SharedString =
+                    provider_compatible_tool_name(tool_name.as_ref()).into();
+                if !seen_tools.insert(tool_name.clone()) {
+                    duplicate_tool_names.insert(tool_name.clone());
+                }
+                context_server_tools.push((server_id.clone(), tool_name, tool.clone()));
             }
         }
 
