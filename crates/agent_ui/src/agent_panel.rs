@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -5994,31 +5994,38 @@ impl AgentPanel {
     }
 }
 
-/// Depth of `window_control` synthetic keystroke dispatches currently on the
-/// stack. While non-zero, UI handlers must not treat a keystroke as a real
-/// user action — in particular, a probe's `press escape` must never
-/// Stop-Generate the turn that dispatched it (ISSUE-0042).
-static WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Depth of `window_control` synthetic keystroke dispatches currently on the
+    /// stack. While non-zero, UI handlers must not treat a keystroke as a real
+    /// user action — in particular, a probe's `press escape` must never
+    /// Stop-Generate the turn that dispatched it (ISSUE-0042).
+    ///
+    /// Thread-local rather than process-global: the dispatch and the
+    /// `cancel_generation` read always run on the same foreground thread, and
+    /// a thread-local keeps parallel tests — each on its own thread — from
+    /// observing each other's held guard.
+    static WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Marks a `window_control`-dispatched keystroke as synthetic for its duration.
 pub(crate) struct SyntheticInputGuard(());
 
 impl SyntheticInputGuard {
     pub(crate) fn new() -> Self {
-        WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.fetch_add(1, Ordering::SeqCst);
+        WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.with(|depth| depth.set(depth.get() + 1));
         Self(())
     }
 }
 
 impl Drop for SyntheticInputGuard {
     fn drop(&mut self) {
-        WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.with(|depth| depth.set(depth.get() - 1));
     }
 }
 
 /// Whether a `window_control` synthetic keystroke is currently being dispatched.
 pub(crate) fn window_control_synthetic_input_active() -> bool {
-    WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.load(Ordering::SeqCst) > 0
+    WINDOW_CONTROL_SYNTHETIC_INPUT_DEPTH.with(|depth| depth.get() > 0)
 }
 
 /// Dispatch a `window_control` request against `panel` at the top level.
