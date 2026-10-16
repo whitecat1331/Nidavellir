@@ -164,7 +164,11 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
     match input.operation {
         GitOperation::Commit => {
             args.push("-m".to_string());
-            args.push(required_arg(input.message.as_deref(), "message", operation)?);
+            args.push(required_arg(
+                input.message.as_deref(),
+                "message",
+                operation,
+            )?);
         }
         GitOperation::Checkout | GitOperation::Switch | GitOperation::Branch => {
             args.push(required_arg(reference, "ref", operation)?);
@@ -294,7 +298,10 @@ async fn run_git_operation(
             error: error.to_string(),
         })?
         .ok_or_else(|| GitToolOutput::Error {
-            error: format!("No project root resolved for `cd` directory {:?}.", input.cd),
+            error: format!(
+                "No project root resolved for `cd` directory {:?}.",
+                input.cd
+            ),
         })?;
 
     let result = cx
@@ -488,7 +495,14 @@ mod tests {
             vec!["push", "origin", "feature"]
         );
 
-        let tag = test_input(GitOperation::Tag, Some("main"), None, Some("v1"), None, false);
+        let tag = test_input(
+            GitOperation::Tag,
+            Some("main"),
+            None,
+            Some("v1"),
+            None,
+            false,
+        );
         assert_eq!(assemble_git_args(&tag).unwrap(), vec!["tag", "v1", "main"]);
 
         let checkout = test_input(GitOperation::Checkout, None, None, None, None, false);
