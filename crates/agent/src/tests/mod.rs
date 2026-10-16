@@ -2644,6 +2644,57 @@ async fn test_rea_mode_controls_rea_context_server_tools(cx: &mut TestAppContext
         cx,
     );
 
+    // The per-thread `rea` server is built through the store's factory; inject a
+    // fake transport so toggling `rea_mode` on doesn't spawn a real process.
+    let executor = cx.executor();
+    context_server_store.update(cx, |store, _| {
+        store.set_context_server_factory(Box::new(move |id, _| {
+            let fake_transport = context_server::test::create_fake_transport(
+                id.0.to_string(),
+                executor.clone(),
+            )
+            .on_request::<context_server::types::requests::Initialize, _>(move |_params| {
+                async move {
+                    context_server::types::InitializeResponse {
+                        protocol_version: context_server::types::ProtocolVersion(
+                            context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                        ),
+                        server_info: context_server::types::Implementation {
+                            name: "rea".into(),
+                            title: None,
+                            version: "1.0.0".to_string(),
+                            description: None,
+                        },
+                        capabilities: context_server::types::ServerCapabilities {
+                            tools: Some(context_server::types::ToolsCapabilities {
+                                list_changed: Some(true),
+                            }),
+                            ..Default::default()
+                        },
+                        meta: None,
+                    }
+                }
+            })
+            .on_request::<context_server::types::requests::ListTools, _>(move |_params| {
+                async move {
+                    context_server::types::ListToolsResponse {
+                        tools: vec![context_server::types::Tool {
+                            name: "open_binary".into(),
+                            title: None,
+                            description: None,
+                            input_schema: json!({"type": "object"}),
+                            output_schema: None,
+                            annotations: None,
+                        }],
+                        next_cursor: None,
+                        meta: None,
+                    }
+                }
+            });
+            Arc::new(ContextServer::new(id, Arc::new(fake_transport)))
+        }));
+    });
+
     // With `rea_mode` off, the `rea` server's tools must stay hidden.
     let events = thread.update(cx, |thread, cx| {
         thread
@@ -2663,6 +2714,7 @@ async fn test_rea_mode_controls_rea_context_server_tools(cx: &mut TestAppContext
 
     // Toggling `rea_mode` on must expose them.
     thread.update(cx, |thread, cx| thread.set_rea_mode(true, cx));
+    cx.run_until_parked();
     let events = thread.update(cx, |thread, cx| {
         thread.send(ClientUserMessageId::new(), ["Go"], cx).unwrap()
     });
@@ -2679,6 +2731,7 @@ async fn test_rea_mode_controls_rea_context_server_tools(cx: &mut TestAppContext
 
     // Toggling back off must drop them again.
     thread.update(cx, |thread, cx| thread.set_rea_mode(false, cx));
+    cx.run_until_parked();
     let events = thread.update(cx, |thread, cx| {
         thread
             .send(ClientUserMessageId::new(), ["Stop"], cx)
