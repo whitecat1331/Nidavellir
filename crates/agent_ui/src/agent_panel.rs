@@ -96,8 +96,9 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, OpenOptions, OpenVisible,
+    PathList, SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace,
+    WorkspaceId, WorkspaceManager,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -5838,11 +5839,118 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
             let panel = panel
                 .upgrade()
                 .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
+            // `add_workspace_root` mutates the worktree set and must await the open
+            // to report the resulting roots, so it is handled here rather than in
+            // the synchronous `window_control_dispatch`.
+            if matches!(
+                request.operation,
+                agent::WindowControlOperation::AddWorkspaceRoot
+            ) {
+                return window_control_add_workspace_root(&panel, request, window, cx).await;
+            }
             window.update(cx, |_root, window, cx| {
                 window_control_dispatch(&panel, request, window, cx)
             })?
         })
     }
+}
+
+/// Add a folder as a workspace root on behalf of the agent.
+///
+/// Mirrors `ProjectPanel::add_folder_to_workspace` — persist the membership for
+/// a managed workspace, then add the root to the live worktree set — but takes
+/// the path directly instead of opening the interactive folder picker. Runs
+/// outside any panel update, like every other mutating `window_control` op.
+async fn window_control_add_workspace_root(
+    panel: &Entity<AgentPanel>,
+    request: agent::WindowControlRequest,
+    window: gpui::AnyWindowHandle,
+    cx: &mut gpui::AsyncApp,
+) -> Result<serde_json::Value> {
+    let path = request
+        .path
+        .clone()
+        .ok_or_else(|| anyhow!("`add_workspace_root` requires `path`"))?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        bail!(
+            "`add_workspace_root` requires an absolute path, got `{}`",
+            path.display()
+        );
+    }
+    if !path.is_dir() {
+        bail!(
+            "`add_workspace_root` path is not an existing directory: `{}`",
+            path.display()
+        );
+    }
+
+    let workspace = panel
+        .read_with(cx, |panel, _cx| panel.workspace.upgrade())
+        .ok_or_else(|| anyhow!("No workspace is available"))?;
+
+    // Read the state and start the open inside a window update (which yields a
+    // `&mut App`), then await the open outside it: `add_workspace_root` is the
+    // only op that must await the worktree open to report the resulting roots.
+    let (already_root, managed_workspace_id, opened): (
+        bool,
+        Option<workspace::workspace_manager::ManagedWorkspaceId>,
+        Option<Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>>>,
+    ) = window.update(cx, |_root, window, cx| {
+        // Already a root: no-op, so re-adding does not re-open the worktree.
+        let already_root = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path.as_path())
+        });
+        if already_root {
+            return (true, None, None);
+        }
+        let managed_workspace_id =
+            workspace.read_with(cx, |workspace, _cx| workspace.managed_workspace_id());
+        let opened = workspace.update(cx, |workspace, cx| {
+            workspace.open_paths(
+                vec![path.clone()],
+                OpenOptions {
+                    visible: Some(OpenVisible::All),
+                    skip_managed_workspace_ask: true,
+                    ..Default::default()
+                },
+                None,
+                window,
+                cx,
+            )
+        });
+        (false, managed_workspace_id, Some(opened))
+    })?;
+
+    if let Some(managed_workspace_id) = managed_workspace_id {
+        let manager = window.update(cx, |_root, _window, cx| WorkspaceManager::global(cx))?;
+        manager
+            .add_project(managed_workspace_id, path.clone())
+            .await
+            .log_err();
+    }
+    if let Some(opened) = opened {
+        for result in opened.await.into_iter().flatten() {
+            result.log_err();
+        }
+    }
+
+    let roots = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                agent::redact_sensitive(&worktree.read(cx).abs_path().to_string_lossy())
+            })
+            .collect::<Vec<_>>()
+    });
+
+    Ok(serde_json::json!({
+        "added": agent::redact_sensitive(&path.to_string_lossy()),
+        "already_root": already_root,
+        "workspace": { "roots": roots },
+    }))
 }
 
 /// A named, addressable UI affordance for the dev-only window-control surface
@@ -6111,6 +6219,11 @@ pub(crate) fn window_control_dispatch(
             panel.read_with(cx, |panel, cx| {
                 window_control_assert(panel, &selector, &request, window, cx)
             })
+        }
+        Operation::AddWorkspaceRoot => {
+            // Handled by the host, which can await the worktree open
+            // (`window_control_add_workspace_root`); this dispatch is synchronous.
+            bail!("`add_workspace_root` is handled by the window-control host")
         }
     }
 }

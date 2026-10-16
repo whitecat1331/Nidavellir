@@ -49,6 +49,13 @@ pub enum WindowControlOperation {
     Click,
     /// Assert on a selector's visibility or text.
     Assert,
+    /// Add a folder as a workspace root, so the agent can reach paths outside the
+    /// current roots (for example a `../zed-wip-<slug>` git worktree). This skips
+    /// the interactive folder picker that `workspace::AddFolderToWorkspace` opens.
+    ///
+    /// This mutates the user's workspace: `path` must be an absolute, existing
+    /// directory, and adding a path that is already a root is a no-op.
+    AddWorkspaceRoot,
 }
 
 impl WindowControlOperation {
@@ -63,6 +70,7 @@ impl WindowControlOperation {
             Self::Find => "find",
             Self::Click => "click",
             Self::Assert => "assert",
+            Self::AddWorkspaceRoot => "add_workspace_root",
         }
     }
 }
@@ -123,6 +131,11 @@ pub struct WindowControlRequest {
     /// For `assert`: the visibility the selector must currently have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_visible: Option<bool>,
+
+    /// For `add_workspace_root`: the absolute path of an existing directory to
+    /// add as a workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl WindowControlRequest {
@@ -149,6 +162,7 @@ impl Default for WindowControlRequest {
             selector: None,
             expect_text: None,
             expect_visible: None,
+            path: None,
         }
     }
 }
@@ -390,5 +404,18 @@ mod tests {
         assert_eq!(parsed.token, "deadbeef");
         assert_eq!(parsed.request.operation, WindowControlOperation::Type);
         assert!(parsed.request.submit);
+    }
+
+    #[test]
+    fn add_workspace_root_operation_serializes() {
+        let value = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::AddWorkspaceRoot,
+            path: Some("/tmp/zed-wip-example".into()),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(value["operation"], "add_workspace_root");
+        assert_eq!(value["path"], "/tmp/zed-wip-example");
+        assert!(value.get("selector").is_none());
     }
 }
