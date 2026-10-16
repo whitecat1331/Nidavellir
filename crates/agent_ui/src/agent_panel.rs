@@ -96,8 +96,9 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, OpenOptions, OpenVisible,
+    PathList, SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace,
+    WorkspaceId, WorkspaceManager,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -5838,11 +5839,157 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
             let panel = panel
                 .upgrade()
                 .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
+            // The two root-add operations mutate the worktree set and must await
+            // the open to report the resulting roots, so they are handled here
+            // rather than in the synchronous `window_control_dispatch`.
+            if matches!(
+                request.operation,
+                agent::WindowControlOperation::AddWorktreeRoot
+                    | agent::WindowControlOperation::AddProjectRoot
+            ) {
+                return window_control_add_workspace_root(&panel, request, window, cx).await;
+            }
             window.update(cx, |_root, window, cx| {
                 window_control_dispatch(&panel, request, window, cx)
             })?
         })
     }
+}
+
+/// Add a folder as a workspace root on behalf of the agent.
+///
+/// Mirrors `ProjectPanel::add_folder_to_workspace` — persist the membership for
+/// a managed workspace, then add the root to the live worktree set — but takes
+/// the path directly instead of opening the interactive folder picker. Runs
+/// outside any panel update, like every other mutating `window_control` op.
+///
+/// The two operations differ only in validation: `add_worktree_root` is
+/// auto-allowed, so it is constrained to directories whose name matches the
+/// configured worktree prefix (default `zed-wip-`); `add_project_root` accepts
+/// any existing directory.
+async fn window_control_add_workspace_root(
+    panel: &Entity<AgentPanel>,
+    request: agent::WindowControlRequest,
+    window: gpui::AnyWindowHandle,
+    cx: &mut gpui::AsyncApp,
+) -> Result<serde_json::Value> {
+    let operation = request.operation.label();
+    let is_worktree = matches!(
+        request.operation,
+        agent::WindowControlOperation::AddWorktreeRoot
+    );
+    let path = request
+        .path
+        .clone()
+        .ok_or_else(|| anyhow!("`{operation}` requires `path`"))?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        bail!(
+            "`{operation}` requires an absolute path, got `{}`",
+            path.display()
+        );
+    }
+    if !path.is_dir() {
+        bail!(
+            "`{operation}` path is not an existing directory: `{}`",
+            path.display()
+        );
+    }
+
+    // `add_worktree_root` is auto-allowed, so constrain it to directories whose
+    // name matches the configured worktree prefix — otherwise the agent could
+    // smuggle an arbitrary folder through the auto-allowed path.
+    if is_worktree {
+        let pattern = window.update(cx, |_root, _window, cx| {
+            AgentSettings::get_global(cx).worktree_root_pattern.clone()
+        })?;
+        let pattern = pattern.as_deref().unwrap_or("zed-wip-");
+        if !worktree_path_matches_pattern(&path, pattern) {
+            bail!(
+                "`add_worktree_root` path `{}` does not match the worktree prefix \
+                 `{pattern}`; use `add_project_root` for non-worktree folders",
+                path.display()
+            );
+        }
+    }
+
+    let workspace = panel
+        .read_with(cx, |panel, _cx| panel.workspace.upgrade())
+        .ok_or_else(|| anyhow!("No workspace is available"))?;
+
+    // Read the state and start the open inside a window update (which yields a
+    // `&mut App`), then await the open outside it: the root-add ops are the only
+    // ops that must await the worktree open to report the resulting roots.
+    let (already_root, managed_workspace_id, opened): (
+        bool,
+        Option<workspace::workspace_manager::ManagedWorkspaceId>,
+        Option<Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>>>,
+    ) = window.update(cx, |_root, window, cx| {
+        // Already a root: no-op, so re-adding does not re-open the worktree.
+        let already_root = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path.as_path())
+        });
+        if already_root {
+            return (true, None, None);
+        }
+        let managed_workspace_id =
+            workspace.read_with(cx, |workspace, _cx| workspace.managed_workspace_id());
+        let opened = workspace.update(cx, |workspace, cx| {
+            workspace.open_paths(
+                vec![path.clone()],
+                OpenOptions {
+                    visible: Some(OpenVisible::All),
+                    skip_managed_workspace_ask: true,
+                    ..Default::default()
+                },
+                None,
+                window,
+                cx,
+            )
+        });
+        (false, managed_workspace_id, Some(opened))
+    })?;
+
+    if let Some(managed_workspace_id) = managed_workspace_id {
+        let manager = window.update(cx, |_root, _window, cx| WorkspaceManager::global(cx))?;
+        manager
+            .add_project(managed_workspace_id, path.clone())
+            .await
+            .log_err();
+    }
+    if let Some(opened) = opened {
+        for result in opened.await.into_iter().flatten() {
+            result.log_err();
+        }
+    }
+
+    let roots = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                agent::redact_sensitive(&worktree.read(cx).abs_path().to_string_lossy())
+            })
+            .collect::<Vec<_>>()
+    });
+
+    Ok(serde_json::json!({
+        "added": agent::redact_sensitive(&path.to_string_lossy()),
+        "already_root": already_root,
+        "workspace": { "roots": roots },
+    }))
+}
+
+/// Whether `path`'s final component matches the configured worktree prefix.
+fn worktree_path_matches_pattern(path: &std::path::Path, pattern: &str) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name_lower = name.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+    !pattern_lower.is_empty() && name_lower.starts_with(pattern_lower.as_str())
 }
 
 /// A named, addressable UI affordance for the dev-only window-control surface
@@ -6118,6 +6265,12 @@ pub(crate) fn window_control_dispatch(
             panel.read_with(cx, |panel, cx| {
                 window_control_assert(panel, &selector, &request, window, cx)
             })
+        }
+        Operation::AddWorktreeRoot | Operation::AddProjectRoot => {
+            // Handled by the host, which can await the worktree open
+            // (`window_control_add_workspace_root`); this dispatch is synchronous.
+            let label = request.operation.label();
+            bail!("`{label}` is handled by the window-control host")
         }
     }
 }
@@ -8390,6 +8543,25 @@ mod tests {
             );
         }
         assert!(window_control_action("agent::DefinitelyNotAnAction").is_err());
+    }
+
+    #[test]
+    fn worktree_path_matches_pattern_checks_final_component() {
+        let path = std::path::Path::new;
+        assert!(worktree_path_matches_pattern(
+            path("/tmp/zed-wip-native-git-tool"),
+            "zed-wip-"
+        ));
+        assert!(worktree_path_matches_pattern(
+            path("/tmp/Zed-Wip-Mixed-Case"),
+            "zed-wip-"
+        ));
+        assert!(!worktree_path_matches_pattern(
+            path("/tmp/some-project"),
+            "zed-wip-"
+        ));
+        // Fail closed on an empty prefix.
+        assert!(!worktree_path_matches_pattern(path("/tmp/zed-wip-x"), ""));
     }
 
     /// Reproduction of the 2026-10-09 failure that motivated

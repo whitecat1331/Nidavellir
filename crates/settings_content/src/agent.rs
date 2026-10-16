@@ -373,6 +373,13 @@ pub struct AgentSettingsContent {
     /// Path to the Chromium binary used by the browser tool. When unset, the
     /// tool discovers Chrome/Edge from common install locations.
     pub browser_chromium_path: Option<PathBuf>,
+
+    /// Case-insensitive prefix identifying a git worktree directory by its
+    /// final path component. `add_worktree_root` only accepts paths whose
+    /// directory name starts with this prefix (default `zed-wip-`), so the
+    /// agent cannot smuggle an arbitrary folder through the auto-allowed
+    /// worktree op.
+    pub worktree_root_pattern: Option<String>,
 }
 
 impl AgentSettingsContent {

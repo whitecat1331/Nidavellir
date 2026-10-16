@@ -245,6 +245,7 @@ pub struct AgentSettings {
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
     pub browser_chromium_path: Option<PathBuf>,
+    pub worktree_root_pattern: Option<String>,
 }
 
 impl AgentSettings {
@@ -826,6 +827,7 @@ impl Settings for AgentSettings {
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
             browser_chromium_path: agent.browser_chromium_path,
+            worktree_root_pattern: agent.worktree_root_pattern,
         }
     }
 }

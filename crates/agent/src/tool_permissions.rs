@@ -612,6 +612,7 @@ mod tests {
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
             browser_chromium_path: None,
+            worktree_root_pattern: None,
         }
     }
 
