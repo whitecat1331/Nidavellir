@@ -92,7 +92,13 @@ pub fn mode_framing(profile_id: &str) -> Option<&'static str> {
         builtin_profiles::EXECUTE => Some(
             "## Agent mode: execute\n\n\
              You have full autonomy: you may edit files, run the terminal, and \
-             use the debugger.",
+             use the debugger. Route write and network git operations \
+             (`commit`, `checkout`, `switch`, `branch`, `fetch`, `pull`, \
+             `merge`, `push`, `tag`) through the `git` tool so its \
+             per-operation permissions gate merges and pushes into protected \
+             refs; use `terminal` for git commands the tool does not model \
+             (e.g. `git worktree add`, `git status`) and for build/test/run \
+             commands.",
         ),
         builtin_profiles::DEBUG => Some(
             "## Agent mode: debug\n\n\
@@ -121,7 +127,10 @@ pub fn plan_framing() -> &'static str {
      each returned suite, and cite the results in the plan. Always load the \
      `dev-flow` skill and follow its end-to-end route: mark the plan's \
      `## Checklist` items as each completes (in the same edit, never in bulk), \
-     and never merge or release before every gate has actually run and passed."
+     and never merge or release before every gate has actually run and passed. \
+     Route write and network git operations through the `git` tool where \
+     available; its per-operation permissions gate merges and pushes into \
+     protected refs."
 }
 
 /// The REA (reverse-engineering) overlay. Unlike plan mode (framing-only),
