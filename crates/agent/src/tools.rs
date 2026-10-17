@@ -17,6 +17,7 @@ mod fetch_tool;
 mod find_path_tool;
 mod find_references_tool;
 mod get_code_actions_tool;
+mod git_tool;
 mod go_to_definition_tool;
 mod graph_tool;
 mod grep_tool;
@@ -96,6 +97,7 @@ pub use fetch_tool::*;
 pub use find_path_tool::*;
 pub use find_references_tool::*;
 pub use get_code_actions_tool::*;
+pub use git_tool::*;
 pub use go_to_definition_tool::*;
 pub use graph_tool::*;
 pub use grep_tool::*;
@@ -231,6 +233,7 @@ tools! {
     FindPathTool,
     FindReferencesTool,
     GetCodeActionsTool,
+    GitTool,
     GoToDefinitionTool,
     GraphTool,
     GrepTool,
@@ -311,13 +314,15 @@ mod tests {
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(ContainerTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(VmTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(GitTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
             let expected = *name != FetchTool::NAME
                 && *name != TerminalTool::NAME
                 && *name != ContainerTool::NAME
-                && *name != VmTool::NAME;
+                && *name != VmTool::NAME
+                && *name != GitTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,
