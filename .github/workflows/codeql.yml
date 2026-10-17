@@ -1,12 +1,18 @@
 name: Nidavellir CodeQL
 
+# CodeQL takes ~60 min on this Rust workspace, so it no longer runs on every
+# dev push. It runs on PRs to main, on main pushes, weekly, and on demand.
+# (`schedule`/`workflow_dispatch` need this file on the default branch; `main`
+# is an upstream mirror without it, so use `workflow_dispatch --ref dev` or a
+# PR when available.)
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
-    branches: [main, dev]
+    branches: [main]
   schedule:
     - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
