@@ -750,7 +750,7 @@ impl ThreadMetadataStore {
             .filter_map(|(thread_id, metadata)| {
                 let workspace_id = metadata.workspace_id.or_else(|| {
                     WorkspaceManager::global(cx)
-                        .workspace_id_for_paths(metadata.folder_paths())
+                        .workspace_id_for_paths_relaxed(metadata.folder_paths())
                         .log_err()
                         .flatten()
                 });
@@ -1535,7 +1535,7 @@ impl ThreadMetadataStore {
         // the folder set) threads that predate tagging.
         let workspace_id = existing_thread.and_then(|t| t.workspace_id).or_else(|| {
             WorkspaceManager::global(cx)
-                .workspace_id_for_paths(worktree_paths.folder_path_list())
+                .workspace_id_for_paths_relaxed(worktree_paths.folder_path_list())
                 .log_err()
                 .flatten()
         });
@@ -1727,14 +1727,15 @@ impl ThreadMetadataDb {
 
     /// A cheap change signal for the sidebar metadata table, used to detect
     /// writes from other Zed instances sharing the same database file. Any
-    /// insert, delete, archive, or timestamp update changes at least one of
+    /// insert, delete, archive, or `updated_at` change alters at least one of
     /// the aggregated values, so a polling watcher can reload on external
-    /// changes without deserializing every row.
+    /// changes without deserializing every row. Interaction-only writes
+    /// (`interacted_at`) are intentionally excluded so local clicks don't force
+    /// a full reload every poll.
     #[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
     pub fn change_fingerprint(&self) -> anyhow::Result<String> {
         let row = self.select_row::<String>(
             "SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), '') || ':' || \
-             COALESCE(MAX(interacted_at), '') || ':' || COALESCE(MAX(created_at), '') || ':' || \
              COALESCE(SUM(archived), 0) \
              FROM sidebar_threads",
         )?()?;
@@ -2285,6 +2286,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_change_fingerprint_ignores_interaction_only_writes(_cx: &mut TestAppContext) {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let now = Utc::now();
+        let mut metadata = make_metadata("session-1", "Title", now, PathList::default());
+        db.save(metadata.clone()).await.unwrap();
+
+        let baseline = db.change_fingerprint().unwrap();
+
+        metadata.interacted_at = Some(now + chrono::Duration::seconds(1));
+        db.save(metadata.clone()).await.unwrap();
+        assert_eq!(
+            db.change_fingerprint().unwrap(),
+            baseline,
+            "an interaction-only write must not change the reload signal"
+        );
+
+        metadata.updated_at = now + chrono::Duration::seconds(2);
+        db.save(metadata).await.unwrap();
+        assert_ne!(
+            db.change_fingerprint().unwrap(),
+            baseline,
+            "an updated_at write must change the reload signal"
+        );
+    }
+
+    #[gpui::test]
     async fn test_save_dedupes_same_session_across_thread_ids(_cx: &mut TestAppContext) {
         let now = Utc::now();
         let first = make_metadata(
@@ -2452,6 +2485,57 @@ mod tests {
                 .filter_map(|entry| entry.session_id.as_ref().map(|s| s.0.to_string()))
                 .collect();
             assert_eq!(second_path_entries, vec!["session-2"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_relaxed_workspace_backfill_indexes_subset_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let manager = cx.update(|cx| WorkspaceManager::global(cx));
+        let workspace_id = manager
+            .create(
+                "Subset Test".into(),
+                vec![
+                    Path::new("/project-a").to_path_buf(),
+                    Path::new("/project-b").to_path_buf(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let subset_paths = PathList::new(&[Path::new("/project-a")]);
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(
+                    make_metadata("session-subset", "Subset Thread", Utc::now(), subset_paths),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let reload = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| store.reload(cx))
+        });
+        reload.await;
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let entries: Vec<_> = store.entries_for_workspace(workspace_id).collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "a thread whose paths are a subset of a workspace should still index under it"
+            );
+            assert_eq!(
+                entries[0].session_id.as_ref().unwrap().0.as_ref(),
+                "session-subset"
+            );
         });
     }
 
