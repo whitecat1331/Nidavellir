@@ -1,13 +1,28 @@
 name: Nidavellir CI
 
+# CI tiers (2026-10-17). Jobs run in parallel, so wall time is the slowest
+# job: build-smoke (17m) and the windows/macos test legs (12-16m) are the
+# critical path, while the ubuntu test slice is ~7m and is what caught the
+# 1.22 default.json regression. So:
+#   - push to dev          -> LIGHT: checks + check + clippy + ubuntu tests
+#   - `ci-full-*` tag      -> FULL: 3-OS test matrix + workspace compile smoke
+#   - pull_request to main -> FULL (used if a dev -> main promotion PR returns)
+#   - workflow_dispatch    -> FULL on demand, when this file is on the default
+#                             branch. `main` is an upstream mirror without it,
+#                             so the `ci-full-*` tag is the dependable trigger.
+# Release gate: push `ci-full-<sha>` on the dev head before rebuilding the
+# shared feature/dev slots and require it green.
 on:
   push:
-    branches: [main, dev]
+    branches: [dev]
+    tags: ['ci-full-*']
   pull_request:
-    branches: [main, dev]
+    branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Include the event so a push cannot cancel a release-gate run on the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -78,7 +93,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # LIGHT tier (branch push): ubuntu only. FULL tier (tag, PR, dispatch):
+        # the three-OS matrix.
+        os: ${{ (github.event_name == 'push' && github.ref_type == 'branch') && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install system dependencies
@@ -101,6 +118,9 @@ jobs:
 
   build-smoke:
     name: Workspace compile smoke
+    # FULL tier only: this is the CI critical path (17m) and compiles targets
+    # the light jobs already exercise.
+    if: "!(github.event_name == 'push' && github.ref_type == 'branch')"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
