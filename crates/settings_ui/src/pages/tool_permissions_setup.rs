@@ -81,6 +81,12 @@ const TOOLS: &[ToolInfo] = &[
         regex_explanation: "Patterns are matched against `add_worktree_root path:<path>` and `add_project_root path:<path>`. Only the two root-add operations request permission; the read/control operations do not.",
     },
     ToolInfo {
+        id: "git",
+        name: "Git",
+        description: "Git operations with per-operation permission rules",
+        regex_explanation: "Patterns are matched against `operation:<verb> [ref:<ref>] [remote:<remote>] [tag:<tag>] protected:<bool>`, e.g. `operation:merge ref:wip/foo protected:false`. Protected refs (`feature`, `dev`, `main`) are flagged by `protected:true`.",
+    },
+    ToolInfo {
         id: "search_web",
         name: "Web Search",
         description: "Web search queries",

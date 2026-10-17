@@ -2,7 +2,7 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, BrowserTool, CodeActionStore, ContainerTool,
     ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel,
     DbThread, DebuggerTool, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
-    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GraphTool, GrepTool,
+    FindReferencesTool, GetCodeActionsTool, GitTool, GoToDefinitionTool, GraphTool, GrepTool,
     ListAgentsAndModelsTool, ListDirectoryTool, MemoryStore, MemoryTool, MovePathTool, NetworkTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSearchTool,
@@ -1198,6 +1198,11 @@ impl ToolPermissionContext {
                     extract_path_pattern(value),
                     extract_path_pattern_display(value),
                 )
+            } else if tool_name == GitTool::NAME {
+                (
+                    extract_git_pattern(value),
+                    extract_git_pattern_display(value),
+                )
             } else if tool_name == FetchTool::NAME {
                 (
                     extract_url_pattern(value),
@@ -2385,6 +2390,7 @@ impl Thread {
         ));
         self.add_tool(FetchTool::new(self.project.read(cx).client().http_client()));
         self.add_tool(FindPathTool::new(self.project.clone()));
+        self.add_tool(GitTool::new(self.project.clone()));
         self.add_tool(GrepTool::new(self.project.clone()));
         self.add_tool(ListDirectoryTool::new(self.project.clone()));
         self.add_tool(MovePathTool::new(self.project.clone()));

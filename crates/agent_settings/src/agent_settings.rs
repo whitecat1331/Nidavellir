@@ -1718,10 +1718,22 @@ mod tests {
 
         assert_eq!(permissions.default, ToolPermissionMode::Confirm);
 
-        assert!(
-            permissions.tools.is_empty(),
-            "default.json should not have any active tool-specific rules, found: {:?}",
-            permissions.tools.keys().collect::<Vec<_>>()
+        // The fork intentionally ships two tool-specific rule sets in
+        // default.json: `window_control` (auto-allows worktree adds; project
+        // adds still confirm) and `git` (protected refs stay behind
+        // `always_confirm`). Anything else appearing here is a mistake — the
+        // remaining per-tool blocks in default.json are commented-out examples.
+        // Update this list deliberately when the shipped set changes.
+        let mut tools: Vec<String> = permissions
+            .tools
+            .keys()
+            .map(|name| name.to_string())
+            .collect();
+        tools.sort_unstable();
+        assert_eq!(
+            tools,
+            ["git", "window_control"],
+            "unexpected active tool-specific rules in default.json"
         );
     }
 

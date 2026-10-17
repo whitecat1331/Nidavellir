@@ -1565,6 +1565,128 @@ fn test_window_control_worktree_allow_can_be_overridden() {
 }
 
 #[test]
+fn test_git_tool_permission_defaults_gate_every_operation() {
+    // The shipped shape: `default: confirm` + `always_confirm` on protected
+    // refs, with no allow patterns yet.
+    let mut permissions = agent_settings::ToolPermissions::default();
+    permissions.default = settings::ToolPermissionMode::Confirm;
+    permissions.tools.insert(
+        GitTool::NAME.into(),
+        agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Confirm),
+            always_allow: vec![],
+            always_deny: vec![],
+            always_confirm: vec![
+                agent_settings::CompiledRegex::new(r"\bprotected:true\b", false)
+                    .expect("protected confirm regex should compile"),
+            ],
+            invalid_patterns: vec![],
+        },
+    );
+
+    let decision = |input: String| {
+        ToolPermissionDecision::from_input(
+            GitTool::NAME,
+            &[input],
+            &permissions,
+            util::shell::ShellKind::system(),
+        )
+    };
+
+    // Every operation prompts on first use…
+    assert_eq!(
+        decision(git_permission_input("commit", None, None, None)),
+        ToolPermissionDecision::Confirm
+    );
+    assert_eq!(
+        decision(git_permission_input("merge", Some("wip/foo"), None, None)),
+        ToolPermissionDecision::Confirm
+    );
+    // …and a protected ref is confirm from the start.
+    assert_eq!(
+        decision(git_permission_input(
+            "push",
+            Some("feature"),
+            Some("origin"),
+            None
+        )),
+        ToolPermissionDecision::Confirm
+    );
+}
+
+#[test]
+fn test_git_tool_always_allow_sticks_but_protected_refs_stay_gated() {
+    // After the user clicked "Always for `operation:commit`" / `push` /
+    // `merge`, those patterns live in `always_allow`…
+    let mut permissions = agent_settings::ToolPermissions::default();
+    permissions.default = settings::ToolPermissionMode::Confirm;
+    permissions.tools.insert(
+        GitTool::NAME.into(),
+        agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Confirm),
+            always_allow: vec![
+                agent_settings::CompiledRegex::new(r"^operation:commit\b", false)
+                    .expect("commit allow regex should compile"),
+                agent_settings::CompiledRegex::new(r"^operation:push\b", false)
+                    .expect("push allow regex should compile"),
+                agent_settings::CompiledRegex::new(r"^operation:merge\b", false)
+                    .expect("merge allow regex should compile"),
+            ],
+            always_deny: vec![],
+            always_confirm: vec![
+                agent_settings::CompiledRegex::new(r"\bprotected:true\b", false)
+                    .expect("protected confirm regex should compile"),
+            ],
+            invalid_patterns: vec![],
+        },
+    );
+
+    let decision = |input: String| {
+        ToolPermissionDecision::from_input(
+            GitTool::NAME,
+            &[input],
+            &permissions,
+            util::shell::ShellKind::system(),
+        )
+    };
+
+    // …so blessed operations no longer prompt, including a local merge
+    // (the false positive that motivated the tool).
+    assert_eq!(
+        decision(git_permission_input("commit", None, None, None)),
+        ToolPermissionDecision::Allow
+    );
+    assert_eq!(
+        decision(git_permission_input("merge", Some("wip/foo"), None, None)),
+        ToolPermissionDecision::Allow
+    );
+    assert_eq!(
+        decision(git_permission_input(
+            "push",
+            Some("wip/foo"),
+            Some("origin"),
+            None
+        )),
+        ToolPermissionDecision::Allow
+    );
+    // `always_confirm` outranks `always_allow`, so protected refs keep
+    // prompting even after an "Always" click.
+    assert_eq!(
+        decision(git_permission_input(
+            "push",
+            Some("feature"),
+            Some("origin"),
+            None
+        )),
+        ToolPermissionDecision::Confirm
+    );
+    assert_eq!(
+        decision(git_permission_input("merge", Some("dev"), None, None)),
+        ToolPermissionDecision::Confirm
+    );
+}
+
+#[test]
 fn test_debugger_tool_step_back_permission_name() {
     let inputs = control_permission_inputs_for_test(
         "control",
