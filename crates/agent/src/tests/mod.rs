@@ -1687,6 +1687,60 @@ fn test_git_tool_always_allow_sticks_but_protected_refs_stay_gated() {
 }
 
 #[test]
+fn test_git_tool_current_branch_gating_outranks_sticky_allow() {
+    // A blessed `reset`/`restore` sticks while HEAD is a wip branch…
+    let mut permissions = agent_settings::ToolPermissions::default();
+    permissions.default = settings::ToolPermissionMode::Confirm;
+    permissions.tools.insert(
+        GitTool::NAME.into(),
+        agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Confirm),
+            always_allow: vec![
+                agent_settings::CompiledRegex::new(r"^operation:reset\b", false)
+                    .expect("reset allow regex should compile"),
+                agent_settings::CompiledRegex::new(r"^operation:restore\b", false)
+                    .expect("restore allow regex should compile"),
+            ],
+            always_deny: vec![],
+            always_confirm: vec![
+                agent_settings::CompiledRegex::new(r"\bprotected:true\b", false)
+                    .expect("protected confirm regex should compile"),
+            ],
+            invalid_patterns: vec![],
+        },
+    );
+
+    let decision = |input: String| {
+        ToolPermissionDecision::from_input(
+            GitTool::NAME,
+            &[input],
+            &permissions,
+            util::shell::ShellKind::system(),
+        )
+    };
+
+    assert_eq!(
+        decision(current_branch_permission_input("reset", "wip/foo")),
+        ToolPermissionDecision::Allow
+    );
+    assert_eq!(
+        decision(current_branch_permission_input("restore", "wip/foo")),
+        ToolPermissionDecision::Allow
+    );
+    // …but the current-branch `protected:true` shape keeps prompting while
+    // HEAD is a protected branch, even though the operation itself was
+    // blessed.
+    assert_eq!(
+        decision(current_branch_permission_input("reset", "feature")),
+        ToolPermissionDecision::Confirm
+    );
+    assert_eq!(
+        decision(current_branch_permission_input("restore", "dev")),
+        ToolPermissionDecision::Confirm
+    );
+}
+
+#[test]
 fn test_debugger_tool_step_back_permission_name() {
     let inputs = control_permission_inputs_for_test(
         "control",
