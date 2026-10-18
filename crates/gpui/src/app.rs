@@ -744,6 +744,7 @@ pub struct App {
     pub(crate) restart_arguments: Vec<OsString>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
+    pub(crate) key_binding_dispatched: bool,
     pub(crate) prompt_builder: Option<PromptBuilder>,
     pub(crate) window_invalidators_by_entity:
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
@@ -857,6 +858,7 @@ impl App {
                 window_closed_observers: SubscriberSet::new(),
                 layout_id_buffer: Default::default(),
                 propagate_event: true,
+                key_binding_dispatched: false,
                 prompt_builder: Some(PromptBuilder::Default),
                 #[cfg(any(feature = "inspector", debug_assertions))]
                 inspector_renderer: None,

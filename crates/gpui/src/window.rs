@@ -5168,7 +5168,7 @@ impl Window {
             }),
             cx,
         );
-        if !result.propagate {
+        if !result.propagate || cx.key_binding_dispatched {
             return true;
         }
 
@@ -5220,6 +5220,11 @@ impl Window {
 
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
+        // A key binding may dispatch an action without stopping propagation
+        // (global action listeners do not stop propagation by default). Track
+        // that separately so `dispatch_keystroke` can report the keystroke as
+        // handled even when propagation continued.
+        cx.key_binding_dispatched = false;
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
@@ -5738,6 +5743,7 @@ impl Window {
 
         if !skip_bindings {
             for binding in match_result.bindings {
+                cx.key_binding_dispatched = true;
                 self.dispatch_action_on_node(node_id, binding.action.as_ref(), cx);
                 if !cx.propagate_event {
                     self.dispatch_keystroke_observers(
@@ -6019,6 +6025,7 @@ impl Window {
 
             cx.propagate_event = true;
             for binding in replay.bindings {
+                cx.key_binding_dispatched = true;
                 self.dispatch_action_on_node(node_id, binding.action.as_ref(), cx);
                 if !cx.propagate_event {
                     self.dispatch_keystroke_observers(
@@ -7395,11 +7402,14 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, LongPressEvent, MouseButton,
-        MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
+        InputEvent as _, InteractiveElement as _, IntoElement, KeyBinding, Keystroke,
+        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point,
+        Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
+        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance, WindowOptions,
+        canvas, div, point, px, size,
     };
+
+    actions!(window_test, [HandledProbeAction]);
 
     struct EmptyView;
 
@@ -8364,5 +8374,36 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn dispatch_keystroke_reports_binding_that_does_not_stop_propagation(cx: &mut TestAppContext) {
+        let action_count = Rc::new(Cell::new(0));
+        // Use `AnyWindowHandle` (not `WindowHandle<T>`) so the root view is not
+        // borrowed while `dispatch_keystroke` dispatches the action on it.
+        let window: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+
+        cx.update(|cx| {
+            let action_count = action_count.clone();
+            cx.on_action(move |_: &HandledProbeAction, _| {
+                action_count.set(action_count.get() + 1);
+            });
+            cx.bind_keys([KeyBinding::new("f9", HandledProbeAction, None)]);
+        });
+
+        let handled = window
+            .update(cx, |_, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse("f9").unwrap(), cx)
+            })
+            .unwrap();
+        assert!(
+            handled,
+            "a keystroke whose binding fired must be reported as handled, \
+             even when the action does not stop propagation"
+        );
+        assert_eq!(action_count.get(), 1, "the bound action must have run");
     }
 }
