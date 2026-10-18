@@ -471,7 +471,7 @@ pub fn into_deepseek(
         }
     }
 
-    Ok(deepseek::Request {
+    let mut request = deepseek::Request {
         model: model.id().to_string(),
         messages,
         stream: true,
@@ -515,7 +515,12 @@ pub fn into_deepseek(
                 })
             })
             .collect::<Result<_>>()?,
-    })
+    };
+    // The DeepSeek API rejects a request whose messages plus reserved
+    // completion exceed the model's context window even when the messages
+    // alone fit, so shrink the completion budget to the remaining headroom.
+    deepseek::clamp_completion_budget(&mut request, model.max_token_count());
+    Ok(request)
 }
 
 fn deepseek_thinking(
@@ -681,6 +686,7 @@ impl DeepSeekEventMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use language_model::LanguageModelRequestMessage;
 
     #[test]
     fn request_output_limits_reach_deepseek_payloads() -> Result<()> {
@@ -740,5 +746,87 @@ mod tests {
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.cache_creation_input_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    /// The API's real maximum context length for deepseek-v4-pro (live 400
+    /// response, 2026-10-18). The declared window must match it so the UI ring
+    /// and the compaction thresholds count against the right denominator.
+    #[test]
+    fn deepseek_v4_pro_window_matches_api_limit() {
+        assert_eq!(deepseek::Model::V4Pro.max_token_count(), 1_048_576);
+    }
+
+    #[test]
+    fn completion_budget_unchanged_when_headroom_abundant() -> Result<()> {
+        let request = into_deepseek(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("small prompt".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                ..Default::default()
+            },
+            &deepseek::Model::V4Pro,
+            Some(384_000),
+        )?;
+        assert_eq!(request.max_tokens, Some(384_000));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_budget_clamped_to_remaining_headroom() -> Result<()> {
+        // ~3.2 MB of message text ≈ 800K tokens by the 4-bytes heuristic,
+        // leaving ~230K of headroom in V4Pro's window — less than the 384K
+        // model budget, so the clamp must shrink it.
+        let filler = "a".repeat(3_200_000);
+        let request = into_deepseek(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(filler)],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                ..Default::default()
+            },
+            &deepseek::Model::V4Pro,
+            Some(384_000),
+        )?;
+        let max_tokens = request
+            .max_tokens
+            .expect("the clamp keeps a positive budget");
+        assert!(max_tokens < 384_000, "budget should shrink: {max_tokens}");
+        assert!(
+            request.estimated_input_tokens()
+                + max_tokens
+                + deepseek::COMPLETION_BUDGET_SAFETY_MARGIN
+                <= deepseek::Model::V4Pro.max_token_count(),
+            "estimate + budget + margin must fit inside the window"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_budget_floored_when_input_exhausts_window() -> Result<()> {
+        // ~4.4 MB of message text ≈ 1.1M estimated tokens — past the window,
+        // so the clamp floors the budget instead of sending zero.
+        let filler = "a".repeat(4_400_000);
+        let request = into_deepseek(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(filler)],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                ..Default::default()
+            },
+            &deepseek::Model::V4Pro,
+            Some(384_000),
+        )?;
+        assert_eq!(request.max_tokens, Some(deepseek::MIN_COMPLETION_BUDGET));
+        Ok(())
     }
 }

@@ -106,7 +106,15 @@ impl Model {
 
     pub fn max_token_count(&self) -> u64 {
         match self {
-            Self::V4Flash | Self::Flash | Self::V4Pro => 1_000_000,
+            // The API's real maximum context length for deepseek-v4-pro is
+            // 1,048,576 (live 400 response, 2026-10-18: "maximum context length
+            // is 1048576 tokens"). Declaring less under-counts the window for
+            // the UI ring and the agent's compaction thresholds. The flash
+            // variants keep 1,000,000: no live evidence of a larger window,
+            // and under-declaring them is the safe direction (the completion
+            // clamp only ever shrinks the budget against this value).
+            Self::V4Pro => 1_048_576,
+            Self::V4Flash | Self::Flash => 1_000_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
@@ -150,6 +158,39 @@ pub struct Request {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+}
+
+/// Tokens reserved so a request whose size is only estimated never quite
+/// reaches the API's context limit.
+pub const COMPLETION_BUDGET_SAFETY_MARGIN: u64 = 16_384;
+
+/// The floor for `max_tokens` when headroom is nearly exhausted, so a doomed
+/// request still gets a positive completion budget and fails honestly rather
+/// than being sent with a nonsensical zero.
+pub const MIN_COMPLETION_BUDGET: u64 = 1_024;
+
+impl Request {
+    /// Rough estimate of the request's input-token count from its serialized
+    /// byte size, using the "1 token ≈ 4 bytes" heuristic. The estimate feeds
+    /// the completion-budget clamp; it may under-count token-dense content,
+    /// which the safety margin absorbs.
+    pub fn estimated_input_tokens(&self) -> u64 {
+        (serde_json::to_string(self).unwrap_or_default().len() / 4) as u64
+    }
+}
+
+/// Clamps the request's completion budget so `estimated_input + max_tokens`
+/// cannot exceed the model's context window: the DeepSeek API rejects a
+/// request whose messages plus reserved completion exceed its maximum context
+/// length even when the messages alone fit (live 400, 2026-10-18).
+pub fn clamp_completion_budget(request: &mut Request, context_window: u64) {
+    let Some(max_tokens) = request.max_tokens else {
+        return;
+    };
+    let headroom = context_window
+        .saturating_sub(request.estimated_input_tokens())
+        .saturating_sub(COMPLETION_BUDGET_SAFETY_MARGIN);
+    request.max_tokens = Some(max_tokens.min(headroom).max(MIN_COMPLETION_BUDGET));
 }
 
 #[derive(Debug, Serialize, Deserialize)]
