@@ -51,6 +51,16 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 ///   is a protected branch.
 /// - `stash` — stash changes (`push` with an optional `message`, `pop`, or
 ///   `apply`).
+/// - `worktree` — manage worktrees (`add`/`remove`). `add` requires `ref`
+///   (the new branch, passed with `-b`) and `destination` (an absolute path),
+///   with `source` as the optional start point; `remove` requires
+///   `destination`, and `force` passes `--force`.
+/// - `clone` — clone `url` into `destination` (both required; `destination`
+///   absolute). External-facing: joins `fetch`/`pull`/`push` in the
+///   restricted-mode set.
+/// - `init` — initialize a repository at `destination` (required, absolute).
+/// - `remote` — manage remotes (`add`/`remove`/`rename`/`set-url`). `remote`
+///   is the remote name; `url` for `add`/`set-url`; `new_name` for `rename`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GitToolInput {
     /// The git operation to perform.
@@ -64,11 +74,13 @@ pub struct GitToolInput {
     pub cd: String,
 
     /// The ref to operate on: the ref to `checkout`/`switch`/`merge`/`reset`,
-    /// the branch name for `branch`, or an optional start point for `tag`.
+    /// the branch name for `branch`, the new branch name for `worktree add`
+    /// (passed with `-b`), or an optional start point for `tag`.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
 
-    /// The remote for `fetch`/`pull`/`push` (e.g. `origin`).
+    /// The remote for `fetch`/`pull`/`push`, or the remote name for
+    /// `remote` (e.g. `origin`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
 
@@ -99,7 +111,8 @@ pub struct GitToolInput {
     #[serde(default)]
     pub staged: bool,
 
-    /// For `restore`: pass `--source=<source>` to restore from another ref.
+    /// For `restore`: the ref to restore from (`--source=`). For
+    /// `worktree add`: the optional start point for the new branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 
@@ -107,6 +120,35 @@ pub struct GitToolInput {
     /// `apply`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stash_subcommand: Option<StashSubcommand>,
+
+    /// For `worktree add`/`worktree remove`, `clone`, and `init`: the
+    /// destination path (required, absolute). `worktree add` writes the new
+    /// worktree here; `clone` and `init` create the repository here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+
+    /// For `clone`: the repository URL to clone from. For `remote add` and
+    /// `remote set-url`: the remote URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// For `remote rename`: the new remote name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_name: Option<String>,
+
+    /// For `worktree remove`: pass `--force` to remove a worktree with
+    /// uncommitted changes.
+    #[serde(default)]
+    pub force: bool,
+
+    /// For `worktree`: which subcommand to run (`add` default, `remove`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_subcommand: Option<WorktreeSubcommand>,
+
+    /// For `remote`: which subcommand to run (`add` default, `remove`,
+    /// `rename`, `set-url`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_subcommand: Option<RemoteSubcommand>,
 }
 
 /// A git operation. Only write and network operations are modeled; read-only
@@ -142,6 +184,15 @@ pub enum GitOperation {
     Restore,
     /// Stash changes (`push` with an optional `message`, `pop`, or `apply`).
     Stash,
+    /// Manage worktrees (`add` requires `ref` + `destination`; `remove`
+    /// requires `destination`, `force` optional).
+    Worktree,
+    /// Clone `url` into `destination` (both required). External-facing.
+    Clone,
+    /// Initialize a repository at `destination` (required).
+    Init,
+    /// Manage remotes (`add`/`remove`/`rename`/`set-url`).
+    Remote,
 }
 
 impl GitOperation {
@@ -160,6 +211,10 @@ impl GitOperation {
             Self::Reset => "reset",
             Self::Restore => "restore",
             Self::Stash => "stash",
+            Self::Worktree => "worktree",
+            Self::Clone => "clone",
+            Self::Init => "init",
+            Self::Remote => "remote",
         }
     }
 }
@@ -205,6 +260,52 @@ impl StashSubcommand {
             Self::Push => "push",
             Self::Pop => "pop",
             Self::Apply => "apply",
+        }
+    }
+}
+
+/// The `git worktree` subcommand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSubcommand {
+    /// Create a worktree from `-b` `ref` at `destination` (default).
+    #[default]
+    Add,
+    /// Remove the worktree at `destination`; `force` passes `--force`.
+    Remove,
+}
+
+impl WorktreeSubcommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// The `git remote` subcommand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSubcommand {
+    /// Add a remote named `remote` pointing at `url` (default).
+    #[default]
+    Add,
+    /// Remove the remote named `remote`.
+    Remove,
+    /// Rename the remote `remote` to `new_name`.
+    Rename,
+    /// Point the remote `remote` at `url`.
+    SetUrl,
+}
+
+impl RemoteSubcommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Rename => "rename",
+            Self::SetUrl => "set-url",
         }
     }
 }
@@ -269,6 +370,26 @@ fn required_arg(value: Option<&str>, field: &str, operation: &str) -> Result<Str
 /// `-` is refused so interactive forms (`add -p`, `add -i`) and unknown flags
 /// can never reach git argv.
 const ADD_FLAG_ALLOWLIST: &[&str] = &["-A", "--all", "-u", "--update"];
+
+/// The destination path for `worktree add`/`worktree remove`, `clone`, and
+/// `init`. It must be absolute — a destination is a fresh filesystem location
+/// (a new worktree, a new clone, a new repo), not a project root, so it is
+/// never resolved through `working_dir`.
+fn required_destination(input: &GitToolInput, operation: &str) -> Result<String, String> {
+    let destination = input
+        .destination
+        .as_deref()
+        .ok_or_else(|| format!("`{operation}` requires the `destination` field"))?;
+    if destination.trim().is_empty() {
+        return Err(format!("`{operation}` requires a non-empty `destination`"));
+    }
+    if !Path::new(destination).is_absolute() {
+        return Err(format!(
+            "`{operation}` requires an absolute `destination` path (got {destination:?})"
+        ));
+    }
+    Ok(destination.to_string())
+}
 
 fn required_pathspecs(input: &GitToolInput, operation: &str) -> Result<Vec<String>, String> {
     let pathspecs = input
@@ -364,6 +485,56 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
             }
             StashSubcommand::Pop => args.push("pop".to_string()),
             StashSubcommand::Apply => args.push("apply".to_string()),
+        },
+        GitOperation::Worktree => match input.worktree_subcommand.unwrap_or_default() {
+            WorktreeSubcommand::Add => {
+                args.push("add".to_string());
+                args.push("-b".to_string());
+                args.push(required_arg(reference, "ref", operation)?);
+                args.push(required_destination(input, operation)?);
+                if let Some(start_point) = &input.source {
+                    args.push(start_point.clone());
+                }
+            }
+            WorktreeSubcommand::Remove => {
+                args.push("remove".to_string());
+                if input.force {
+                    args.push("--force".to_string());
+                }
+                args.push(required_destination(input, operation)?);
+            }
+        },
+        GitOperation::Clone => {
+            args.push(required_arg(input.url.as_deref(), "url", operation)?);
+            args.push(required_destination(input, operation)?);
+        }
+        GitOperation::Init => {
+            args.push(required_destination(input, operation)?);
+        }
+        GitOperation::Remote => match input.remote_subcommand.unwrap_or_default() {
+            RemoteSubcommand::Add => {
+                args.push("add".to_string());
+                args.push(required_arg(input.remote.as_deref(), "remote", operation)?);
+                args.push(required_arg(input.url.as_deref(), "url", operation)?);
+            }
+            RemoteSubcommand::Remove => {
+                args.push("remove".to_string());
+                args.push(required_arg(input.remote.as_deref(), "remote", operation)?);
+            }
+            RemoteSubcommand::Rename => {
+                args.push("rename".to_string());
+                args.push(required_arg(input.remote.as_deref(), "remote", operation)?);
+                args.push(required_arg(
+                    input.new_name.as_deref(),
+                    "new_name",
+                    operation,
+                )?);
+            }
+            RemoteSubcommand::SetUrl => {
+                args.push("set-url".to_string());
+                args.push(required_arg(input.remote.as_deref(), "remote", operation)?);
+                args.push(required_arg(input.url.as_deref(), "url", operation)?);
+            }
         },
     }
     Ok(args)
@@ -487,11 +658,16 @@ async fn run_git_operation(
                 })?;
             current_branch_permission_input(operation, current_branch.trim())
         }
-        // `add`/`stash` never take a ref, remote, or tag: keep their
-        // permission input free of stray fields so rules key on the operation
-        // alone.
-        GitOperation::Add | GitOperation::Stash => {
+        // `add`/`stash`/`worktree`/`init` never take a ref, remote, or tag:
+        // keep their permission input free of stray fields so rules key on
+        // the operation alone.
+        GitOperation::Add | GitOperation::Stash | GitOperation::Worktree | GitOperation::Init => {
             git_permission_input(operation, None, None, None)
+        }
+        // `clone` keys on the source URL; `remote` on the remote name.
+        GitOperation::Clone => git_permission_input(operation, None, input.url.as_deref(), None),
+        GitOperation::Remote => {
+            git_permission_input(operation, None, input.remote.as_deref(), None)
         }
         _ => git_permission_input(
             operation,
@@ -621,6 +797,12 @@ mod tests {
             staged: false,
             source: None,
             stash_subcommand: None,
+            destination: None,
+            url: None,
+            new_name: None,
+            force: false,
+            worktree_subcommand: None,
+            remote_subcommand: None,
         }
     }
 
@@ -847,6 +1029,240 @@ mod tests {
         assert_eq!(
             assemble_git_args(&stash_apply).unwrap(),
             vec!["stash", "apply"]
+        );
+    }
+
+    #[test]
+    fn lifecycle_permission_inputs() {
+        assert_eq!(
+            git_permission_input("worktree", None, None, None),
+            "operation:worktree protected:false"
+        );
+        assert_eq!(
+            git_permission_input("init", None, None, None),
+            "operation:init protected:false"
+        );
+        assert_eq!(
+            git_permission_input(
+                "clone",
+                None,
+                Some("https://github.com/example/repo.git"),
+                None
+            ),
+            "operation:clone remote:https://github.com/example/repo.git protected:false"
+        );
+        assert_eq!(
+            git_permission_input("remote", None, Some("origin"), None),
+            "operation:remote remote:origin protected:false"
+        );
+    }
+
+    #[test]
+    fn lifecycle_argument_assembly_validates_fields() {
+        let destination = std::env::temp_dir()
+            .join("git-tool-acceptance")
+            .to_string_lossy()
+            .to_string();
+
+        let worktree_add = GitToolInput {
+            destination: Some(destination.clone()),
+            source: Some("feature".to_string()),
+            ..test_input(
+                GitOperation::Worktree,
+                Some("wip/foo"),
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            assemble_git_args(&worktree_add).unwrap(),
+            vec![
+                "worktree",
+                "add",
+                "-b",
+                "wip/foo",
+                destination.as_str(),
+                "feature"
+            ]
+        );
+
+        let worktree_add_missing_ref =
+            test_input(GitOperation::Worktree, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&worktree_add_missing_ref),
+            Err("`worktree` requires the `ref` field".to_string())
+        );
+
+        let worktree_add_missing_destination = test_input(
+            GitOperation::Worktree,
+            Some("wip/foo"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            assemble_git_args(&worktree_add_missing_destination),
+            Err("`worktree` requires the `destination` field".to_string())
+        );
+
+        let worktree_add_relative = GitToolInput {
+            destination: Some("zed-wip-foo".to_string()),
+            ..test_input(
+                GitOperation::Worktree,
+                Some("wip/foo"),
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        assert!(
+            assemble_git_args(&worktree_add_relative)
+                .unwrap_err()
+                .contains("absolute `destination` path")
+        );
+
+        let worktree_remove = GitToolInput {
+            destination: Some(destination.clone()),
+            force: true,
+            worktree_subcommand: Some(WorktreeSubcommand::Remove),
+            ..test_input(GitOperation::Worktree, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&worktree_remove).unwrap(),
+            vec!["worktree", "remove", "--force", destination.as_str()]
+        );
+
+        let clone = GitToolInput {
+            destination: Some(destination.clone()),
+            url: Some("https://github.com/example/repo.git".to_string()),
+            ..test_input(GitOperation::Clone, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&clone).unwrap(),
+            vec![
+                "clone",
+                "https://github.com/example/repo.git",
+                destination.as_str()
+            ]
+        );
+
+        let clone_missing_url = GitToolInput {
+            destination: Some(destination.clone()),
+            ..test_input(GitOperation::Clone, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&clone_missing_url),
+            Err("`clone` requires the `url` field".to_string())
+        );
+
+        let clone_missing_destination = GitToolInput {
+            url: Some("https://github.com/example/repo.git".to_string()),
+            ..test_input(GitOperation::Clone, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&clone_missing_destination),
+            Err("`clone` requires the `destination` field".to_string())
+        );
+
+        let clone_relative = GitToolInput {
+            destination: Some("new-repo".to_string()),
+            url: Some("https://github.com/example/repo.git".to_string()),
+            ..test_input(GitOperation::Clone, None, None, None, None, false)
+        };
+        assert!(
+            assemble_git_args(&clone_relative)
+                .unwrap_err()
+                .contains("absolute `destination` path")
+        );
+
+        let init = GitToolInput {
+            destination: Some(destination.clone()),
+            ..test_input(GitOperation::Init, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&init).unwrap(),
+            vec!["init", destination.as_str()]
+        );
+
+        let init_missing = test_input(GitOperation::Init, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&init_missing),
+            Err("`init` requires the `destination` field".to_string())
+        );
+
+        let remote_add = GitToolInput {
+            remote: Some("origin".to_string()),
+            url: Some("https://github.com/example/repo.git".to_string()),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&remote_add).unwrap(),
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git"
+            ]
+        );
+
+        let remote_add_missing_url = GitToolInput {
+            remote: Some("origin".to_string()),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&remote_add_missing_url),
+            Err("`remote` requires the `url` field".to_string())
+        );
+
+        let remote_remove = GitToolInput {
+            remote: Some("origin".to_string()),
+            remote_subcommand: Some(RemoteSubcommand::Remove),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&remote_remove).unwrap(),
+            vec!["remote", "remove", "origin"]
+        );
+
+        let remote_rename = GitToolInput {
+            remote: Some("origin".to_string()),
+            new_name: Some("upstream".to_string()),
+            remote_subcommand: Some(RemoteSubcommand::Rename),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&remote_rename).unwrap(),
+            vec!["remote", "rename", "origin", "upstream"]
+        );
+
+        let remote_rename_missing_new_name = GitToolInput {
+            remote: Some("origin".to_string()),
+            remote_subcommand: Some(RemoteSubcommand::Rename),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&remote_rename_missing_new_name),
+            Err("`remote` requires the `new_name` field".to_string())
+        );
+
+        let remote_set_url = GitToolInput {
+            remote: Some("origin".to_string()),
+            url: Some("https://github.com/example/repo.git".to_string()),
+            remote_subcommand: Some(RemoteSubcommand::SetUrl),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&remote_set_url).unwrap(),
+            vec![
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/repo.git"
+            ]
         );
     }
 
