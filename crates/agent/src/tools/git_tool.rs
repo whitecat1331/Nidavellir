@@ -16,11 +16,17 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 ///
 /// Prefer this over the `terminal` tool for git's write and network
 /// operations: `commit`, `checkout`, `switch`, `branch`, `fetch`, `pull`,
-/// `merge`, `push`, and `tag`. Each operation is authorized through the
-/// settings permission system with a structured input string
+/// `merge`, `push`, `tag`, `add`, `reset`, `restore`, and `stash`. Each
+/// operation is authorized through the settings permission system with a
+/// structured input string
 /// (`operation:<verb> [ref:<ref>] [remote:<remote>] [tag:<tag>] protected:<bool>`),
 /// so "Always allow" decisions apply per operation and stick. Protected refs
-/// (`feature`, `dev`, `main`) always prompt.
+/// (`feature`, `dev`, `main`) always prompt; `reset`/`restore` additionally
+/// prompt whenever the *current* branch is protected, because they are
+/// history-destructive.
+///
+/// Interactive git forms (`add -p`, `add -i`, …) are never modeled — flag
+/// pathspecs are refused at argv level.
 ///
 /// Read-only git inspection (`status`, `log`, `diff`, `show`) is not modeled
 /// here; run it through the `terminal` tool as usual.
@@ -36,6 +42,15 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 /// - `push` — push to a remote. `remote` and `ref` optional.
 /// - `tag` — create a lightweight tag. Requires `tag`; `ref` is an optional
 ///   start point.
+/// - `add` — stage changes. Requires `pathspecs`; only the non-interactive
+///   flags `-A`/`--all` and `-u`/`--update` are accepted.
+/// - `reset` — reset HEAD to an optional `ref`, with an optional `mode`
+///   (`soft`/`mixed`/`hard`). Prompted while HEAD is a protected branch.
+/// - `restore` — restore working-tree files. Requires `pathspecs`; `staged`
+///   passes `--staged`, `source` passes `--source=<ref>`. Prompted while HEAD
+///   is a protected branch.
+/// - `stash` — stash changes (`push` with an optional `message`, `pop`, or
+///   `apply`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GitToolInput {
     /// The git operation to perform.
@@ -48,8 +63,8 @@ pub struct GitToolInput {
     /// `wip/` branch.
     pub cd: String,
 
-    /// The ref to operate on: the ref to `checkout`/`switch`/`merge`, the
-    /// branch name for `branch`, or an optional start point for `tag`.
+    /// The ref to operate on: the ref to `checkout`/`switch`/`merge`/`reset`,
+    /// the branch name for `branch`, or an optional start point for `tag`.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
 
@@ -61,13 +76,37 @@ pub struct GitToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
 
-    /// The commit message: required for `commit`, optional for `merge`.
+    /// The commit message: required for `commit`, optional for `merge`, and
+    /// the message for `stash push`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
     /// For `merge`: pass `--no-ff` to always create a merge commit.
     #[serde(default)]
     pub no_ff: bool,
+
+    /// For `add`/`restore`: the pathspecs to stage or restore (required).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pathspecs: Option<Vec<String>>,
+
+    /// For `reset`: the reset mode (`soft`/`mixed`/`hard`; defaults to
+    /// `mixed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ResetMode>,
+
+    /// For `restore`: pass `--staged` to unstage instead of restoring the
+    /// working tree.
+    #[serde(default)]
+    pub staged: bool,
+
+    /// For `restore`: pass `--source=<source>` to restore from another ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// For `stash`: which stash command to run (`push` default, `pop`,
+    /// `apply`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stash_subcommand: Option<StashSubcommand>,
 }
 
 /// A git operation. Only write and network operations are modeled; read-only
@@ -93,6 +132,16 @@ pub enum GitOperation {
     Push,
     /// Create a lightweight tag (`tag` required, `ref` optional).
     Tag,
+    /// Stage changes (`pathspecs` required; non-interactive flags only).
+    Add,
+    /// Reset HEAD to an optional `ref` (`mode` optional). Prompted while HEAD
+    /// is a protected branch.
+    Reset,
+    /// Restore working-tree files (`pathspecs` required; `staged`/`source`
+    /// optional). Prompted while HEAD is a protected branch.
+    Restore,
+    /// Stash changes (`push` with an optional `message`, `pop`, or `apply`).
+    Stash,
 }
 
 impl GitOperation {
@@ -107,6 +156,55 @@ impl GitOperation {
             Self::Merge => "merge",
             Self::Push => "push",
             Self::Tag => "tag",
+            Self::Add => "add",
+            Self::Reset => "reset",
+            Self::Restore => "restore",
+            Self::Stash => "stash",
+        }
+    }
+}
+
+/// The `git reset` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetMode {
+    /// Move HEAD only, leaving the index and working tree intact.
+    Soft,
+    /// Move HEAD and reset the index (the default).
+    Mixed,
+    /// Move HEAD, reset the index, and discard working-tree changes.
+    Hard,
+}
+
+impl ResetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Mixed => "mixed",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+/// The `git stash` subcommand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StashSubcommand {
+    /// Stash changes (default); `message` is passed as `-m`.
+    #[default]
+    Push,
+    /// Apply and drop the most recent stash.
+    Pop,
+    /// Apply the most recent stash without dropping it.
+    Apply,
+}
+
+impl StashSubcommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::Pop => "pop",
+            Self::Apply => "apply",
         }
     }
 }
@@ -150,10 +248,49 @@ pub fn git_permission_input(
     parts.join(" ")
 }
 
+/// The permission input for operations gated on the *current* branch:
+/// `operation:<verb> ref:<HEAD-branch> protected:<bool>`. `reset`/`restore`
+/// are history-destructive, so they prompt whenever HEAD is a protected ref —
+/// regardless of which ref the operation targets.
+pub fn current_branch_permission_input(operation: &str, current_branch: &str) -> String {
+    format!(
+        "operation:{operation} ref:{current_branch} protected:{}",
+        is_protected_ref(Some(current_branch))
+    )
+}
+
 fn required_arg(value: Option<&str>, field: &str, operation: &str) -> Result<String, String> {
     value
         .map(str::to_string)
         .ok_or_else(|| format!("`{operation}` requires the `{field}` field"))
+}
+
+/// Non-interactive flags `git add` may receive; anything else starting with
+/// `-` is refused so interactive forms (`add -p`, `add -i`) and unknown flags
+/// can never reach git argv.
+const ADD_FLAG_ALLOWLIST: &[&str] = &["-A", "--all", "-u", "--update"];
+
+fn required_pathspecs(input: &GitToolInput, operation: &str) -> Result<Vec<String>, String> {
+    let pathspecs = input
+        .pathspecs
+        .as_ref()
+        .ok_or_else(|| format!("`{operation}` requires the `pathspecs` field"))?;
+    if pathspecs.is_empty() {
+        return Err(format!("`{operation}` requires at least one pathspec"));
+    }
+    let flag_allowlist: &[&str] = if operation == "add" {
+        ADD_FLAG_ALLOWLIST
+    } else {
+        &[]
+    };
+    for pathspec in pathspecs {
+        if pathspec.starts_with('-') && !flag_allowlist.contains(&pathspec.as_str()) {
+            return Err(format!(
+                "`{operation}` refuses flag pathspec {pathspec:?}: interactive forms (`-p`, `-i`) and unsupported flags are not modeled by the git tool"
+            ));
+        }
+    }
+    Ok(pathspecs.clone())
 }
 
 /// The git argv for an operation, validating required fields up front.
@@ -197,6 +334,37 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
                 args.push(reference.to_string());
             }
         }
+        GitOperation::Add => {
+            args.extend(required_pathspecs(input, operation)?);
+        }
+        GitOperation::Reset => {
+            if let Some(mode) = input.mode {
+                args.push(format!("--{}", mode.as_str()));
+            }
+            if let Some(reference) = reference {
+                args.push(reference.to_string());
+            }
+        }
+        GitOperation::Restore => {
+            if input.staged {
+                args.push("--staged".to_string());
+            }
+            if let Some(source) = &input.source {
+                args.push(format!("--source={source}"));
+            }
+            args.extend(required_pathspecs(input, operation)?);
+        }
+        GitOperation::Stash => match input.stash_subcommand.unwrap_or_default() {
+            StashSubcommand::Push => {
+                if let Some(message) = &input.message {
+                    args.push("push".to_string());
+                    args.push("-m".to_string());
+                    args.push(message.clone());
+                }
+            }
+            StashSubcommand::Pop => args.push("pop".to_string()),
+            StashSubcommand::Apply => args.push("apply".to_string()),
+        },
     }
     Ok(args)
 }
@@ -280,18 +448,6 @@ async fn run_git_operation(
     let operation = input.operation.as_str();
     let args = assemble_git_args(&input).map_err(|error| GitToolOutput::Error { error })?;
 
-    let permission_input = git_permission_input(
-        operation,
-        input.reference.as_deref(),
-        input.remote.as_deref(),
-        input.tag.as_deref(),
-    );
-    authorize_git_operation(&event_stream, operation, permission_input, cx)
-        .await
-        .map_err(|error| GitToolOutput::Error {
-            error: error.to_string(),
-        })?;
-
     let directory = cx
         .update(|cx| working_dir(&input.cd, &tool.project, cx))
         .map_err(|error| GitToolOutput::Error {
@@ -302,6 +458,52 @@ async fn run_git_operation(
                 "No project root resolved for `cd` directory {:?}.",
                 input.cd
             ),
+        })?;
+
+    // `reset`/`restore` are gated on the *current* branch, which is only
+    // known after the working directory is resolved.
+    let permission_input = match input.operation {
+        GitOperation::Reset | GitOperation::Restore => {
+            let current_branch = cx
+                .background_spawn({
+                    let directory = directory.clone();
+                    async move {
+                        run_git(
+                            &[
+                                "rev-parse".to_string(),
+                                "--abbrev-ref".to_string(),
+                                "HEAD".to_string(),
+                            ],
+                            &directory,
+                        )
+                        .await
+                    }
+                })
+                .await
+                .map_err(|error| GitToolOutput::Error {
+                    error: format!(
+                        "Failed to resolve the current branch for `{operation}`: {error}"
+                    ),
+                })?;
+            current_branch_permission_input(operation, current_branch.trim())
+        }
+        // `add`/`stash` never take a ref, remote, or tag: keep their
+        // permission input free of stray fields so rules key on the operation
+        // alone.
+        GitOperation::Add | GitOperation::Stash => {
+            git_permission_input(operation, None, None, None)
+        }
+        _ => git_permission_input(
+            operation,
+            input.reference.as_deref(),
+            input.remote.as_deref(),
+            input.tag.as_deref(),
+        ),
+    };
+    authorize_git_operation(&event_stream, operation, permission_input, cx)
+        .await
+        .map_err(|error| GitToolOutput::Error {
+            error: error.to_string(),
         })?;
 
     let result = cx
@@ -414,6 +616,11 @@ mod tests {
             tag: tag.map(str::to_string),
             message: message.map(str::to_string),
             no_ff,
+            pathspecs: None,
+            mode: None,
+            staged: false,
+            source: None,
+            stash_subcommand: None,
         }
     }
 
@@ -515,6 +722,131 @@ mod tests {
         assert_eq!(
             assemble_git_args(&tag),
             Err("`tag` requires the `tag` field".to_string())
+        );
+    }
+
+    #[test]
+    fn current_branch_permission_input_flags_protected_head() {
+        assert_eq!(
+            current_branch_permission_input("reset", "feature"),
+            "operation:reset ref:feature protected:true"
+        );
+        assert_eq!(
+            current_branch_permission_input("restore", "dev"),
+            "operation:restore ref:dev protected:true"
+        );
+        assert_eq!(
+            current_branch_permission_input("reset", "MAIN"),
+            "operation:reset ref:MAIN protected:true"
+        );
+        assert_eq!(
+            current_branch_permission_input("reset", "wip/native-git-tool-phase7"),
+            "operation:reset ref:wip/native-git-tool-phase7 protected:false"
+        );
+        assert_eq!(
+            current_branch_permission_input("restore", "HEAD"),
+            "operation:restore ref:HEAD protected:false"
+        );
+    }
+
+    #[test]
+    fn staging_and_undo_argument_assembly_validates_fields() {
+        let add = GitToolInput {
+            pathspecs: Some(vec!["crates/agent".to_string()]),
+            ..test_input(GitOperation::Add, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&add).unwrap(),
+            vec!["add", "crates/agent"]
+        );
+
+        let add_all = GitToolInput {
+            pathspecs: Some(vec!["-A".to_string()]),
+            ..test_input(GitOperation::Add, None, None, None, None, false)
+        };
+        assert_eq!(assemble_git_args(&add_all).unwrap(), vec!["add", "-A"]);
+
+        for interactive in ["-p", "-i", "--patch", "--interactive", "--unknown"] {
+            let input = GitToolInput {
+                pathspecs: Some(vec![interactive.to_string()]),
+                ..test_input(GitOperation::Add, None, None, None, None, false)
+            };
+            assert!(
+                assemble_git_args(&input).unwrap_err().contains("refuses"),
+                "flag pathspec {interactive:?} should be refused"
+            );
+        }
+
+        let add_missing = test_input(GitOperation::Add, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&add_missing),
+            Err("`add` requires the `pathspecs` field".to_string())
+        );
+
+        let add_empty = GitToolInput {
+            pathspecs: Some(vec![]),
+            ..test_input(GitOperation::Add, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&add_empty),
+            Err("`add` requires at least one pathspec".to_string())
+        );
+
+        let reset_hard = GitToolInput {
+            mode: Some(ResetMode::Hard),
+            ..test_input(GitOperation::Reset, Some("HEAD~1"), None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&reset_hard).unwrap(),
+            vec!["reset", "--hard", "HEAD~1"]
+        );
+
+        let reset_bare = test_input(GitOperation::Reset, None, None, None, None, false);
+        assert_eq!(assemble_git_args(&reset_bare).unwrap(), vec!["reset"]);
+
+        let restore_staged = GitToolInput {
+            staged: true,
+            source: Some("HEAD~1".to_string()),
+            pathspecs: Some(vec!["src".to_string()]),
+            ..test_input(GitOperation::Restore, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&restore_staged).unwrap(),
+            vec!["restore", "--staged", "--source=HEAD~1", "src"]
+        );
+
+        let restore_interactive = GitToolInput {
+            pathspecs: Some(vec!["-p".to_string()]),
+            ..test_input(GitOperation::Restore, None, None, None, None, false)
+        };
+        assert!(
+            assemble_git_args(&restore_interactive)
+                .unwrap_err()
+                .contains("refuses")
+        );
+
+        let stash_bare = test_input(GitOperation::Stash, None, None, None, None, false);
+        assert_eq!(assemble_git_args(&stash_bare).unwrap(), vec!["stash"]);
+
+        let stash_push = test_input(GitOperation::Stash, None, None, None, Some("wip"), false);
+        assert_eq!(
+            assemble_git_args(&stash_push).unwrap(),
+            vec!["stash", "push", "-m", "wip"]
+        );
+
+        let stash_pop = GitToolInput {
+            stash_subcommand: Some(StashSubcommand::Pop),
+            ..test_input(GitOperation::Stash, None, None, None, None, false)
+        };
+        assert_eq!(assemble_git_args(&stash_pop).unwrap(), vec!["stash", "pop"]);
+
+        let stash_apply = GitToolInput {
+            stash_subcommand: Some(StashSubcommand::Apply),
+            ..test_input(GitOperation::Stash, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&stash_apply).unwrap(),
+            vec!["stash", "apply"]
         );
     }
 
