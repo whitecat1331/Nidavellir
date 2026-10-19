@@ -67,9 +67,9 @@ use util::path_list::PathList;
 use workspace::{
     CloseWindow, FocusWorkspaceSidebar, ManagedWorkspaceId, MoveProjectDown, MoveProjectUp,
     MultiWorkspace, MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject,
-    PreviousThread, ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar,
-    SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace, WorkspaceManager,
-    notifications::NotificationId, sidebar_side_context_menu,
+    PreviousThread, ProjectGroup, ProjectGroupKey, RemovalIntent, SaveIntent,
+    Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
+    WorkspaceManager, notifications::NotificationId, sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -1475,7 +1475,34 @@ impl Sidebar {
             (icon, icon_from_external_svg)
         };
 
-        let groups = mw.project_groups(cx);
+        let mut groups = mw.project_groups(cx);
+
+        // The persisted project-group list can be stale after a restore (its
+        // path keys drift as worktrees appear and disappear), and a workspace
+        // pinned before its group was recorded can be missing from every
+        // group. Guarantee the active workspace's *current* key has a group;
+        // otherwise the managed-workspace filter below skips every group and
+        // the sidebar renders "No threads yet" for an open workspace.
+        if let Some(active) = &active_workspace {
+            let active_key = active.read(cx).project_group_key(cx);
+            if !active_key.path_list().paths().is_empty() {
+                let active_is_grouped = groups
+                    .iter()
+                    .any(|group| group.key == active_key && group.workspaces.contains(active));
+                // Only synthesize for a transient workspace or one whose
+                // persisted group state drifted; a normal open/update sequence
+                // must keep using the persisted groups (the remote-integration
+                // test asserts no brief separate header appears). The retained
+                // case is repaired in `retain_active_workspace`.
+                if !active_is_grouped && !mw.is_workspace_retained(active) {
+                    groups.push(ProjectGroup {
+                        key: active_key,
+                        workspaces: vec![active.clone()],
+                        expanded: true,
+                    });
+                }
+            }
+        }
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
@@ -2117,6 +2144,30 @@ impl Sidebar {
             .retain(|id, _| current_terminal_ids.contains(id));
 
         self.live_thread_statuses = new_live_statuses;
+
+        if entries.is_empty() && has_open_projects {
+            log::info!(
+                "[SIDEBAR] built no entries: active_key_paths={}, managed_id={:?}, groups={:?}, workspaces={:?}",
+                active_workspace.as_ref().map_or(0, |ws| ws
+                    .read(cx)
+                    .project_group_key(cx)
+                    .path_list()
+                    .paths()
+                    .len()),
+                active_managed_workspace_id.map(|id| id.to_key_string()),
+                groups
+                    .iter()
+                    .map(|group| (group.key.path_list().paths().len(), group.workspaces.len()))
+                    .collect::<Vec<_>>(),
+                workspaces
+                    .iter()
+                    .map(|ws| (
+                        ws.read(cx).project_group_key(cx).path_list().paths().len(),
+                        mw.is_workspace_retained(ws),
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         self.contents = SidebarContents {
             entries,

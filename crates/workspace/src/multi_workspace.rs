@@ -1367,14 +1367,16 @@ impl MultiWorkspace {
 
     /// Promotes the currently active workspace to persistent if it is
     /// transient, so it is retained across workspace switches even when
-    /// the sidebar is closed. No-op if the workspace is already persistent.
+    /// the sidebar is closed. Also ensures the persisted project-group list
+    /// has an entry for the workspace's *current* key, which can drift across
+    /// sessions as worktrees are created and removed.
     pub fn retain_active_workspace(&mut self, cx: &mut Context<Self>) {
         let index = self.displayed_index();
-        if self.held[index].pinned {
-            return;
-        }
         let key = self.held[index].workspace.read(cx).project_group_key(cx);
-        self.pin(index, key, cx);
+        self.ensure_project_group_state(key.clone());
+        if !self.held[index].pinned {
+            self.pin(index, key, cx);
+        }
         self.serialize(cx);
         cx.notify();
     }
