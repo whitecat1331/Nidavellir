@@ -775,7 +775,10 @@ impl AgentTool for GitTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => format!("Git: {}", input.operation.as_str()).into(),
+            Ok(input) => match assemble_git_args(&input) {
+                Ok(args) => format!("git {}", args.join(" ")).into(),
+                Err(_) => format!("Git: {}", input.operation.as_str()).into(),
+            },
             Err(_) => "Git operation".into(),
         }
     }
@@ -792,6 +795,23 @@ impl AgentTool for GitTool {
             })?;
             run_git_operation(self, input, event_stream, cx).await
         })
+    }
+
+    fn replay(
+        &self,
+        _input: Self::Input,
+        output: Self::Output,
+        event_stream: ToolCallEventStream,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let content = match output {
+            GitToolOutput::Success { message } => message,
+            GitToolOutput::Error { error } => error,
+        };
+        event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+            acp::ToolCallContent::Content(acp::Content::new(content)),
+        ]));
+        Ok(())
     }
 }
 
@@ -880,6 +900,16 @@ async fn run_git_operation(
     let result = cx
         .background_spawn(async move { run_git(&args, &directory).await })
         .await;
+    // Push the streams into the tool-call UI: a tool that only returns a value
+    // renders no output in the transcript, and the operator wants the command
+    // and its streams fully visible.
+    let content = match &result {
+        Ok(message) => message.clone(),
+        Err(error) => error.clone(),
+    };
+    event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+        acp::ToolCallContent::Content(acp::Content::new(content)),
+    ]));
     match result {
         Ok(message) => Ok(GitToolOutput::Success { message }),
         Err(error) => Err(GitToolOutput::Error { error }),
@@ -927,29 +957,35 @@ async fn run_git(args: &[String], directory: &Path) -> Result<String, String> {
 
     let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
     let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
-    let mut message = String::new();
-    if !stdout.trim().is_empty() {
-        message.push_str(stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        if !message.is_empty() {
-            message.push('\n');
-        }
-        message.push_str(stderr.trim());
-    }
+    let message = format_git_output(&stdout, &stderr, output.status.code());
 
     if output.status.success() {
-        if message.is_empty() {
-            message = format!("`git {}` completed successfully.", args.join(" "));
-        }
         Ok(message)
     } else {
-        Err(format!(
-            "`git {}` exited with {}: {message}",
-            args.join(" "),
-            output.status
-        ))
+        Err(format!("`git {}` failed\n\n{message}", args.join(" ")))
     }
+}
+
+/// Formats git's two streams so the transcript and the model see each one
+/// distinctly: an empty stream is still shown as `(empty)` so "nothing was
+/// written" is never ambiguous.
+fn format_git_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> String {
+    let stream = |name: &str, content: &str| {
+        if content.trim().is_empty() {
+            format!("{name}:\n(empty)")
+        } else {
+            format!("{name}:\n{}", content.trim())
+        }
+    };
+    let exit = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string());
+    format!(
+        "{}\n\n{}\n\nexit: {}",
+        stream("stdout", stdout),
+        stream("stderr", stderr),
+        exit
+    )
 }
 
 fn truncate_output(output: &str) -> String {
@@ -1812,6 +1848,22 @@ mod tests {
             git_permission_input("status", None, None, None),
             "operation:status protected:false"
         );
+    }
+
+    #[test]
+    fn git_output_labels_each_stream() {
+        let both = format_git_output("one\ntwo", "warning", Some(0));
+        assert!(both.starts_with("stdout:\none\ntwo"));
+        assert!(both.contains("stderr:\nwarning"));
+        assert!(both.ends_with("exit: 0"));
+
+        let empty = format_git_output("", "  ", Some(1));
+        assert!(empty.contains("stdout:\n(empty)"));
+        assert!(empty.contains("stderr:\n(empty)"));
+        assert!(empty.ends_with("exit: 1"));
+
+        let killed = format_git_output("out", "", None);
+        assert!(killed.contains("exit: terminated by signal"));
     }
 
     #[test]
