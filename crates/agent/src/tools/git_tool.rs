@@ -16,17 +16,18 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 ///
 /// Prefer this over the `terminal` tool for git's write and network
 /// operations: `commit`, `checkout`, `switch`, `branch`, `fetch`, `pull`,
-/// `merge`, `push`, `tag`, `add`, `reset`, `restore`, and `stash`. Each
+/// `merge`, `push`, `tag`, `add`, `reset`, `restore`, `stash`, `worktree`,
+/// `clone`, `init`, `remote`, `rebase`, `cherry-pick`, and `revert`. Each
 /// operation is authorized through the settings permission system with a
 /// structured input string
 /// (`operation:<verb> [ref:<ref>] [remote:<remote>] [tag:<tag>] protected:<bool>`),
 /// so "Always allow" decisions apply per operation and stick. Protected refs
-/// (`feature`, `dev`, `main`) always prompt; `reset`/`restore` additionally
-/// prompt whenever the *current* branch is protected, because they are
-/// history-destructive.
+/// (`feature`, `dev`, `main`) always prompt; `reset`/`restore`/`rebase`/
+/// `cherry-pick`/`revert` additionally prompt whenever the *current* branch
+/// is protected, because they are history-destructive.
 ///
-/// Interactive git forms (`add -p`, `add -i`, …) are never modeled — flag
-/// pathspecs are refused at argv level.
+/// Interactive git forms (`add -p`, `rebase -i`, …) are never modeled — flag
+/// pathspecs and flag arguments are refused at argv level.
 ///
 /// Read-only git inspection (`status`, `log`, `diff`, `show`) is not modeled
 /// here; run it through the `terminal` tool as usual.
@@ -61,6 +62,13 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 /// - `init` — initialize a repository at `destination` (required, absolute).
 /// - `remote` — manage remotes (`add`/`remove`/`rename`/`set-url`). `remote`
 ///   is the remote name; `url` for `add`/`set-url`; `new_name` for `rename`.
+/// - `rebase` — rebase the current branch onto `ref` (required). Interactive
+///   forms are refused; prompted while HEAD is a protected branch.
+/// - `cherry-pick` — apply the commit `ref` onto the current branch
+///   (required). Prompted while HEAD is a protected branch.
+/// - `revert` — revert the commit `ref` on the current branch (required;
+///   `--no-edit` is always passed). Prompted while HEAD is a protected
+///   branch.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GitToolInput {
     /// The git operation to perform.
@@ -75,7 +83,8 @@ pub struct GitToolInput {
 
     /// The ref to operate on: the ref to `checkout`/`switch`/`merge`/`reset`,
     /// the branch name for `branch`, the new branch name for `worktree add`
-    /// (passed with `-b`), or an optional start point for `tag`.
+    /// (passed with `-b`), the upstream for `rebase`, the commit for
+    /// `cherry-pick`/`revert`, or an optional start point for `tag`.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
 
@@ -193,6 +202,15 @@ pub enum GitOperation {
     Init,
     /// Manage remotes (`add`/`remove`/`rename`/`set-url`).
     Remote,
+    /// Rebase the current branch onto `ref` (required; interactive forms
+    /// refused). Prompted while HEAD is a protected branch.
+    Rebase,
+    /// Apply the commit `ref` onto the current branch (required). Prompted
+    /// while HEAD is a protected branch.
+    CherryPick,
+    /// Revert the commit `ref` on the current branch (required; `--no-edit`
+    /// is always passed). Prompted while HEAD is a protected branch.
+    Revert,
 }
 
 impl GitOperation {
@@ -215,6 +233,9 @@ impl GitOperation {
             Self::Clone => "clone",
             Self::Init => "init",
             Self::Remote => "remote",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
         }
     }
 }
@@ -350,9 +371,10 @@ pub fn git_permission_input(
 }
 
 /// The permission input for operations gated on the *current* branch:
-/// `operation:<verb> ref:<HEAD-branch> protected:<bool>`. `reset`/`restore`
-/// are history-destructive, so they prompt whenever HEAD is a protected ref —
-/// regardless of which ref the operation targets.
+/// `operation:<verb> ref:<HEAD-branch> protected:<bool>`. `reset`/`restore`/
+/// `rebase`/`cherry-pick`/`revert` are history-destructive, so they prompt
+/// whenever HEAD is a protected ref — regardless of which ref the operation
+/// targets.
 pub fn current_branch_permission_input(operation: &str, current_branch: &str) -> String {
     format!(
         "operation:{operation} ref:{current_branch} protected:{}",
@@ -364,6 +386,23 @@ fn required_arg(value: Option<&str>, field: &str, operation: &str) -> Result<Str
     value
         .map(str::to_string)
         .ok_or_else(|| format!("`{operation}` requires the `{field}` field"))
+}
+
+/// The commit/upstream argument for the history ops. Leading dashes are
+/// refused so interactive forms (`rebase -i`) and unsupported flags can never
+/// reach git argv through a structured field.
+fn required_history_arg(
+    value: Option<&str>,
+    field: &str,
+    operation: &str,
+) -> Result<String, String> {
+    let argument = required_arg(value, field, operation)?;
+    if argument.starts_with('-') {
+        return Err(format!(
+            "`{operation}` refuses flag argument {argument:?}: interactive forms (`-i`) and unsupported flags are not modeled by the git tool"
+        ));
+    }
+    Ok(argument)
 }
 
 /// Non-interactive flags `git add` may receive; anything else starting with
@@ -536,6 +575,18 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
                 args.push(required_arg(input.url.as_deref(), "url", operation)?);
             }
         },
+        GitOperation::Rebase => {
+            args.push(required_history_arg(reference, "ref", operation)?);
+        }
+        GitOperation::CherryPick => {
+            args.push(required_history_arg(reference, "ref", operation)?);
+        }
+        GitOperation::Revert => {
+            // A revert opens the commit-message editor by default; the tool
+            // has no TTY, so the editor is skipped.
+            args.push("--no-edit".to_string());
+            args.push(required_history_arg(reference, "ref", operation)?);
+        }
     }
     Ok(args)
 }
@@ -631,10 +682,15 @@ async fn run_git_operation(
             ),
         })?;
 
-    // `reset`/`restore` are gated on the *current* branch, which is only
-    // known after the working directory is resolved.
+    // `reset`/`restore`/`rebase`/`cherry-pick`/`revert` are gated on the
+    // *current* branch, which is only known after the working directory is
+    // resolved.
     let permission_input = match input.operation {
-        GitOperation::Reset | GitOperation::Restore => {
+        GitOperation::Reset
+        | GitOperation::Restore
+        | GitOperation::Rebase
+        | GitOperation::CherryPick
+        | GitOperation::Revert => {
             let current_branch = cx
                 .background_spawn({
                     let directory = directory.clone();
@@ -1263,6 +1319,128 @@ mod tests {
                 "origin",
                 "https://github.com/example/repo.git"
             ]
+        );
+    }
+
+    #[test]
+    fn history_permission_inputs() {
+        assert_eq!(
+            current_branch_permission_input("rebase", "feature"),
+            "operation:rebase ref:feature protected:true"
+        );
+        assert_eq!(
+            current_branch_permission_input("cherry-pick", "dev"),
+            "operation:cherry-pick ref:dev protected:true"
+        );
+        assert_eq!(
+            current_branch_permission_input("revert", "wip/foo"),
+            "operation:revert ref:wip/foo protected:false"
+        );
+        assert_eq!(
+            current_branch_permission_input("revert", "MAIN"),
+            "operation:revert ref:MAIN protected:true"
+        );
+    }
+
+    #[test]
+    fn history_argument_assembly_validates_fields() {
+        let rebase = test_input(
+            GitOperation::Rebase,
+            Some("origin/main"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            assemble_git_args(&rebase).unwrap(),
+            vec!["rebase", "origin/main"]
+        );
+
+        for interactive in ["-i", "--interactive", "--onto"] {
+            let input = test_input(
+                GitOperation::Rebase,
+                Some(interactive),
+                None,
+                None,
+                None,
+                false,
+            );
+            assert!(
+                assemble_git_args(&input).unwrap_err().contains("refuses"),
+                "flag argument {interactive:?} should be refused"
+            );
+        }
+
+        let rebase_missing = test_input(GitOperation::Rebase, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&rebase_missing),
+            Err("`rebase` requires the `ref` field".to_string())
+        );
+
+        let cherry_pick = test_input(
+            GitOperation::CherryPick,
+            Some("abc1234"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            assemble_git_args(&cherry_pick).unwrap(),
+            vec!["cherry-pick", "abc1234"]
+        );
+
+        let cherry_pick_flag = test_input(
+            GitOperation::CherryPick,
+            Some("-n"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            assemble_git_args(&cherry_pick_flag)
+                .unwrap_err()
+                .contains("refuses")
+        );
+
+        let cherry_pick_missing =
+            test_input(GitOperation::CherryPick, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&cherry_pick_missing),
+            Err("`cherry-pick` requires the `ref` field".to_string())
+        );
+
+        let revert = test_input(
+            GitOperation::Revert,
+            Some("HEAD~1"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            assemble_git_args(&revert).unwrap(),
+            vec!["revert", "--no-edit", "HEAD~1"]
+        );
+
+        let revert_flag = test_input(
+            GitOperation::Revert,
+            Some("--mainline"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            assemble_git_args(&revert_flag).unwrap_err().contains("refuses")
+        );
+
+        let revert_missing = test_input(GitOperation::Revert, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&revert_missing),
+            Err("`revert` requires the `ref` field".to_string())
         );
     }
 
