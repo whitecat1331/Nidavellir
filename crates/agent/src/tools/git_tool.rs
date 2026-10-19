@@ -1434,7 +1434,9 @@ mod tests {
             false,
         );
         assert!(
-            assemble_git_args(&revert_flag).unwrap_err().contains("refuses")
+            assemble_git_args(&revert_flag)
+                .unwrap_err()
+                .contains("refuses")
         );
 
         let revert_missing = test_input(GitOperation::Revert, None, None, None, None, false);
