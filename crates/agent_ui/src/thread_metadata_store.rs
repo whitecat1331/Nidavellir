@@ -520,6 +520,10 @@ pub struct ThreadMetadataStore {
     threads_by_workspace: HashMap<ManagedWorkspaceId, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
+    /// Monotonic counter of local database writes, used by the cross-instance
+    /// watcher to tell our own `updated_at` churn apart from another
+    /// instance's writes.
+    local_write_generation: u64,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
@@ -876,12 +880,18 @@ impl ThreadMetadataStore {
     }
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
+        self.local_write_generation = self.local_write_generation.wrapping_add(1);
+
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
-            if thread.workspace_id != metadata.workspace_id {
-                if let Some(workspace_id) = thread.workspace_id {
-                    if let Some(thread_ids) = self.threads_by_workspace.get_mut(&workspace_id) {
-                        thread_ids.remove(&metadata.thread_id);
-                    }
+            // Only move the thread between buckets when both ids are known. A
+            // save built from an entry that lost its id must not silently drop
+            // the thread out of the workspace index.
+            if let (Some(old_workspace_id), Some(new_workspace_id)) =
+                (thread.workspace_id, metadata.workspace_id)
+                && old_workspace_id != new_workspace_id
+            {
+                if let Some(thread_ids) = self.threads_by_workspace.get_mut(&old_workspace_id) {
+                    thread_ids.remove(&metadata.thread_id);
                 }
             }
             if thread.folder_paths() != metadata.folder_paths() {
@@ -1289,6 +1299,8 @@ impl ThreadMetadataStore {
     }
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.local_write_generation = self.local_write_generation.wrapping_add(1);
+
         if let Some(thread) = self.threads.get(&thread_id) {
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
@@ -1405,6 +1417,7 @@ impl ThreadMetadataStore {
                     })
                     .await;
                 let mut last_fingerprint = baseline.ok();
+                let mut last_local_write_generation = 0;
 
                 loop {
                     cx.background_executor()
@@ -1422,6 +1435,22 @@ impl ThreadMetadataStore {
                     if last_fingerprint.as_ref() == Some(&fingerprint) {
                         continue;
                     }
+
+                    // `updated_at` moves on every streamed turn, so a local
+                    // write looks exactly like a cross-instance change. Skip
+                    // our own writes without adopting the fingerprint: the
+                    // first quiet poll still reloads once, which also picks up
+                    // an external write that landed alongside ours.
+                    let local_write_generation =
+                        match this.read_with(cx, |this, _| this.local_write_generation) {
+                            Ok(generation) => generation,
+                            Err(_) => break,
+                        };
+                    if local_write_generation != last_local_write_generation {
+                        last_local_write_generation = local_write_generation;
+                        continue;
+                    }
+
                     last_fingerprint = Some(fingerprint);
                     this.update(cx, |this, cx| {
                         let _ = this.reload(cx);
@@ -1441,6 +1470,7 @@ impl ThreadMetadataStore {
             threads_by_workspace: HashMap::default(),
             threads_by_session: HashMap::default(),
             reload_task: None,
+            local_write_generation: 0,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
@@ -2315,6 +2345,47 @@ mod tests {
             baseline,
             "an updated_at write must change the reload signal"
         );
+    }
+
+    #[gpui::test]
+    async fn test_save_without_workspace_id_keeps_workspace_index(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let manager = cx.update(|cx| WorkspaceManager::global(cx));
+        let workspace_id = manager
+            .create(
+                "Index Test".into(),
+                vec![Path::new("/project-a").to_path_buf()],
+            )
+            .await
+            .unwrap();
+
+        let folder_paths = PathList::new(&[Path::new("/project-a")]);
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                let mut metadata =
+                    make_metadata("session-index", "Indexed", Utc::now(), folder_paths.clone());
+                metadata.workspace_id = Some(workspace_id);
+                store.save(metadata.clone(), cx);
+
+                store.save(
+                    ThreadMetadata {
+                        workspace_id: None,
+                        ..metadata
+                    },
+                    cx,
+                );
+
+                assert!(
+                    store.entries_for_workspace(workspace_id).any(|entry| entry
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|id| id.0.as_ref() == "session-index")),
+                    "a save that omits the workspace id must not drop the thread from the workspace index"
+                );
+            });
+        });
     }
 
     #[gpui::test]

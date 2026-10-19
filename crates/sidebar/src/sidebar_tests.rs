@@ -7698,6 +7698,70 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
 }
 
 #[gpui::test]
+async fn test_sidebar_keeps_thread_after_managed_workspace_merge(cx: &mut TestAppContext) {
+    // A managed workspace merged or deleted outside this window leaves the
+    // live workspace holding an id the manager no longer knows, while the
+    // thread rows have been re-pointed to the surviving id. The sidebar must
+    // still find those rows, even when their stored paths drifted from the
+    // live group key.
+    let project = init_test_project("/project-a", cx).await;
+
+    let manager = cx.update(|cx| WorkspaceManager::global(cx));
+    let surviving_id = manager
+        .create(
+            "Surviving Workspace".into(),
+            vec![PathBuf::from("/project-a"), PathBuf::from("/project-b")],
+        )
+        .await
+        .unwrap();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let stale_id = ManagedWorkspaceId::new();
+    workspace.update(cx, |workspace, _| {
+        workspace.set_managed_workspace_id(Some(stale_id));
+    });
+
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let _panel = add_agent_panel(&workspace, cx);
+    cx.run_until_parked();
+
+    let session_id = acp::SessionId::new(Arc::from("merged-managed-workspace"));
+    let drifted_paths = PathList::new(&[PathBuf::from("/project-a"), PathBuf::from("/project-b")]);
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.save(
+                ThreadMetadata {
+                    thread_id: ThreadId::new(),
+                    session_id: Some(session_id.clone()),
+                    agent_id: agent::ZED_AGENT_ID.clone(),
+                    title: Some("Merged Managed Thread".into()),
+                    title_override: None,
+                    updated_at: Utc::now(),
+                    created_at: None,
+                    interacted_at: None,
+                    worktree_paths: WorktreePaths::from_folder_paths(&drifted_paths),
+                    archived: false,
+                    remote_connection: None,
+                    workspace_id: Some(surviving_id),
+                },
+                cx,
+            )
+        });
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert!(
+        sidebar.read_with(cx, |sidebar, _| has_thread_entry(sidebar, &session_id)),
+        "thread disappeared after its managed workspace was merged into \
+         {surviving_id:?} while the live workspace still held {stale_id:?}; \
+         sidebar entries: {entries:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_activate_archived_thread_with_saved_paths_activates_matching_workspace(
     cx: &mut TestAppContext,
 ) {
