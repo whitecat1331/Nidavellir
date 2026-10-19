@@ -1100,6 +1100,19 @@ impl Domain for WorkspaceDb {
             ON workspaces(workspace_uuid)
             WHERE workspace_uuid IS NOT NULL;
         ),
+        // Rows created by `next_id()` after the column was added carry a NULL
+        // uuid until their first save; mint one so a workspace that never got
+        // saved still has a restorable identity.
+        sql!(
+            UPDATE workspaces
+            SET workspace_uuid =
+                lower(hex(randomblob(4))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(6)))
+            WHERE workspace_uuid IS NULL OR workspace_uuid = "";
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1389,6 +1402,12 @@ impl WorkspaceDb {
             .context("Looking up workspace uuid")
             .warn_on_err()
             .flatten()?;
+        // sqlez reads a NULL TEXT column as an empty string, and rows created
+        // by `next_id()` carry no uuid until their first save — treat that as
+        // "not yet minted" rather than feeding an empty string to the parser.
+        if key.is_empty() {
+            return None;
+        }
         Uuid::parse_str(&key).ok()
     }
 
@@ -1814,6 +1833,17 @@ impl WorkspaceDb {
                 kind = RemoteConnectionKind::Ssh;
                 host = Some(format!("mock-{}", id));
                 user = Some(format!("mock-user-{}", id));
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => {
+                // remote is built with its test-support feature (via this
+                // crate's dev-dependencies) whenever this crate's tests
+                // compile, but the Mock arm above is gated on this crate's
+                // own cfg — so cover the variant here for scoped builds.
+                // Unreachable in plain builds, where the variant is absent.
+                kind = RemoteConnectionKind::Ssh;
+                host = Some("mock".to_string());
+                user = Some("mock".to_string());
             }
         }
 
@@ -3636,6 +3666,48 @@ mod tests {
         let restored = db.workspace_for_uuid(uuid).unwrap();
         assert_eq!(restored.id, WorkspaceId(1));
         assert_eq!(restored.paths, PathList::new(&["/tmp", "/tmp2", "/tmp3"]));
+        assert_eq!(restored.center_group, workspace.center_group);
+    }
+
+    #[gpui::test]
+    async fn test_workspace_uuid_minted_for_unsaved_row() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_workspace_uuid_minted_for_unsaved_row").await;
+
+        // `next_id()` inserts a bare workspaces row whose uuid column is NULL
+        // until the first save — the state the original parse failure came from.
+        let id = db.next_id().await.unwrap();
+        assert!(
+            db.workspace_uuid_for_id(id).is_none(),
+            "a freshly created row should read as 'no uuid yet'"
+        );
+
+        let workspace = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            identity_paths: None,
+            location: SerializedWorkspaceLocation::Local,
+            center_group: pane_with_items(&[1]),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: Default::default(),
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+            recent_navigation_history: Default::default(),
+        };
+        db.save_workspace(workspace.clone()).await;
+
+        let uuid = db
+            .workspace_uuid_for_id(id)
+            .expect("the first save should mint a uuid for a NULL-uuid row");
+        let restored = db.workspace_for_uuid(uuid).unwrap();
+        assert_eq!(restored.id, id);
+        assert_eq!(restored.paths, PathList::new(&["/tmp"]));
         assert_eq!(restored.center_group, workspace.center_group);
     }
 
