@@ -1704,7 +1704,14 @@ mod tests {
 
         let branch_delete = GitToolInput {
             delete: true,
-            ..test_input(GitOperation::Branch, Some("wip/foo"), None, None, None, false)
+            ..test_input(
+                GitOperation::Branch,
+                Some("wip/foo"),
+                None,
+                None,
+                None,
+                false,
+            )
         };
         assert_eq!(
             assemble_git_args(&branch_delete).unwrap(),
@@ -1714,7 +1721,14 @@ mod tests {
         let branch_delete_force = GitToolInput {
             delete: true,
             force: true,
-            ..test_input(GitOperation::Branch, Some("wip/foo"), None, None, None, false)
+            ..test_input(
+                GitOperation::Branch,
+                Some("wip/foo"),
+                None,
+                None,
+                None,
+                false,
+            )
         };
         assert_eq!(
             assemble_git_args(&branch_delete_force).unwrap(),
@@ -1769,9 +1783,7 @@ mod tests {
         );
 
         let fetch_refspec = GitToolInput {
-            refspec: Some(
-                "refs/heads/wip/foo:refs/remotes/origin/wip/foo".to_string(),
-            ),
+            refspec: Some("refs/heads/wip/foo:refs/remotes/origin/wip/foo".to_string()),
             ..test_input(GitOperation::Fetch, None, Some("origin"), None, None, false)
         };
         assert_eq!(
