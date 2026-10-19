@@ -8994,10 +8994,11 @@ impl ThreadView {
             || (should_show_raw_input && tool_call.raw_input.is_some());
 
         let is_collapsible = has_content && !needs_confirmation;
-        let is_open = self
-            .entry_view_state
-            .read(cx)
-            .is_tool_call_content_visible(tool_call);
+        let is_open = is_terminal_tool
+            || self
+                .entry_view_state
+                .read(cx)
+                .is_tool_call_content_visible(tool_call);
 
         let input_output_header = |label: SharedString| {
             Label::new(label)
