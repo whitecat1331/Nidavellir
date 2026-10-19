@@ -10873,7 +10873,7 @@ impl ThreadView {
                 })
         };
 
-        let is_execute = tool_call.kind() == acp_v2::ToolKind::Execute;
+        let is_execute = *tool_call.kind() == acp_v2::ToolKind::Execute;
         h_flex()
             .relative()
             .w_full()
@@ -11337,7 +11337,7 @@ impl ThreadView {
         // wants to see the command's full streams with nothing hidden, and the
         // execute tools cap their own output, so an inline result stays
         // bounded.
-        let is_execute_output = tool_call.kind() == acp_v2::ToolKind::Execute;
+        let is_execute_output = *tool_call.kind() == acp_v2::ToolKind::Execute;
         if !is_execute_output
             && should_collapse_tool_output(
                 source,
