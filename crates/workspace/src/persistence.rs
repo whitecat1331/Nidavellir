@@ -1932,7 +1932,15 @@ impl WorkspaceDb {
 
     query! {
         pub async fn next_id() -> Result<WorkspaceId> {
-            INSERT INTO workspaces DEFAULT VALUES RETURNING workspace_id
+            INSERT INTO workspaces(workspace_uuid)
+            VALUES (
+                lower(hex(randomblob(4))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(6)))
+            )
+            RETURNING workspace_id
         }
     }
 
@@ -3311,7 +3319,7 @@ mod tests {
         .await;
 
         let id = db.next_id().await.unwrap();
-        // Assert the empty row got inserted
+        // Assert the row got inserted
         assert_eq!(
             Some(id),
             db.select_row_bound::<WorkspaceId, WorkspaceId>(sql!(
@@ -3675,13 +3683,12 @@ mod tests {
 
         let db = WorkspaceDb::open_test_db("test_workspace_uuid_minted_for_unsaved_row").await;
 
-        // `next_id()` inserts a bare workspaces row whose uuid column is NULL
-        // until the first save — the state the original parse failure came from.
+        // `next_id()` mints a uuid at insert time, so a freshly created row
+        // already carries a restorable identity (no NULL window).
         let id = db.next_id().await.unwrap();
-        assert!(
-            db.workspace_uuid_for_id(id).is_none(),
-            "a freshly created row should read as 'no uuid yet'"
-        );
+        let minted_at_insert = db
+            .workspace_uuid_for_id(id)
+            .expect("a freshly created row should already carry a uuid");
 
         let workspace = SerializedWorkspace {
             id,
@@ -3702,9 +3709,11 @@ mod tests {
         };
         db.save_workspace(workspace.clone()).await;
 
+        // Saving reuses the uuid minted at insert rather than minting a new one.
         let uuid = db
             .workspace_uuid_for_id(id)
-            .expect("the first save should mint a uuid for a NULL-uuid row");
+            .expect("the uuid must survive the first save");
+        assert_eq!(uuid, minted_at_insert);
         let restored = db.workspace_for_uuid(uuid).unwrap();
         assert_eq!(restored.id, id);
         assert_eq!(restored.paths, PathList::new(&["/tmp"]));
