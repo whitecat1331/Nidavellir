@@ -65,11 +65,11 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
-    CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
-    MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
-    ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceManager, notifications::NotificationId,
-    sidebar_side_context_menu,
+    CloseWindow, FocusWorkspaceSidebar, ManagedWorkspaceId, MoveProjectDown, MoveProjectUp,
+    MultiWorkspace, MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject,
+    PreviousThread, ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar,
+    SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace, WorkspaceManager,
+    notifications::NotificationId, sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -586,6 +586,32 @@ fn root_repository_snapshots(
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
     PathList::new(&workspace.read(cx).root_paths(cx))
+}
+
+/// Resolve the managed-workspace id the sidebar should group `workspace` under.
+///
+/// The id stored on a live workspace can outlive its manager row: merging or
+/// deleting a managed workspace outside this window re-points the thread rows
+/// to the surviving id while the window keeps the old one. Trusting that stale
+/// id filters the sidebar to a workspace that no longer exists and hides every
+/// thread that was re-pointed. Fall back to the live path set whenever the
+/// stored id is unknown to the manager.
+fn resolve_managed_workspace_id(
+    workspace: &Entity<Workspace>,
+    cx: &App,
+) -> Option<ManagedWorkspaceId> {
+    let manager = WorkspaceManager::global(cx);
+    if let Some(workspace_id) = workspace.read(cx).managed_workspace_id()
+        && manager.get(workspace_id).log_err().flatten().is_some()
+    {
+        return Some(workspace_id);
+    }
+
+    let paths = workspace_path_list(workspace, cx);
+    manager
+        .workspace_id_for_paths_relaxed(&paths)
+        .log_err()
+        .flatten()
 }
 
 fn linked_worktree_path_lists_for_workspaces(
@@ -1405,15 +1431,9 @@ impl Sidebar {
         let mw = multi_workspace.read(cx);
         let workspaces: Vec<_> = mw.workspaces().cloned().collect();
         let active_workspace = Some(mw.workspace().clone());
-        let active_managed_workspace_id = active_workspace.as_ref().and_then(|workspace| {
-            workspace.read(cx).managed_workspace_id().or_else(|| {
-                let paths = workspace_path_list(workspace, cx);
-                WorkspaceManager::global(cx)
-                    .workspace_id_for_paths(&paths)
-                    .log_err()
-                    .flatten()
-            })
-        });
+        let active_managed_workspace_id = active_workspace
+            .as_ref()
+            .and_then(|workspace| resolve_managed_workspace_id(workspace, cx));
 
         let agent_server_store = workspaces
             .first()
@@ -1685,6 +1705,39 @@ impl Sidebar {
                             row,
                             ThreadEntryWorkspace::Open(ws.clone()),
                         ));
+                    }
+                }
+
+                // The loop above only asks for the ids the live workspaces
+                // carry. A workspace merged or deleted outside this window
+                // leaves them holding an id that no longer exists while the
+                // rows have already been re-pointed to the surviving id.
+                // Resolve the group's canonical id from its paths as well so
+                // those threads stay reachable without re-opening the
+                // workspace from the switcher.
+                let group_entry_workspace = active_workspace
+                    .as_ref()
+                    .filter(|active| group_workspaces.contains(active))
+                    .cloned()
+                    .or_else(|| group_workspaces.first().cloned());
+                if let Some(group_workspace_id) = WorkspaceManager::global(cx)
+                    .workspace_id_for_paths_relaxed(group_key.path_list())
+                    .log_err()
+                    .flatten()
+                {
+                    for row in thread_store
+                        .read(cx)
+                        .entries_for_workspace(group_workspace_id)
+                        .cloned()
+                    {
+                        if !seen_thread_ids.insert(row.thread_id) {
+                            continue;
+                        }
+                        let workspace = group_entry_workspace
+                            .clone()
+                            .map(ThreadEntryWorkspace::Open)
+                            .unwrap_or_else(|| resolve_workspace(row.folder_paths()));
+                        threads.push(make_thread_entry(row, workspace));
                     }
                 }
 
