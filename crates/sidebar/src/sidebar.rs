@@ -1486,11 +1486,15 @@ impl Sidebar {
         if let Some(active) = &active_workspace {
             let active_key = active.read(cx).project_group_key(cx);
             if !active_key.path_list().paths().is_empty() {
-                if let Some(group) = groups.iter_mut().find(|group| group.key == active_key) {
-                    if !group.workspaces.contains(active) {
-                        group.workspaces.push(active.clone());
-                    }
-                } else {
+                let active_is_grouped = groups
+                    .iter()
+                    .any(|group| group.key == active_key && group.workspaces.contains(active));
+                // Only synthesize for a transient workspace or one whose
+                // persisted group state drifted; a normal open/update sequence
+                // must keep using the persisted groups (the remote-integration
+                // test asserts no brief separate header appears). The retained
+                // case is repaired in `retain_active_workspace`.
+                if !active_is_grouped && !mw.is_workspace_retained(active) {
                     groups.push(ProjectGroup {
                         key: active_key,
                         workspaces: vec![active.clone()],
