@@ -1835,12 +1835,13 @@ impl WorkspaceDb {
                 user = Some(format!("mock-user-{}", id));
             }
             #[cfg(not(any(test, feature = "test-support")))]
+            #[allow(unreachable_patterns)]
             _ => {
-                // remote is built with its test-support feature (via this
-                // crate's dev-dependencies) whenever this crate's tests
-                // compile, but the Mock arm above is gated on this crate's
-                // own cfg — so cover the variant here for scoped builds.
-                // Unreachable in plain builds, where the variant is absent.
+                // In plain builds the Mock variant is absent, so this arm is
+                // unreachable; but a downstream crate's dev-dependencies can
+                // enable remote's test-support (e.g. `cargo test -p agent_ui`)
+                // while this crate's Mock arm above is gated out, leaving
+                // RemoteConnectionIdentity::Mock to fall through here.
                 kind = RemoteConnectionKind::Ssh;
                 host = Some("mock".to_string());
                 user = Some("mock".to_string());
