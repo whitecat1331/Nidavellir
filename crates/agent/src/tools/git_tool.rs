@@ -40,7 +40,9 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 /// - `fetch` / `pull` — update from a remote. `remote` and `ref` optional.
 /// - `merge` — merge `ref` into the current branch. `no_ff` and `message`
 ///   optional.
-/// - `push` — push to a remote. `remote` and `ref` optional.
+/// - `push` — push to a remote. `remote` and `ref` optional; `delete`
+///   passes `--delete` (requires `ref`; the protected-ref boundary
+///   applies to the ref being deleted).
 /// - `tag` — create a lightweight tag. Requires `tag`; `ref` is an optional
 ///   start point.
 /// - `add` — stage changes. Requires `pathspecs`; only the non-interactive
@@ -105,6 +107,11 @@ pub struct GitToolInput {
     /// For `merge`: pass `--no-ff` to always create a merge commit.
     #[serde(default)]
     pub no_ff: bool,
+
+    /// For `push`: pass `--delete` to delete the remote ref instead of
+    /// updating it (`ref` required).
+    #[serde(default)]
+    pub delete: bool,
 
     /// For `add`/`restore`: the pathspecs to stage or restore (required).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +464,11 @@ fn required_pathspecs(input: &GitToolInput, operation: &str) -> Result<Vec<Strin
 fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
     let operation = input.operation.as_str();
     let reference = input.reference.as_deref();
+    if input.delete && input.operation != GitOperation::Push {
+        return Err(format!(
+            "`{operation}` does not support the `delete` field (push only)"
+        ));
+    }
     let mut args: Vec<String> = vec![operation.to_string()];
     match input.operation {
         GitOperation::Commit => {
@@ -470,7 +482,19 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
         GitOperation::Checkout | GitOperation::Switch | GitOperation::Branch => {
             args.push(required_arg(reference, "ref", operation)?);
         }
-        GitOperation::Fetch | GitOperation::Pull | GitOperation::Push => {
+        GitOperation::Fetch | GitOperation::Pull => {
+            if let Some(remote) = &input.remote {
+                args.push(remote.clone());
+            }
+            if let Some(reference) = reference {
+                args.push(reference.to_string());
+            }
+        }
+        GitOperation::Push => {
+            if input.delete {
+                args.push("--delete".to_string());
+                required_arg(reference, "ref", operation)?;
+            }
             if let Some(remote) = &input.remote {
                 args.push(remote.clone());
             }
@@ -848,6 +872,7 @@ mod tests {
             tag: tag.map(str::to_string),
             message: message.map(str::to_string),
             no_ff,
+            delete: false,
             pathspecs: None,
             mode: None,
             staged: false,
@@ -1443,6 +1468,62 @@ mod tests {
         assert_eq!(
             assemble_git_args(&revert_missing),
             Err("`revert` requires the `ref` field".to_string())
+        );
+    }
+
+    #[test]
+    fn push_delete_argument_assembly_validates_fields() {
+        let delete_push = GitToolInput {
+            delete: true,
+            ..test_input(
+                GitOperation::Push,
+                Some("wip/foo"),
+                Some("origin"),
+                None,
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            assemble_git_args(&delete_push).unwrap(),
+            vec!["push", "--delete", "origin", "wip/foo"]
+        );
+
+        let delete_missing_ref = GitToolInput {
+            delete: true,
+            ..test_input(GitOperation::Push, None, Some("origin"), None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&delete_missing_ref),
+            Err("`push` requires the `ref` field".to_string())
+        );
+
+        let delete_on_fetch = GitToolInput {
+            delete: true,
+            ..test_input(
+                GitOperation::Fetch,
+                Some("origin/dev"),
+                Some("origin"),
+                None,
+                None,
+                false,
+            )
+        };
+        assert!(
+            assemble_git_args(&delete_on_fetch)
+                .unwrap_err()
+                .contains("`delete` field")
+        );
+
+        // The canonical permission input is unchanged; the protected-ref
+        // predicate keys on the ref being deleted.
+        assert_eq!(
+            git_permission_input("push", Some("origin/dev"), Some("origin"), None),
+            "operation:push ref:origin/dev remote:origin protected:true"
+        );
+        assert_eq!(
+            git_permission_input("push", Some("wip/foo"), Some("origin"), None),
+            "operation:push ref:wip/foo remote:origin protected:false"
         );
     }
 
