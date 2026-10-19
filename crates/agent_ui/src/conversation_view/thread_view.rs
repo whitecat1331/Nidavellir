@@ -11332,10 +11332,19 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let source = markdown.read(cx).source();
-        if should_collapse_tool_output(
-            source,
-            self.expanded_large_tool_outputs.contains(&tool_call.id),
-        ) {
+        // Terminal outputs render inline regardless of size: the operator wants
+        // to see stdout/stderr, and the terminal tool caps its own output, so
+        // an inline terminal result stays bounded.
+        let is_terminal_output = tool_call
+            .name
+            .as_deref()
+            .is_some_and(|name| name == "terminal" || name == "sandboxed_terminal");
+        if !is_terminal_output
+            && should_collapse_tool_output(
+                source,
+                self.expanded_large_tool_outputs.contains(&tool_call.id),
+            )
+        {
             return self.render_collapsed_markdown_output(
                 source.clone(),
                 tool_call,
