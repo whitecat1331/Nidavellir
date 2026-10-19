@@ -8994,10 +8994,11 @@ impl ThreadView {
             || (should_show_raw_input && tool_call.raw_input.is_some());
 
         let is_collapsible = has_content && !needs_confirmation;
-        let is_open = self
-            .entry_view_state
-            .read(cx)
-            .is_tool_call_content_visible(tool_call);
+        let is_open = is_terminal_tool
+            || self
+                .entry_view_state
+                .read(cx)
+                .is_tool_call_content_visible(tool_call);
 
         let input_output_header = |label: SharedString| {
             Label::new(label)
@@ -10873,10 +10874,11 @@ impl ThreadView {
                 })
         };
 
+        let is_execute = *tool_call.kind() == acp_v2::ToolKind::Execute;
         h_flex()
             .relative()
             .w_full()
-            .h(window.line_height() - px(2.))
+            .when(!is_execute, |this| this.h(window.line_height() - px(2.)))
             .text_size(self.tool_name_font_size())
             .gap_1p5()
             .when(has_location || use_card_layout, |this| this.px_1())
@@ -10885,7 +10887,7 @@ impl ThreadView {
                     .rounded(rems_from_px(3_f32)) // Concentric border radius
                     .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
             })
-            .overflow_hidden()
+            .when(!is_execute, |this| this.overflow_hidden())
             .child(
                 div()
                     .id(("tool-call-icon", entry_ix))
@@ -10936,7 +10938,7 @@ impl ThreadView {
                     ))
                     .into_any()
             })
-            .when(!is_edit, |this| this.child(gradient_overlay))
+            .when(!is_edit && !is_execute, |this| this.child(gradient_overlay))
     }
 
     fn open_tool_call_location(
@@ -11332,14 +11334,12 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let source = markdown.read(cx).source();
-        // Terminal outputs render inline regardless of size: the operator wants
-        // to see stdout/stderr, and the terminal tool caps its own output, so
-        // an inline terminal result stays bounded.
-        let is_terminal_output = tool_call
-            .name
-            .as_deref()
-            .is_some_and(|name| name == "terminal" || name == "sandboxed_terminal");
-        if !is_terminal_output
+        // Execute-kind outputs render inline regardless of size: the operator
+        // wants to see the command's full streams with nothing hidden, and the
+        // execute tools cap their own output, so an inline result stays
+        // bounded.
+        let is_execute_output = *tool_call.kind() == acp_v2::ToolKind::Execute;
+        if !is_execute_output
             && should_collapse_tool_output(
                 source,
                 self.expanded_large_tool_outputs.contains(&tool_call.id),
