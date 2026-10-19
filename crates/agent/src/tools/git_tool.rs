@@ -775,7 +775,10 @@ impl AgentTool for GitTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => format!("Git: {}", input.operation.as_str()).into(),
+            Ok(input) => match assemble_git_args(&input) {
+                Ok(args) => format!("git {}", args.join(" ")).into(),
+                Err(_) => format!("Git: {}", input.operation.as_str()).into(),
+            },
             Err(_) => "Git operation".into(),
         }
     }
