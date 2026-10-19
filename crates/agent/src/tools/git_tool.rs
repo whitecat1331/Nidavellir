@@ -17,7 +17,8 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 /// Prefer this over the `terminal` tool for git's write and network
 /// operations: `commit`, `checkout`, `switch`, `branch`, `fetch`, `pull`,
 /// `merge`, `push`, `tag`, `add`, `reset`, `restore`, `stash`, `worktree`,
-/// `clone`, `init`, `remote`, `rebase`, `cherry-pick`, and `revert`. Each
+/// `clone`, `init`, `remote`, `rebase`, `cherry-pick`, `revert`, `status`,
+/// `log`, `diff`, and `show`. Each
 /// operation is authorized through the settings permission system with a
 /// structured input string
 /// (`operation:<verb> [ref:<ref>] [remote:<remote>] [tag:<tag>] protected:<bool>`),
@@ -35,9 +36,12 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 /// ### Operations
 /// - `commit` — commit staged changes. Requires `message`.
 /// - `checkout` / `switch` — switch to an existing ref. Requires `ref`.
-/// - `branch` — create a branch at the current HEAD. Requires `ref` (the new
-///   branch name).
-/// - `fetch` / `pull` — update from a remote. `remote` and `ref` optional.
+/// - `branch` — create a branch at the current HEAD (`ref` = new branch
+///   name), list branches without `ref`, or delete one (`delete` passes
+///   `-d`; `force` upgrades to `-D`; the deleted ref's protected
+///   boundary applies).
+/// - `fetch` / `pull` — update from a remote. `remote` and `ref` optional;
+///   `refspec` passes an explicit refspec (flag refspecs are refused).
 /// - `merge` — merge `ref` into the current branch. `no_ff` and `message`
 ///   optional.
 /// - `push` — push to a remote. `remote` and `ref` optional; `delete`
@@ -54,16 +58,19 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 ///   is a protected branch.
 /// - `stash` — stash changes (`push` with an optional `message`, `pop`, or
 ///   `apply`).
-/// - `worktree` — manage worktrees (`add`/`remove`). `add` requires `ref`
-///   (the new branch, passed with `-b`) and `destination` (an absolute path),
-///   with `source` as the optional start point; `remove` requires
-///   `destination`, and `force` passes `--force`.
+/// - `worktree` — manage worktrees (`add`/`remove`/`list`/`prune`). `add`
+///   requires `ref` (the new branch, passed with `-b`) and `destination`
+///   (an absolute path), with `source` as the optional start point;
+///   `remove` requires `destination`, and `force` passes `--force`;
+///   `list` lists worktrees; `prune` prunes stale worktree records.
 /// - `clone` — clone `url` into `destination` (both required; `destination`
 ///   absolute). External-facing: joins `fetch`/`pull`/`push` in the
 ///   restricted-mode set.
-/// - `init` — initialize a repository at `destination` (required, absolute).
-/// - `remote` — manage remotes (`add`/`remove`/`rename`/`set-url`). `remote`
-///   is the remote name; `url` for `add`/`set-url`; `new_name` for `rename`.
+/// - `init` — initialize a repository at `destination` (required,
+///   absolute); `bare` passes `--bare`.
+/// - `remote` — manage remotes (`add`/`remove`/`rename`/`set-url`/`list`).
+///   `remote` is the remote name; `url` for `add`/`set-url`; `new_name`
+///   for `rename`; `list` prints the remote names.
 /// - `rebase` — rebase the current branch onto `ref` (required). Interactive
 ///   forms are refused; prompted while HEAD is a protected branch.
 /// - `cherry-pick` — apply the commit `ref` onto the current branch
@@ -71,6 +78,13 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 /// - `revert` — revert the commit `ref` on the current branch (required;
 ///   `--no-edit` is always passed). Prompted while HEAD is a protected
 ///   branch.
+/// - `status` — working-tree status (`--short --branch`). Read-only.
+/// - `log` — commit history (`--oneline -n <count>`, default 20; optional
+///   `ref` as the start point). Read-only.
+/// - `diff` — working-tree diff (optional `staged`, `ref`, `pathspecs`;
+///   flag pathspecs are refused). Read-only.
+/// - `show` — show a commit (optional `ref`; HEAD when omitted).
+///   Read-only.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GitToolInput {
     /// The git operation to perform.
@@ -84,9 +98,11 @@ pub struct GitToolInput {
     pub cd: String,
 
     /// The ref to operate on: the ref to `checkout`/`switch`/`merge`/`reset`,
-    /// the branch name for `branch`, the new branch name for `worktree add`
-    /// (passed with `-b`), the upstream for `rebase`, the commit for
-    /// `cherry-pick`/`revert`, or an optional start point for `tag`.
+    /// the branch name for `branch`, the branch to delete for
+    /// `branch --delete`, the new branch name for `worktree add` (passed
+    /// with `-b`), the upstream for `rebase`, the commit for
+    /// `cherry-pick`/`revert`, the start point for `log`/`diff`/`show`, or
+    /// an optional start point for `tag`.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
 
@@ -108,10 +124,24 @@ pub struct GitToolInput {
     #[serde(default)]
     pub no_ff: bool,
 
-    /// For `push`: pass `--delete` to delete the remote ref instead of
-    /// updating it (`ref` required).
+    /// For `push`/`branch`: pass `--delete` to delete the ref instead of
+    /// updating or creating it (`ref` required).
     #[serde(default)]
     pub delete: bool,
+
+    /// For `log`: the number of commits to show (`-n`; defaults to 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+
+    /// For `fetch`/`pull`: an explicit refspec (e.g.
+    /// `refs/heads/wip/foo:refs/remotes/origin/wip/foo`), appended after
+    /// `remote`. Flag refspecs are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refspec: Option<String>,
+
+    /// For `init`: pass `--bare` to create a bare repository.
+    #[serde(default)]
+    pub bare: bool,
 
     /// For `add`/`restore`: the pathspecs to stage or restore (required).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,7 +183,8 @@ pub struct GitToolInput {
     pub new_name: Option<String>,
 
     /// For `worktree remove`: pass `--force` to remove a worktree with
-    /// uncommitted changes.
+    /// uncommitted changes. For `branch --delete`, `force` passes `-D`
+    /// (delete even if unmerged).
     #[serde(default)]
     pub force: bool,
 
@@ -218,6 +249,14 @@ pub enum GitOperation {
     /// Revert the commit `ref` on the current branch (required; `--no-edit`
     /// is always passed). Prompted while HEAD is a protected branch.
     Revert,
+    /// Working-tree status (`--short --branch`). Read-only.
+    Status,
+    /// Commit history (`--oneline -n <count>`). Read-only.
+    Log,
+    /// Working-tree diff (optional `staged`/`ref`/`pathspecs`). Read-only.
+    Diff,
+    /// Show a commit (`ref` optional, HEAD when omitted). Read-only.
+    Show,
 }
 
 impl GitOperation {
@@ -243,6 +282,10 @@ impl GitOperation {
             Self::Rebase => "rebase",
             Self::CherryPick => "cherry-pick",
             Self::Revert => "revert",
+            Self::Status => "status",
+            Self::Log => "log",
+            Self::Diff => "diff",
+            Self::Show => "show",
         }
     }
 }
@@ -301,6 +344,10 @@ pub enum WorktreeSubcommand {
     Add,
     /// Remove the worktree at `destination`; `force` passes `--force`.
     Remove,
+    /// List worktrees.
+    List,
+    /// Prune stale worktree records.
+    Prune,
 }
 
 impl WorktreeSubcommand {
@@ -308,6 +355,8 @@ impl WorktreeSubcommand {
         match self {
             Self::Add => "add",
             Self::Remove => "remove",
+            Self::List => "list",
+            Self::Prune => "prune",
         }
     }
 }
@@ -325,6 +374,8 @@ pub enum RemoteSubcommand {
     Rename,
     /// Point the remote `remote` at `url`.
     SetUrl,
+    /// List remote names.
+    List,
 }
 
 impl RemoteSubcommand {
@@ -334,6 +385,7 @@ impl RemoteSubcommand {
             Self::Remove => "remove",
             Self::Rename => "rename",
             Self::SetUrl => "set-url",
+            Self::List => "list",
         }
     }
 }
@@ -464,7 +516,7 @@ fn required_pathspecs(input: &GitToolInput, operation: &str) -> Result<Vec<Strin
 fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
     let operation = input.operation.as_str();
     let reference = input.reference.as_deref();
-    if input.delete && input.operation != GitOperation::Push {
+    if input.delete && !matches!(input.operation, GitOperation::Push | GitOperation::Branch) {
         return Err(format!(
             "`{operation}` does not support the `delete` field (push only)"
         ));
@@ -479,8 +531,18 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
                 operation,
             )?);
         }
-        GitOperation::Checkout | GitOperation::Switch | GitOperation::Branch => {
+        GitOperation::Checkout | GitOperation::Switch => {
             args.push(required_arg(reference, "ref", operation)?);
+        }
+        GitOperation::Branch => {
+            if input.delete {
+                args.push(if input.force { "-D" } else { "-d" }.to_string());
+                args.push(required_arg(reference, "ref", operation)?);
+            } else if let Some(reference) = reference {
+                args.push(reference.to_string());
+            } else {
+                args.push("--list".to_string());
+            }
         }
         GitOperation::Fetch | GitOperation::Pull => {
             if let Some(remote) = &input.remote {
@@ -488,6 +550,13 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
             }
             if let Some(reference) = reference {
                 args.push(reference.to_string());
+            }
+            if let Some(refspec) = &input.refspec {
+                args.push(required_history_arg(
+                    Some(refspec.as_str()),
+                    "refspec",
+                    operation,
+                )?);
             }
         }
         GitOperation::Push => {
@@ -566,12 +635,17 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
                 }
                 args.push(required_destination(input, operation)?);
             }
+            WorktreeSubcommand::List => args.push("list".to_string()),
+            WorktreeSubcommand::Prune => args.push("prune".to_string()),
         },
         GitOperation::Clone => {
             args.push(required_arg(input.url.as_deref(), "url", operation)?);
             args.push(required_destination(input, operation)?);
         }
         GitOperation::Init => {
+            if input.bare {
+                args.push("--bare".to_string());
+            }
             args.push(required_destination(input, operation)?);
         }
         GitOperation::Remote => match input.remote_subcommand.unwrap_or_default() {
@@ -598,6 +672,7 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
                 args.push(required_arg(input.remote.as_deref(), "remote", operation)?);
                 args.push(required_arg(input.url.as_deref(), "url", operation)?);
             }
+            RemoteSubcommand::List => {}
         },
         GitOperation::Rebase => {
             args.push(required_history_arg(reference, "ref", operation)?);
@@ -610,6 +685,41 @@ fn assemble_git_args(input: &GitToolInput) -> Result<Vec<String>, String> {
             // has no TTY, so the editor is skipped.
             args.push("--no-edit".to_string());
             args.push(required_history_arg(reference, "ref", operation)?);
+        }
+        GitOperation::Status => {
+            args.push("--short".to_string());
+            args.push("--branch".to_string());
+        }
+        GitOperation::Log => {
+            args.push("--oneline".to_string());
+            args.push("-n".to_string());
+            args.push(input.count.unwrap_or(20).to_string());
+            if let Some(reference) = reference {
+                args.push(reference.to_string());
+            }
+        }
+        GitOperation::Diff => {
+            if input.staged {
+                args.push("--staged".to_string());
+            }
+            if let Some(reference) = reference {
+                args.push(reference.to_string());
+            }
+            if let Some(pathspecs) = &input.pathspecs {
+                for pathspec in pathspecs {
+                    if pathspec.starts_with('-') {
+                        return Err(format!(
+                            "`diff` refuses flag pathspec {pathspec:?}: flags are not modeled by the git tool"
+                        ));
+                    }
+                    args.push(pathspec.clone());
+                }
+            }
+        }
+        GitOperation::Show => {
+            if let Some(reference) = reference {
+                args.push(reference.to_string());
+            }
         }
     }
     Ok(args)
@@ -741,9 +851,14 @@ async fn run_git_operation(
         // `add`/`stash`/`worktree`/`init` never take a ref, remote, or tag:
         // keep their permission input free of stray fields so rules key on
         // the operation alone.
-        GitOperation::Add | GitOperation::Stash | GitOperation::Worktree | GitOperation::Init => {
-            git_permission_input(operation, None, None, None)
-        }
+        GitOperation::Add
+        | GitOperation::Stash
+        | GitOperation::Worktree
+        | GitOperation::Init
+        | GitOperation::Status
+        | GitOperation::Log
+        | GitOperation::Diff
+        | GitOperation::Show => git_permission_input(operation, None, None, None),
         // `clone` keys on the source URL; `remote` on the remote name.
         GitOperation::Clone => git_permission_input(operation, None, input.url.as_deref(), None),
         GitOperation::Remote => {
@@ -873,6 +988,9 @@ mod tests {
             message: message.map(str::to_string),
             no_ff,
             delete: false,
+            count: None,
+            refspec: None,
+            bare: false,
             pathspecs: None,
             mode: None,
             staged: false,
@@ -1524,6 +1642,175 @@ mod tests {
         assert_eq!(
             git_permission_input("push", Some("wip/foo"), Some("origin"), None),
             "operation:push ref:wip/foo remote:origin protected:false"
+        );
+    }
+
+    #[test]
+    fn read_ops_and_write_gap_argument_assembly() {
+        let status = test_input(GitOperation::Status, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&status).unwrap(),
+            vec!["status", "--short", "--branch"]
+        );
+
+        let log = test_input(GitOperation::Log, Some("feature"), None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&log).unwrap(),
+            vec!["log", "--oneline", "-n", "20", "feature"]
+        );
+
+        let log_count = GitToolInput {
+            count: Some(5),
+            ..test_input(GitOperation::Log, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&log_count).unwrap(),
+            vec!["log", "--oneline", "-n", "5"]
+        );
+
+        let diff_staged = GitToolInput {
+            staged: true,
+            pathspecs: Some(vec!["crates/agent".to_string()]),
+            ..test_input(GitOperation::Diff, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&diff_staged).unwrap(),
+            vec!["diff", "--staged", "crates/agent"]
+        );
+
+        let diff_flag = GitToolInput {
+            pathspecs: Some(vec!["-w".to_string()]),
+            ..test_input(GitOperation::Diff, None, None, None, None, false)
+        };
+        assert!(
+            assemble_git_args(&diff_flag)
+                .unwrap_err()
+                .contains("refuses")
+        );
+
+        let show = test_input(GitOperation::Show, Some("HEAD~1"), None, None, None, false);
+        assert_eq!(assemble_git_args(&show).unwrap(), vec!["show", "HEAD~1"]);
+
+        let show_bare = test_input(GitOperation::Show, None, None, None, None, false);
+        assert_eq!(assemble_git_args(&show_bare).unwrap(), vec!["show"]);
+
+        let branch_list = test_input(GitOperation::Branch, None, None, None, None, false);
+        assert_eq!(
+            assemble_git_args(&branch_list).unwrap(),
+            vec!["branch", "--list"]
+        );
+
+        let branch_delete = GitToolInput {
+            delete: true,
+            ..test_input(
+                GitOperation::Branch,
+                Some("wip/foo"),
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            assemble_git_args(&branch_delete).unwrap(),
+            vec!["branch", "-d", "wip/foo"]
+        );
+
+        let branch_delete_force = GitToolInput {
+            delete: true,
+            force: true,
+            ..test_input(
+                GitOperation::Branch,
+                Some("wip/foo"),
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            assemble_git_args(&branch_delete_force).unwrap(),
+            vec!["branch", "-D", "wip/foo"]
+        );
+
+        let branch_delete_missing = GitToolInput {
+            delete: true,
+            ..test_input(GitOperation::Branch, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&branch_delete_missing),
+            Err("`branch` requires the `ref` field".to_string())
+        );
+
+        let remote_list = GitToolInput {
+            remote_subcommand: Some(RemoteSubcommand::List),
+            ..test_input(GitOperation::Remote, None, None, None, None, false)
+        };
+        assert_eq!(assemble_git_args(&remote_list).unwrap(), vec!["remote"]);
+
+        let worktree_list = GitToolInput {
+            worktree_subcommand: Some(WorktreeSubcommand::List),
+            ..test_input(GitOperation::Worktree, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&worktree_list).unwrap(),
+            vec!["worktree", "list"]
+        );
+
+        let worktree_prune = GitToolInput {
+            worktree_subcommand: Some(WorktreeSubcommand::Prune),
+            ..test_input(GitOperation::Worktree, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&worktree_prune).unwrap(),
+            vec!["worktree", "prune"]
+        );
+
+        let destination = std::env::temp_dir()
+            .join("git-tool-acceptance")
+            .to_string_lossy()
+            .to_string();
+        let init_bare = GitToolInput {
+            bare: true,
+            destination: Some(destination.clone()),
+            ..test_input(GitOperation::Init, None, None, None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&init_bare).unwrap(),
+            vec!["init", "--bare", destination.as_str()]
+        );
+
+        let fetch_refspec = GitToolInput {
+            refspec: Some("refs/heads/wip/foo:refs/remotes/origin/wip/foo".to_string()),
+            ..test_input(GitOperation::Fetch, None, Some("origin"), None, None, false)
+        };
+        assert_eq!(
+            assemble_git_args(&fetch_refspec).unwrap(),
+            vec![
+                "fetch",
+                "origin",
+                "refs/heads/wip/foo:refs/remotes/origin/wip/foo"
+            ]
+        );
+
+        let fetch_flag_refspec = GitToolInput {
+            refspec: Some("-f".to_string()),
+            ..test_input(GitOperation::Fetch, None, Some("origin"), None, None, false)
+        };
+        assert!(
+            assemble_git_args(&fetch_flag_refspec)
+                .unwrap_err()
+                .contains("refuses")
+        );
+
+        // Deleting a protected ref stays gated through the canonical input.
+        assert_eq!(
+            git_permission_input("branch", Some("dev"), None, None),
+            "operation:branch ref:dev protected:true"
+        );
+        assert_eq!(
+            git_permission_input("status", None, None, None),
+            "operation:status protected:false"
         );
     }
 
