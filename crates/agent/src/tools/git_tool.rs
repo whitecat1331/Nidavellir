@@ -858,9 +858,7 @@ async fn run_git_operation(
         | GitOperation::Status
         | GitOperation::Log
         | GitOperation::Diff
-        | GitOperation::Show => {
-            git_permission_input(operation, None, None, None)
-        }
+        | GitOperation::Show => git_permission_input(operation, None, None, None),
         // `clone` keys on the source URL; `remote` on the remote name.
         GitOperation::Clone => git_permission_input(operation, None, input.url.as_deref(), None),
         GitOperation::Remote => {
