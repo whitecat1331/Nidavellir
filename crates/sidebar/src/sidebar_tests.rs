@@ -984,6 +984,47 @@ async fn test_single_workspace_with_saved_threads(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_sidebar_renders_active_workspace_without_a_restored_group(cx: &mut TestAppContext) {
+    // A restored window can have no project-group state for its active
+    // workspace (the persisted keys drift as worktrees come and go, and the
+    // workspace can be pinned before its group is recorded). The sidebar must
+    // still render that workspace's threads instead of "No threads yet".
+    let project = init_test_project("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar_closed(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let _panel = add_agent_panel(&workspace, cx);
+    cx.run_until_parked();
+
+    assert!(
+        multi_workspace.read_with(cx, |mw, _| mw.project_group_keys().is_empty()),
+        "precondition: no project groups restored"
+    );
+    assert!(
+        multi_workspace.read_with(cx, |mw, _| !mw.active_workspace_is_retained()),
+        "precondition: the active workspace is transient"
+    );
+
+    let session_id = acp::SessionId::new(Arc::from("unpinned-active"));
+    save_thread_metadata(
+        session_id.clone(),
+        Some("Unpinned Active Thread".into()),
+        Utc::now(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert!(
+        sidebar.read_with(cx, |sidebar, _| has_thread_entry(sidebar, &session_id)),
+        "the sidebar rendered no entries for the active workspace: {entries:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_workspace_lifecycle(cx: &mut TestAppContext) {
     let project = init_test_project("/project-a", cx).await;
     let (multi_workspace, cx) =
