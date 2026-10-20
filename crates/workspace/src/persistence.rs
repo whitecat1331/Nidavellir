@@ -47,6 +47,7 @@ use crate::{
     WorkspaceId,
     path_list::{PathList, SerializedPathList},
     persistence::model::RemoteConnectionKind,
+    workspace_manager::WorkspaceManager,
 };
 
 use model::{
@@ -73,6 +74,22 @@ fn contains_wsl_path(paths: &PathList) -> bool {
             .paths()
             .iter()
             .any(|path| util::paths::WslPath::from_path(path).is_some())
+}
+
+/// True when `path` is gone but its parent directory still exists — the
+/// signature of a deliberate delete, as opposed to an unmounted/removable/
+/// network volume (whose parent is gone too).
+async fn is_unambiguously_missing(fs: &dyn Fs, path: &Path) -> bool {
+    if fs.metadata(path).await.ok().flatten().is_some() {
+        return false;
+    }
+    match path.parent() {
+        None => true,
+        Some(parent) if parent.as_os_str().is_empty() => true,
+        Some(parent) => {
+            matches!(fs.metadata(parent).await.ok().flatten(), Some(meta) if meta.is_dir)
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -2164,6 +2181,23 @@ impl WorkspaceDb {
         any_dir
     }
 
+    /// The subset of `paths` that still resolve to an existing directory, or
+    /// `None` when none survive. Callers keep all-or-nothing semantics for a
+    /// fully-vanished workspace.
+    async fn surviving_local_paths(paths: &PathList, fs: &dyn Fs) -> Option<PathList> {
+        let mut surviving = Vec::new();
+        for path in paths.paths() {
+            if matches!(fs.metadata(path).await.ok().flatten(), Some(meta) if meta.is_dir) {
+                surviving.push(path.clone());
+            }
+        }
+        if surviving.is_empty() {
+            None
+        } else {
+            Some(PathList::new(&surviving))
+        }
+    }
+
     // Returns the raw recent workspace history. Scratch workspaces (no paths) are filtered
     // out because they are restored separately by `last_session_workspace_locations`.
     pub async fn recent_project_workspaces_ungrouped(
@@ -2192,19 +2226,20 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
-                let identity_paths = resolve_local_workspace_identity(fs, &paths)
-                    .await
-                    .or(identity_paths_hint)
-                    .unwrap_or_else(|| paths.clone());
-                result.push(RecentWorkspace {
-                    workspace_id: id,
-                    location: SerializedWorkspaceLocation::Local,
-                    paths,
-                    identity_paths,
-                    timestamp,
-                });
-            }
+            let Some(surviving_paths) = Self::surviving_local_paths(&paths, fs).await else {
+                continue;
+            };
+            let identity_paths = resolve_local_workspace_identity(fs, &surviving_paths)
+                .await
+                .or(identity_paths_hint)
+                .unwrap_or_else(|| surviving_paths.clone());
+            result.push(RecentWorkspace {
+                workspace_id: id,
+                location: SerializedWorkspaceLocation::Local,
+                paths: surviving_paths,
+                identity_paths,
+                timestamp,
+            });
         }
 
         Ok(result)
@@ -2263,6 +2298,49 @@ impl WorkspaceDb {
         Ok(workspace_ids)
     }
 
+    /// Remove member projects whose local paths no longer resolve, keeping the
+    /// workspace itself (id, name, layout, threads) intact. Only local members
+    /// are considered, and a member is removed only when it is unambiguously
+    /// gone (its parent directory still exists) — an unmounted/removable/
+    /// network volume never loses membership.
+    pub(crate) async fn prune_missing_projects(&self, fs: &dyn Fs) -> Result<()> {
+        let manager = WorkspaceManager::new(self.clone());
+        for workspace in manager.all()? {
+            let mut removed = Vec::new();
+            for project in manager.projects(workspace.workspace_id)? {
+                if project.remote_connection_id.is_some() {
+                    continue;
+                }
+                if contains_wsl_path(&PathList::new(std::slice::from_ref(&project.path))) {
+                    continue;
+                }
+                if is_unambiguously_missing(fs, &project.path).await {
+                    manager
+                        .remove_project(workspace.workspace_id, project.path.clone())
+                        .await?;
+                    removed.push(project.path);
+                }
+            }
+            if removed.is_empty() {
+                continue;
+            }
+            // The legacy layout row keyed by this workspace's uuid still lists
+            // the dead member; drop it there too so open-by-path matching and
+            // the raw path set stop referencing it. A missing row (e.g. a
+            // workspace created before managed identity) is not an error.
+            if let Some(mut layout) = self.workspace_for_uuid(workspace.workspace_id.as_uuid()) {
+                for dead in &removed {
+                    layout.paths = layout.paths.without_path(dead);
+                    layout.identity_paths =
+                        layout.identity_paths.map(|paths| paths.without_path(dead));
+                }
+                self.save_workspace_with_uuid(layout, Some(workspace.workspace_id.as_uuid()))
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     // Deletes workspace rows that can no longer be restored from. Remote workspaces whose
     // connection was removed, and (on Windows) workspaces pointing at WSL paths, are cleaned
     // up immediately. Local workspaces with no valid paths on disk are kept for seven days
@@ -2274,6 +2352,11 @@ impl WorkspaceDb {
         current_session_id: &str,
         last_session_id: Option<&str>,
     ) -> Result<()> {
+        // Prune dead member folders first, so a workspace that still has live
+        // members is never dropped by the staleness sweep below (and its
+        // membership stops referencing a deleted folder).
+        self.prune_missing_projects(fs).await?;
+
         let remote_connections = self.remote_connections()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
@@ -2352,11 +2435,20 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if paths.is_empty() || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
+            if paths.is_empty() {
                 workspaces.push(SessionWorkspace {
                     workspace_id,
                     location: SerializedWorkspaceLocation::Local,
                     paths,
+                    window_id,
+                });
+                continue;
+            }
+            if let Some(surviving_paths) = Self::surviving_local_paths(&paths, fs).await {
+                workspaces.push(SessionWorkspace {
+                    workspace_id,
+                    location: SerializedWorkspaceLocation::Local,
+                    paths: surviving_paths,
                     window_id,
                 });
             }
@@ -4193,6 +4285,147 @@ mod tests {
         assert!(
             db.workspace_for_id(WorkspaceId(1)).is_none(),
             "a stale workspace past the retention window must be deleted"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_recent_projects_filters_missing_members(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/surviving", json!({"file.txt": ""})).await;
+        let db = WorkspaceDb::open_test_db("test_recent_projects_filters_missing_members").await;
+
+        db.save_workspace(workspace_with(
+            1,
+            &["/surviving".as_ref(), "/missing".as_ref()],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+
+        let recents = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        assert_eq!(
+            recents.len(),
+            1,
+            "a workspace with a live member must survive"
+        );
+        assert_eq!(
+            recents[0].paths.paths(),
+            &[PathBuf::from("/surviving")],
+            "the dead member must be filtered out of the surviving paths"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_last_session_workspace_locations_filters_missing_members(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/surviving", json!({})).await;
+        let db = WorkspaceDb::open_test_db(
+            "test_last_session_workspace_locations_filters_missing_members",
+        )
+        .await;
+
+        db.save_workspace(workspace_with(
+            1,
+            &["/surviving".as_ref(), "/missing".as_ref()],
+            empty_pane_group(),
+            Some("last"),
+        ))
+        .await;
+
+        let locations = db
+            .last_session_workspace_locations("last", None, fs.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            locations.len(),
+            1,
+            "a workspace with a live member must still be restored"
+        );
+        assert_eq!(
+            locations[0].paths.paths(),
+            &[PathBuf::from("/surviving")],
+            "the dead member must be filtered out of the restored paths"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_prune_missing_projects_removes_dead_member(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/surviving", json!({})).await;
+        fs.insert_tree("/parent", json!({"file.txt": ""})).await;
+        let db = WorkspaceDb::open_test_db("test_prune_missing_projects_removes_dead_member").await;
+        let manager = WorkspaceManager::new(db.clone());
+
+        let workspace_id = manager
+            .create(
+                "Test".into(),
+                vec![
+                    PathBuf::from("/surviving"),
+                    PathBuf::from("/parent/missing"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        db.prune_missing_projects(fs.as_ref()).await.unwrap();
+
+        let projects = manager.projects(workspace_id).unwrap();
+        assert_eq!(projects.len(), 1, "the dead member must be pruned");
+        assert_eq!(
+            projects[0].path,
+            PathBuf::from("/surviving"),
+            "the live member must remain"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_prune_missing_projects_skips_unmounted_volume(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db =
+            WorkspaceDb::open_test_db("test_prune_missing_projects_skips_unmounted_volume").await;
+        let manager = WorkspaceManager::new(db.clone());
+
+        let workspace_id = manager
+            .create("Test".into(), vec![PathBuf::from("/unmounted/member")])
+            .await
+            .unwrap();
+
+        db.prune_missing_projects(fs.as_ref()).await.unwrap();
+
+        assert_eq!(
+            manager.projects(workspace_id).unwrap().len(),
+            1,
+            "an unmounted volume must keep its membership"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_prune_missing_projects_skips_remote_members(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db =
+            WorkspaceDb::open_test_db("test_prune_missing_projects_skips_remote_members").await;
+        let manager = WorkspaceManager::new(db.clone());
+
+        let workspace_id = manager.create("Test".into(), vec![]).await.unwrap();
+        let key = workspace_id.to_key_string();
+        db.write(move |conn| -> Result<()> {
+            conn.exec_bound::<(&str, &str, i64, i64)>(sql! {
+                INSERT INTO managed_workspace_projects (workspace_id, path, position, remote_connection_id)
+                VALUES (?, ?, ?, ?)
+            })?((key.as_str(), "/remote-host/member", 0, 123))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        db.prune_missing_projects(fs.as_ref()).await.unwrap();
+
+        assert_eq!(
+            manager.projects(workspace_id).unwrap().len(),
+            1,
+            "a remote member must never be pruned"
         );
     }
 
