@@ -1940,10 +1940,47 @@ impl NativeAgent {
     fn save_thread(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
         let id = thread.read(cx).id().clone();
         let Some(session) = self.sessions.get(&id) else {
+            // The session was removed (released, or discarded for the
+            // multi-instance staleness reload) while this thread entity is
+            // still alive and observed. Persist it directly so its transcript
+            // is not silently lost on exit.
+            self.save_detached_thread(&id, thread, cx);
             return;
         };
         let draft_prompt = session.draft_prompt(cx);
         self.enqueue_save(&id, draft_prompt, false, cx);
+    }
+
+    /// Persists a thread whose session is gone (released or discarded) but
+    /// whose entity is still alive and being mutated. The normal save path is
+    /// keyed off the session, so without this fallback the transcript would
+    /// silently stop reaching `threads.db` and be lost.
+    fn save_detached_thread(
+        &mut self,
+        id: &acp_v1::SessionId,
+        thread: Entity<Thread>,
+        cx: &mut Context<Self>,
+    ) {
+        log::warn!(
+            "[THREAD] persisting detached thread {id:?}: its session is gone but the thread is still alive"
+        );
+        if thread.read(cx).is_empty() {
+            return;
+        }
+        let db_thread = thread.update(cx, |thread, cx| thread.to_db(cx));
+        let database_future = ThreadsDatabase::connect(cx);
+        let id = id.clone();
+        cx.spawn(async move |_this, _cx| {
+            let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
+                return;
+            };
+            let db_thread = db_thread.await;
+            database
+                .save_thread(id, db_thread, PathList::new::<PathBuf>(&[]), None)
+                .await
+                .log_err();
+        })
+        .detach();
     }
 
     fn enqueue_save(
@@ -1954,15 +1991,18 @@ impl NativeAgent {
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.sessions.get(id) else {
+            log::warn!("[THREAD] save enqueued for absent session {id:?}; dropped");
             return;
         };
         let Some((id, folder_paths, workspace_id, db_thread)) =
             self.thread_save_payload(session, draft_prompt, cx)
         else {
+            log::debug!("[THREAD] no save payload (empty thread or gone project state)");
             return;
         };
 
         let Some(session) = self.sessions.get_mut(&id) else {
+            log::warn!("[THREAD] save enqueued for absent session {id:?}; dropped");
             return;
         };
         *session.pending_save.lock() = Some(PendingThreadSave {
@@ -2063,7 +2103,10 @@ impl NativeAgent {
         if session.thread.read(cx).is_empty() {
             return None;
         }
-        let state = self.projects.get(&session.project_id)?;
+        let Some(state) = self.projects.get(&session.project_id) else {
+            log::warn!("[THREAD] no project state for a session's thread; skipping save");
+            return None;
+        };
         let folder_paths = PathList::new(
             &state
                 .project
@@ -8233,6 +8276,72 @@ mod internal_tests {
             database.save_write_count(),
             writes_after_content + 1,
             "a save with changed content must write",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_detached_thread_save_persists(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+        });
+
+        let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+        let send = cx.foreground_executor().spawn(send);
+        cx.run_until_parked();
+        let request = fake.pending_completions_for(&model).pop().unwrap();
+        fake.send_text(&model, &request, "world");
+        fake.end_stream(&model, &request);
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        let writes_before = database.save_write_count();
+
+        // Discard the session the way the multi-instance staleness reload does,
+        // while the thread entity is still alive and held by the view.
+        agent.update(cx, |agent, cx| agent.discard_session(&session_id, cx));
+        cx.run_until_parked();
+
+        // A save after the discard must still persist the thread's content.
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(thread.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            database.save_write_count() > writes_before,
+            "a detached thread's save must not be silently dropped"
         );
     }
 

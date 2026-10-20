@@ -871,8 +871,8 @@ impl ThreadsDatabase {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
-                folder_paths = excluded.folder_paths,
-                folder_paths_order = excluded.folder_paths_order,
+                folder_paths = COALESCE(excluded.folder_paths, threads.folder_paths),
+                folder_paths_order = COALESCE(excluded.folder_paths_order, threads.folder_paths_order),
                 workspace_id = COALESCE(excluded.workspace_id, threads.workspace_id),
                 summary = excluded.summary,
                 updated_at = excluded.updated_at,
