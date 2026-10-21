@@ -154,7 +154,14 @@ impl Render for InfraPanel {
                         ),
                     ),
             )
-            .child(v_flex().flex_1().px_2().pb_2().children(self.render_rows()))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .px_2()
+                    .pb_2()
+                    .overflow_y_scroll()
+                    .children(self.render_rows()),
+            )
     }
 }
 
