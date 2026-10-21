@@ -6,7 +6,7 @@ use gpui::{
     actions, px, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Task,
     WeakEntity, Window,
 };
-use ui::{Button, IconName, Label, StatefulInteractiveElement, prelude::*};
+use ui::{Button, IconName, Label, LabelSize, StatefulInteractiveElement, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -86,14 +86,33 @@ impl InfraPanel {
 
     fn render_rows(&self) -> Vec<Div> {
         let mut rows = Vec::new();
+        rows.push(section_header(&format!(
+            "Virtual machines ({})",
+            self.vm_statuses.len()
+        )));
         for status in &self.vm_statuses {
             rows.push(render_vm_row(status));
         }
+        rows.push(section_header(&format!(
+            "Containers ({})",
+            self.container_statuses.len()
+        )));
         for status in &self.container_statuses {
             rows.push(render_container_row(status));
         }
         rows
     }
+}
+
+fn section_header(title: &str) -> Div {
+    h_flex()
+        .pt_2()
+        .pb_1()
+        .child(
+            Label::new(title.to_string())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
 }
 
 fn render_vm_row(status: &VmStatus) -> Div {
@@ -122,7 +141,7 @@ fn render_container_row(status: &ContainerStatus) -> Div {
         (None, Some(_)) => ("unreachable".to_string(), Color::Error),
         (None, None) => ("unknown".to_string(), Color::Muted),
     };
-    let name = format!("{} ({})", status.target, driver_label(status.driver));
+    let name = format!("{} · {}", status.target, driver_label(status.driver));
     h_flex()
         .justify_between()
         .child(Label::new(name))
@@ -131,7 +150,7 @@ fn render_container_row(status: &ContainerStatus) -> Div {
 
 fn driver_label(driver: ContainerDriver) -> &'static str {
     match driver {
-        ContainerDriver::Compose => "compose",
+        ContainerDriver::Compose => "docker compose",
         ContainerDriver::Systemd => "systemd",
     }
 }
