@@ -230,10 +230,13 @@ impl WorkspaceManager {
 
     /// Resolve the managed workspace that best represents the given folder
     /// set. Prefers an exact membership match (see
-    /// [`Self::workspace_id_for_paths`]), then falls back to the workspace
-    /// whose membership is a *superset* of the set, choosing the closest by
-    /// extra-folder count. This keeps a window whose roots drifted from its
-    /// workspace's membership attached instead of silently detaching.
+    /// [`Self::workspace_id_for_paths`]), then the workspace whose membership
+    /// is a *superset* of the set (closest by extra-folder count), then the
+    /// workspace with the strongest path overlap.
+    ///
+    /// The overlap step keeps a thread attached after its workspace changes
+    /// shape: the thread's saved paths then name worktrees the workspace has
+    /// since removed, so it is neither an exact match nor a subset.
     pub fn workspace_id_for_paths_relaxed(
         &self,
         paths: &PathList,
@@ -257,31 +260,30 @@ impl WorkspaceManager {
             })?
             (())?;
 
-        let mut by_workspace: collections::HashMap<String, Vec<String>> =
+        let mut by_workspace: collections::HashMap<String, collections::HashSet<String>> =
             collections::HashMap::default();
         for (workspace_id, path) in rows {
-            by_workspace.entry(workspace_id).or_default().push(path);
+            by_workspace.entry(workspace_id).or_default().insert(path);
         }
 
         let mut closest: Option<(usize, ManagedWorkspaceId)> = None;
-        for (workspace_id, project_paths) in by_workspace {
-            if project_paths.len() < target.len() {
+        for (workspace_id, members) in &by_workspace {
+            if members.len() < target.len() || !target.is_subset(members) {
                 continue;
             }
-            let member_set = project_paths
-                .into_iter()
-                .collect::<collections::HashSet<_>>();
-            if !target.is_subset(&member_set) {
-                continue;
-            }
-            let extra = member_set.len() - target.len();
-            let id = ManagedWorkspaceId::from_key_string(&workspace_id)?;
+            let extra = members.len() - target.len();
+            let id = ManagedWorkspaceId::from_key_string(workspace_id)?;
             if closest.map_or(true, |(closest_extra, _)| extra < closest_extra) {
                 closest = Some((extra, id));
             }
         }
+        if let Some((_, id)) = closest {
+            return Ok(Some(id));
+        }
 
-        Ok(closest.map(|(_, id)| id))
+        best_overlap_workspace(&target, &by_workspace)
+            .map(|workspace_id| ManagedWorkspaceId::from_key_string(&workspace_id))
+            .transpose()
     }
 
     /// Create a managed workspace for the given paths unless one with identical
@@ -454,4 +456,111 @@ fn parse_timestamp(text: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(text)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+/// The workspace that best represents `paths` by overlap, used when no
+/// workspace is an exact or superset match.
+///
+/// A thread's saved paths drift from its workspace over time: worktrees are
+/// added and removed, and the thread still names the old ones. Requiring a
+/// subset would leave such a thread unattached, which hides it from the
+/// sidebar. Accept a clear majority overlap (Jaccard similarity at least 1/2)
+/// or a near superset (at least 80% of the smaller set), and require two shared
+/// paths so one coincidence cannot move a thread to another project.
+fn best_overlap_workspace(
+    paths: &collections::HashSet<String>,
+    by_workspace: &collections::HashMap<String, collections::HashSet<String>>,
+) -> Option<String> {
+    let mut candidates: Vec<(f64, usize, usize, &String)> = by_workspace
+        .iter()
+        .filter_map(|(workspace_id, members)| {
+            let overlap = paths.intersection(members).count();
+            if overlap < 2 {
+                return None;
+            }
+            let union = paths.union(members).count();
+            let jaccard = overlap as f64 / union as f64;
+            let smaller = paths.len().min(members.len());
+            if jaccard < 0.5 && overlap * 5 < smaller * 4 {
+                return None;
+            }
+            Some((
+                jaccard,
+                overlap,
+                members.len().saturating_sub(overlap),
+                workspace_id,
+            ))
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(b.3))
+    });
+
+    candidates
+        .first()
+        .map(|(_, _, _, workspace_id)| (*workspace_id).clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(paths: &[&str]) -> collections::HashSet<String> {
+        paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    #[test]
+    fn test_best_overlap_prefers_the_workspace_sharing_most_paths() {
+        let mut by_workspace = collections::HashMap::default();
+        by_workspace.insert("main".to_string(), set(&["a", "b", "c", "d"]));
+        by_workspace.insert("test".to_string(), set(&["a", "b"]));
+
+        assert_eq!(
+            best_overlap_workspace(&set(&["a", "b", "c", "d", "stale"]), &by_workspace),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn test_best_overlap_accepts_a_near_superset_with_stale_paths() {
+        let mut by_workspace = collections::HashMap::default();
+        by_workspace.insert("main".to_string(), set(&["a", "b", "c", "d", "e"]));
+        // Four of the workspace's five folders survive, plus six stale paths;
+        // Jaccard is below 1/2 but the overlap is a near superset.
+        assert_eq!(
+            best_overlap_workspace(
+                &set(&["b", "c", "d", "e", "s1", "s2", "s3", "s4", "s5", "s6"]),
+                &by_workspace,
+            ),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn test_best_overlap_ignores_a_single_shared_path() {
+        let mut by_workspace = collections::HashMap::default();
+        by_workspace.insert("main".to_string(), set(&["a", "b", "c"]));
+
+        assert_eq!(
+            best_overlap_workspace(&set(&["a", "unrelated"]), &by_workspace),
+            None
+        );
+    }
+
+    #[test]
+    fn test_best_overlap_is_deterministic_on_a_tie() {
+        let mut by_workspace = collections::HashMap::default();
+        by_workspace.insert("b-workspace".to_string(), set(&["a", "b"]));
+        by_workspace.insert("a-workspace".to_string(), set(&["a", "b"]));
+
+        assert_eq!(
+            best_overlap_workspace(&set(&["a", "b"]), &by_workspace),
+            Some("a-workspace".to_string())
+        );
+    }
 }
