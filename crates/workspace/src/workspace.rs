@@ -44,7 +44,8 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 pub use workspace_manager::{
-    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
+    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, MembershipIndex,
+    WorkspaceManager,
 };
 
 use anyhow::{Context as _, Result, anyhow};

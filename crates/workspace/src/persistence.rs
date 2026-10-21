@@ -4430,6 +4430,76 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_membership_index_matches_legacy_scan(_cx: &mut gpui::TestAppContext) {
+        let db = WorkspaceDb::open_test_db("test_membership_index_matches_legacy_scan").await;
+        let manager = WorkspaceManager::new(db.clone());
+
+        let exact_ws = manager
+            .create(
+                "Exact".into(),
+                vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            )
+            .await
+            .unwrap();
+        let superset_ws = manager
+            .create(
+                "Superset".into(),
+                vec![
+                    PathBuf::from("/a"),
+                    PathBuf::from("/b"),
+                    PathBuf::from("/c"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let index = manager.membership_index().unwrap();
+
+        let exact_paths = PathList::new(&["/a", "/b"]);
+        assert_eq!(index.workspace_id_for_paths(&exact_paths), Some(exact_ws));
+        assert_eq!(
+            manager.workspace_id_for_paths(&exact_paths).unwrap(),
+            Some(exact_ws),
+            "the in-memory index must agree with the legacy exact scan"
+        );
+
+        // `/a` is a subset of both workspaces; the closest (extra = 1) wins.
+        let subset = PathList::new(&["/a"]);
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&subset),
+            Some(exact_ws)
+        );
+        assert_eq!(
+            manager.workspace_id_for_paths_relaxed(&subset).unwrap(),
+            Some(exact_ws),
+            "the in-memory index must agree with the legacy relaxed scan"
+        );
+
+        // A set equal to the larger workspace's membership resolves to it.
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&PathList::new(&["/a", "/b", "/c"])),
+            Some(superset_ws)
+        );
+
+        assert_eq!(
+            index.workspace_id_for_paths(&PathList::new::<&str>(&[])),
+            None
+        );
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&PathList::new::<&str>(&[])),
+            None
+        );
+        assert_eq!(
+            index.workspace_id_for_paths(&PathList::new(&["/nope"])),
+            None
+        );
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&PathList::new(&["/nope"])),
+            None
+        );
+    }
+
+    #[gpui::test]
     async fn test_gc_preserves_current_and_last_sessions(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         let db = WorkspaceDb::open_test_db("test_gc_preserves_current_and_last_sessions").await;

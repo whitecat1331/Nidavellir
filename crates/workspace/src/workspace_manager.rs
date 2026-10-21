@@ -78,6 +78,59 @@ pub struct ManagedWorkspaceProject {
     pub remote_connection_id: Option<i64>,
 }
 
+/// An in-memory snapshot of `managed_workspace_projects`, built from a single
+/// query. Hot reload paths (thread tagging, window identity) build one of these
+/// per reload and resolve every path set against it, instead of issuing one
+/// full table scan per set.
+#[derive(Default)]
+pub struct MembershipIndex {
+    exact: collections::HashMap<Vec<String>, ManagedWorkspaceId>,
+    supersets: Vec<(ManagedWorkspaceId, collections::HashSet<String>)>,
+}
+
+impl MembershipIndex {
+    /// Resolve the workspace whose membership is exactly the given folder set.
+    pub fn workspace_id_for_paths(&self, paths: &PathList) -> Option<ManagedWorkspaceId> {
+        if paths.is_empty() {
+            return None;
+        }
+        let mut target = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        target.sort();
+        self.exact.get(&target).copied()
+    }
+
+    /// Resolve the workspace that best represents the given folder set: exact
+    /// first, then the closest superset by extra-folder count.
+    pub fn workspace_id_for_paths_relaxed(&self, paths: &PathList) -> Option<ManagedWorkspaceId> {
+        if let Some(id) = self.workspace_id_for_paths(paths) {
+            return Some(id);
+        }
+        if paths.is_empty() {
+            return None;
+        }
+        let target = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<collections::HashSet<_>>();
+        let mut closest: Option<(usize, ManagedWorkspaceId)> = None;
+        for (id, member_set) in &self.supersets {
+            if member_set.len() < target.len() || !target.is_subset(member_set) {
+                continue;
+            }
+            let extra = member_set.len() - target.len();
+            if closest.map_or(true, |(closest_extra, _)| extra < closest_extra) {
+                closest = Some((extra, *id));
+            }
+        }
+        closest.map(|(_, id)| id)
+    }
+}
+
 /// A managed workspace that contains a folder being opened — one option in the
 /// open-folder ask.
 #[derive(Debug, Clone)]
@@ -284,6 +337,35 @@ impl WorkspaceManager {
         best_overlap_workspace(&target, &by_workspace)
             .map(|workspace_id| ManagedWorkspaceId::from_key_string(&workspace_id))
             .transpose()
+    }
+
+    /// Build a single-query snapshot of the managed-workspace membership for
+    /// [`MembershipIndex`], so a caller that resolves many path sets (a thread
+    /// reload, a window restore) pays one scan instead of one per set.
+    pub fn membership_index(&self) -> Result<MembershipIndex> {
+        let rows = self
+            .select_bound::<(), (String, String)>(sql! {
+                SELECT workspace_id, path FROM managed_workspace_projects ORDER BY workspace_id, position
+            })?
+            (())?;
+
+        let mut by_workspace: collections::HashMap<String, Vec<String>> =
+            collections::HashMap::default();
+        for (workspace_id, path) in rows {
+            by_workspace.entry(workspace_id).or_default().push(path);
+        }
+
+        let mut index = MembershipIndex::default();
+        for (workspace_id, project_paths) in by_workspace {
+            let id = ManagedWorkspaceId::from_key_string(&workspace_id)?;
+            let mut sorted = project_paths.clone();
+            sorted.sort();
+            index.exact.insert(sorted, id);
+            index
+                .supersets
+                .push((id, project_paths.into_iter().collect()));
+        }
+        Ok(index)
     }
 
     /// Create a managed workspace for the given paths unless one with identical
