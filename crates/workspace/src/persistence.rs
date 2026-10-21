@@ -1130,6 +1130,17 @@ impl Domain for WorkspaceDb {
                 lower(hex(randomblob(6)))
             WHERE workspace_uuid IS NULL OR workspace_uuid = "";
         ),
+        // Path-based lookups: index the membership-by-path query (open-folder
+        // ask) and restore the legacy layout location index that was dropped as
+        // a unique index. Non-unique on purpose — a layout must survive
+        // membership drift, which is why the unique index was removed.
+        sql!(
+            CREATE INDEX IF NOT EXISTS idx_managed_workspace_projects_path
+            ON managed_workspace_projects(path);
+
+            CREATE INDEX IF NOT EXISTS ix_workspaces_location
+            ON workspaces(remote_connection_id, paths);
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
