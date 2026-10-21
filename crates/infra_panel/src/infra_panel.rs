@@ -4,7 +4,7 @@ use agent::containers::ContainerDriver;
 use agent::{ContainerStatus, VmStatus};
 use gpui::{
     actions, px, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Task,
-    WeakEntity, Window, h_flex, v_flex,
+    WeakEntity, Window,
 };
 use ui::{Button, IconName, Label, prelude::*};
 use workspace::Workspace;
