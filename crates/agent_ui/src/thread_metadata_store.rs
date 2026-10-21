@@ -103,7 +103,9 @@ pub fn init(cx: &mut App) {
 }
 
 /// Migrate existing thread metadata from native agent thread store to the new metadata storage.
-/// We skip migrating threads that do not have a project.
+/// We skip migrating threads that do not have a project. Every migrated thread
+/// is archived: legacy threads must not appear in the sidebar's main list, and
+/// this migration never unarchives anything.
 ///
 /// TODO: Remove this after N weeks of shipping the sidebar
 fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
@@ -162,29 +164,15 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
             return anyhow::Ok(());
         }
 
-        // For each batch of newly-migrated threads, keep the 5 most recent
-        // per project unarchived. Previously this was gated on
-        // `is_first_migration` (an empty `sidebar_threads`), which meant any
-        // subsequent batch of newly-discovered legacy threads got migrated as
-        // fully archived. Running the rescue per-batch keeps the behavior
-        // idempotent across partial migrations and re-runs.
-        let mut per_project: HashMap<PathList, Vec<&mut ThreadMetadata>> = HashMap::default();
-        for entry in &mut to_migrate {
-            if entry.worktree_paths.is_empty() {
-                continue;
-            }
-            per_project
-                .entry(entry.worktree_paths.folder_path_list().clone())
-                .or_default()
-                .push(entry);
-        }
-        for entries in per_project.values_mut() {
-            entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
-            for entry in entries.iter_mut().take(5) {
-                entry.archived = false;
-            }
-        }
-
+        // Migrated legacy threads are always archived. The sidebar only lists
+        // unarchived threads, so this deliberately keeps historical threads out
+        // of the main list; they remain reachable through the archive view.
+        //
+        // Do not add a rescue that unarchives the most recent threads per
+        // project: it produced an inconsistent partial state (a later
+        // migration batch was fully archived, and previously-migrated batches
+        // were never re-examined), which is exactly the drift this migration
+        // must not reintroduce.
         log::info!("Migrating {} thread store entries", to_migrate.len());
 
         // Manually save each entry to the database and call reload, otherwise
@@ -3006,9 +2994,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_migrate_thread_metadata_archives_beyond_five_most_recent_per_project(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_migrate_thread_metadata_archives_all_threads(cx: &mut TestAppContext) {
         init_test(cx);
 
         let project_a_paths = PathList::new(&[Path::new("/project-a")]);
@@ -3062,36 +3048,24 @@ mod tests {
 
         assert_eq!(list.len(), 10);
 
-        // Project A: 5 most recent should be unarchived, 2 oldest should be archived
-        let mut project_a_entries: Vec<_> = list
+        // Legacy threads are always archived, regardless of project or recency:
+        // this migration never unarchives anything.
+        assert!(
+            list.iter().all(|entry| entry.archived),
+            "every migrated legacy thread must be archived"
+        );
+
+        let project_a_entries: Vec<_> = list
             .iter()
             .filter(|m| *m.folder_paths() == project_a_paths)
             .collect();
         assert_eq!(project_a_entries.len(), 7);
-        project_a_entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
 
-        for entry in &project_a_entries[..5] {
-            assert!(
-                !entry.archived,
-                "Expected {:?} to be unarchived (top 5 most recent)",
-                entry.session_id
-            );
-        }
-        for entry in &project_a_entries[5..] {
-            assert!(
-                entry.archived,
-                "Expected {:?} to be archived (older than top 5)",
-                entry.session_id
-            );
-        }
-
-        // Project B: all 3 should be unarchived (under the limit)
         let project_b_entries: Vec<_> = list
             .iter()
             .filter(|m| *m.folder_paths() == project_b_paths)
             .collect();
         assert_eq!(project_b_entries.len(), 3);
-        assert!(project_b_entries.iter().all(|m| !m.archived));
     }
 
     // Regression test for the race between `ThreadStore::reload` and
