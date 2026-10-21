@@ -105,7 +105,8 @@ pub fn init(cx: &mut App) {
 /// Migrate existing thread metadata from native agent thread store to the new metadata storage.
 /// We skip migrating threads that do not have a project. Every migrated thread
 /// is archived: legacy threads must not appear in the sidebar's main list, and
-/// this migration never unarchives anything.
+/// this migration never unarchives anything. Rows already in `sidebar_threads`
+/// are skipped entirely, so no existing thread's archived state is changed.
 ///
 /// TODO: Remove this after N weeks of shipping the sidebar
 fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
@@ -2838,10 +2839,8 @@ mod tests {
         assert!(migrated_session_ids.iter().any(|s| s == "b-session-0"));
         assert!(migrated_session_ids.iter().any(|s| s == "projectless"));
 
-        // The per-batch top-5 rescue applies: each migrated thread that has
-        // a project becomes the most-recent-in-its-project within this batch
-        // and is unarchived. Only the projectless thread stays archived,
-        // because the rescue only applies to threads with a folder path.
+        // Migrated legacy threads are always archived (archive-all), while the
+        // pre-existing unarchived row above keeps its state untouched.
         let migrated_by_session: HashMap<String, &ThreadMetadata> = list
             .iter()
             .filter_map(|metadata| {
@@ -2849,8 +2848,8 @@ mod tests {
                 (session_id != "a-session-0").then_some((session_id, metadata))
             })
             .collect();
-        assert!(!migrated_by_session["a-session-1"].archived);
-        assert!(!migrated_by_session["b-session-0"].archived);
+        assert!(migrated_by_session["a-session-1"].archived);
+        assert!(migrated_by_session["b-session-0"].archived);
         assert!(migrated_by_session["projectless"].archived);
     }
 
