@@ -209,7 +209,7 @@ impl Panel for InfraPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::Link)
+        Some(IconName::Server)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
