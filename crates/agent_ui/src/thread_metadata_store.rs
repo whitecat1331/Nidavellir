@@ -128,7 +128,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
             .filter_map(|m| m.session_id.map(|s| s.0))
             .collect();
 
-        let mut to_migrate = thread_store.read_with(cx, |store, _cx| {
+        let to_migrate = thread_store.read_with(cx, |store, _cx| {
             store
                 .entries()
                 .filter_map(|entry| {
