@@ -6,7 +6,7 @@ use gpui::{
     actions, px, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Task,
     WeakEntity, Window,
 };
-use ui::{Button, IconName, Label, prelude::*};
+use ui::{Button, IconName, Label, StatefulInteractiveElement, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
