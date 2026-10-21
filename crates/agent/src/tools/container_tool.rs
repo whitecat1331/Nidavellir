@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::containers::{ContainerOperation, ContainerStore, assemble_command};
+use crate::containers::{ContainerDriver, ContainerOperation, ContainerStore, assemble_command};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, AppContext as _, SharedString, Task};
@@ -169,6 +169,109 @@ async fn run_operation(
         message = format!("`{}` completed successfully.", assembled.display());
     }
     Ok(ContainerToolOutput::Success { message })
+}
+
+/// One container target's read-only health, for the infra dashboard panel.
+/// Holds no infra of its own — the targets come from the seeded
+/// `containers.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerStatus {
+    /// `containers.json` target id.
+    pub target: String,
+    /// How the target is operated (compose stack vs systemd unit).
+    pub driver: ContainerDriver,
+    /// A short success summary (compose service list / `is-active` state).
+    pub state: Option<String>,
+    /// The failure reason when the health check could not run.
+    pub error: Option<String>,
+}
+
+/// Queries each container target's read-only health (compose `ps` / systemd
+/// `is-active`) and returns one row per target, best-effort.
+pub async fn container_statuses() -> Vec<ContainerStatus> {
+    let store = match ContainerStore::load(ContainerStore::default_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return vec![ContainerStatus {
+                target: String::new(),
+                driver: ContainerDriver::Compose,
+                state: None,
+                error: Some(format!("Failed to load container config: {error}")),
+            }];
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for (target_id, target) in &store.targets {
+        let operation = match target.driver {
+            ContainerDriver::Compose => ContainerOperation::Ps,
+            ContainerDriver::Systemd => ContainerOperation::IsActive,
+        };
+
+        let assembled = match assemble_command(target, operation, None, &[]) {
+            Ok(command) => command,
+            Err(error) => {
+                statuses.push(ContainerStatus {
+                    target: target_id.clone(),
+                    driver: target.driver,
+                    state: None,
+                    error: Some(error.to_string()),
+                });
+                continue;
+            }
+        };
+
+        let output = match util::command::new_command(&assembled.program)
+            .args(&assembled.args)
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                statuses.push(ContainerStatus {
+                    target: target_id.clone(),
+                    driver: target.driver,
+                    state: None,
+                    error: Some(format!("Failed to run `{}`: {error}", assembled.display())),
+                });
+                continue;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            let summary = stdout.trim().to_string();
+            statuses.push(ContainerStatus {
+                target: target_id.clone(),
+                driver: target.driver,
+                state: Some(if summary.is_empty() {
+                    "healthy".to_string()
+                } else {
+                    summary
+                }),
+                error: None,
+            });
+        } else {
+            let mut message = String::new();
+            if !stdout.trim().is_empty() {
+                message.push_str(stdout.trim());
+            }
+            if !stderr.trim().is_empty() {
+                if !message.is_empty() {
+                    message.push('\n');
+                }
+                message.push_str(stderr.trim());
+            }
+            statuses.push(ContainerStatus {
+                target: target_id.clone(),
+                driver: target.driver,
+                state: None,
+                error: Some(message),
+            });
+        }
+    }
+    statuses
 }
 
 #[cfg(test)]
