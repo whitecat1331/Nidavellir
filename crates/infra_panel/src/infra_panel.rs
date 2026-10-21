@@ -156,6 +156,7 @@ impl Render for InfraPanel {
             )
             .child(
                 v_flex()
+                    .id("infra-rows")
                     .flex_1()
                     .px_2()
                     .pb_2()
