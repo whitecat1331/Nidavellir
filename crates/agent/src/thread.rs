@@ -3782,6 +3782,7 @@ impl Thread {
                 &chunks,
                 cancellation_rx.clone(),
                 None,
+                None,
                 cx,
             )
             .await?;
@@ -3872,6 +3873,7 @@ impl Thread {
                 &chunks,
                 cancellation_rx.clone(),
                 Some(&progress),
+                None,
                 cx,
             )
             .await
@@ -4632,8 +4634,13 @@ impl Thread {
     /// Computes a full-handoff summary of the entire history using map-reduce
     /// compaction (chunk → condense → merge), so it works even when the history
     /// exceeds the model's context window. Unlike [`Thread::summary`], this
-    /// never caches and never mutates the thread.
-    pub fn map_reduce_summary(&mut self, cx: &mut Context<Self>) -> Task<Option<SharedString>> {
+    /// never caches and never mutates the thread. `goal`, when set, steers the
+    /// handoff toward the caller's stated continuation goal.
+    pub fn map_reduce_summary(
+        &mut self,
+        goal: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<SharedString>> {
         let Some(model) = self.compaction_model(cx).or_else(|| self.model().cloned()) else {
             log::error!("No model available for map-reduce summary");
             return Task::ready(None);
@@ -4661,6 +4668,7 @@ impl Thread {
                 &chunks,
                 cancellation_rx,
                 None,
+                goal.as_deref(),
                 cx,
             )
             .await
@@ -6087,11 +6095,24 @@ fn build_fork_continuation_prompt(title: &str, summary: &str, tail: &str) -> Str
     prompt
 }
 
+/// Appends a goal-steering suffix to a map-reduce summarization instruction
+/// when a continuation goal was supplied, so the handoff is biased toward what
+/// the next agent needs to achieve that goal.
+fn summarization_instruction(base: &str, goal: Option<&str>) -> String {
+    match goal.filter(|goal| !goal.trim().is_empty()) {
+        Some(goal) => format!(
+            "{base}\n\nThe continuation goal is: {goal}. Bias the summary toward what the next agent needs to achieve that goal."
+        ),
+        None => base.to_string(),
+    }
+}
+
 fn build_chunk_condense_request(
     thread_id: &str,
     prompt_id: &str,
     temperature: Option<f32>,
     chunk: &[Arc<Message>],
+    goal: Option<&str>,
     model: &LanguageModel,
 ) -> LanguageModelRequest {
     let mut request = LanguageModelRequest {
@@ -6112,7 +6133,7 @@ fn build_chunk_condense_request(
     }
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
-        content: vec![MAP_REDUCE_CHUNK_PROMPT.into()],
+        content: vec![summarization_instruction(MAP_REDUCE_CHUNK_PROMPT, goal).into()],
         cache: false,
         reasoning_details: None,
     });
@@ -6128,6 +6149,7 @@ fn build_merge_request(
     prompt_id: &str,
     temperature: Option<f32>,
     group: &[String],
+    goal: Option<&str>,
     model: &LanguageModel,
 ) -> LanguageModelRequest {
     let mut request = LanguageModelRequest {
@@ -6153,7 +6175,7 @@ fn build_merge_request(
     }
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
-        content: vec![MAP_REDUCE_MERGE_PROMPT.into()],
+        content: vec![summarization_instruction(MAP_REDUCE_MERGE_PROMPT, goal).into()],
         cache: false,
         reasoning_details: None,
     });
@@ -6218,6 +6240,7 @@ async fn merge_summaries(
     mut summaries: Vec<String>,
     mut cancellation_rx: watch::Receiver<bool>,
     progress: Option<&dyn Fn(String)>,
+    goal: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Result<String> {
     let provider =
@@ -6246,7 +6269,8 @@ async fn merge_summaries(
         let merge_futures: Vec<_> = groups
             .iter()
             .map(|group| {
-                let request = build_merge_request(thread_id, prompt_id, temperature, group, model);
+                let request =
+                    build_merge_request(thread_id, prompt_id, temperature, group, goal, model);
                 provider.stream_completion(model, request, cx)
             })
             .collect();
@@ -6287,6 +6311,7 @@ async fn map_reduce_summaries(
     chunks: &[Vec<Arc<Message>>],
     cancellation_rx: watch::Receiver<bool>,
     progress: Option<&dyn Fn(String)>,
+    goal: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Result<String> {
     // Race the pass against a hard timeout: a provider stream that stalls must
@@ -6302,6 +6327,7 @@ async fn map_reduce_summaries(
         chunks,
         cancellation_rx,
         progress,
+        goal,
         cx,
     );
     futures::pin_mut!(work);
@@ -6323,6 +6349,7 @@ async fn map_reduce_summaries_inner(
     chunks: &[Vec<Arc<Message>>],
     mut cancellation_rx: watch::Receiver<bool>,
     progress: Option<&dyn Fn(String)>,
+    goal: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Result<String> {
     log::info!(
@@ -6345,7 +6372,7 @@ async fn map_reduce_summaries_inner(
         .iter()
         .map(|chunk| {
             let request =
-                build_chunk_condense_request(thread_id, prompt_id, temperature, chunk, model);
+                build_chunk_condense_request(thread_id, prompt_id, temperature, chunk, goal, model);
             provider.stream_completion(model, request, cx)
         })
         .collect();
@@ -6387,6 +6414,7 @@ async fn map_reduce_summaries_inner(
         summaries,
         cancellation_rx,
         progress,
+        goal,
         cx,
     )
     .await
@@ -8956,6 +8984,21 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
+    }
+
+    #[test]
+    fn summarization_instruction_appends_goal_when_present() {
+        assert_eq!(
+            summarization_instruction("base instruction", None),
+            "base instruction"
+        );
+        assert_eq!(
+            summarization_instruction("base instruction", Some("  ")),
+            "base instruction"
+        );
+        let steered = summarization_instruction("base instruction", Some("implement the plan"));
+        assert!(steered.starts_with("base instruction"));
+        assert!(steered.contains("implement the plan"));
     }
 
     #[gpui::test]
