@@ -3670,9 +3670,9 @@ impl AgentPanel {
                 .ok_or_else(|| anyhow!("native agent connection missing"))?;
             let summary = cx
                 .update(|_window, cx| {
-                    native_connection
-                        .thread(&session_id, cx)
-                        .map(|thread| thread.update(cx, |thread, cx| thread.map_reduce_summary(cx)))
+                    native_connection.thread(&session_id, cx).map(|thread| {
+                        thread.update(cx, |thread, cx| thread.map_reduce_summary(None, cx))
+                    })
                 })?
                 .context("source thread not loaded")?
                 .await
@@ -5252,7 +5252,7 @@ impl AgentPanel {
             cx.weak_entity(),
             window.window_handle(),
         )) as Rc<dyn agent::DebuggerHost>;
-        // Installed unconditionally: `/truncate` fork-and-continue needs the
+        // Installed unconditionally: `/continue` fork-and-continue needs the
         // host regardless of the `create-thread-tool` feature flag. Exposing the
         // `create_thread`/`list_agents_and_models` tools to the model is gated
         // separately, at tool-exposure time.
@@ -10971,7 +10971,7 @@ mod tests {
         )]);
 
         // 1. A real thread is active — the fork's parent, mirroring the
-        //    live `/truncate` flow.
+        //    live `/continue` flow.
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
@@ -10982,7 +10982,7 @@ mod tests {
         cx.run_until_parked();
 
         // 2. Fork a continuation thread exactly like `AgentPanelSiblingHost`
-        //    does for `/truncate`: seeded content, not auto-submitted, focused.
+        //    does for `/continue`: seeded content, not auto-submitted, focused.
         let seed_text = "Continued from thread \"Parent\":\n\ncompressed summary";
         let seed_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
             seed_text.to_string(),
