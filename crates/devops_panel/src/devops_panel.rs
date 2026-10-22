@@ -3,38 +3,38 @@ use std::time::Duration;
 use agent::containers::ContainerDriver;
 use agent::{ContainerStatus, VmStatus};
 use gpui::{
-    actions, px, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Task,
-    WeakEntity, Window,
+    App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Task, WeakEntity,
+    Window, actions, px,
 };
 use ui::{Button, IconName, Label, LabelSize, StatefulInteractiveElement, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-actions!(infra, [ToggleInfraPanel]);
+actions!(devops, [ToggleDevOpsPanel]);
 
-const INFRA_PANEL_KEY: &str = "InfraPanel";
+const DEVOPS_PANEL_KEY: &str = "DevOpsPanel";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A read-only, bottom-dock panel showing the health of every VM and container
 /// registered in the seeded `vms.json` / `containers.json`. It holds no infra of
 /// its own — the targets and the health logic both come from the `agent` crate,
 /// which reads the seeded registries.
-pub struct InfraPanel {
+pub struct DevOpsPanel {
     focus_handle: FocusHandle,
     vm_statuses: Vec<VmStatus>,
     container_statuses: Vec<ContainerStatus>,
     _refresh_task: Task<()>,
 }
 
-impl Focusable for InfraPanel {
+impl Focusable for DevOpsPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl EventEmitter<PanelEvent> for InfraPanel {}
+impl EventEmitter<PanelEvent> for DevOpsPanel {}
 
-impl InfraPanel {
+impl DevOpsPanel {
     pub fn new(
         _workspace: &Workspace,
         _window: &mut Window,
@@ -58,7 +58,7 @@ impl InfraPanel {
     ) -> Task<anyhow::Result<Entity<Self>>> {
         cx.spawn(async move |cx| {
             workspace.update_in(cx, |workspace, window, cx| {
-                InfraPanel::new(workspace, window, cx)
+                DevOpsPanel::new(workspace, window, cx)
             })
         })
     }
@@ -105,14 +105,11 @@ impl InfraPanel {
 }
 
 fn section_header(title: &str) -> Div {
-    h_flex()
-        .pt_2()
-        .pb_1()
-        .child(
-            Label::new(title.to_string())
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
+    h_flex().pt_2().pb_1().child(
+        Label::new(title.to_string())
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+    )
 }
 
 fn render_vm_row(status: &VmStatus) -> Div {
@@ -155,7 +152,7 @@ fn driver_label(driver: ContainerDriver) -> &'static str {
     }
 }
 
-impl Render for InfraPanel {
+impl Render for DevOpsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
@@ -164,18 +161,18 @@ impl Render for InfraPanel {
                     .justify_between()
                     .px_2()
                     .py_1()
-                    .child(Label::new("Infrastructure"))
+                    .child(Label::new("DevOps"))
                     .child(
-                        Button::new("infra-refresh", "Refresh").on_click(
-                            cx.listener(|this, _event, _window, cx| {
+                        Button::new("devops-refresh", "Refresh").on_click(cx.listener(
+                            |this, _event, _window, cx| {
                                 this.schedule_refresh(cx);
-                            }),
-                        ),
+                            },
+                        )),
                     ),
             )
             .child(
                 v_flex()
-                    .id("infra-rows")
+                    .id("devops-rows")
                     .flex_1()
                     .px_2()
                     .pb_2()
@@ -185,13 +182,13 @@ impl Render for InfraPanel {
     }
 }
 
-impl Panel for InfraPanel {
+impl Panel for DevOpsPanel {
     fn persistent_name() -> &'static str {
-        "InfraPanel"
+        "DevOpsPanel"
     }
 
     fn panel_key() -> &'static str {
-        INFRA_PANEL_KEY
+        DEVOPS_PANEL_KEY
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
@@ -213,11 +210,11 @@ impl Panel for InfraPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Infrastructure")
+        Some("DevOps")
     }
 
     fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleInfraPanel)
+        Box::new(ToggleDevOpsPanel)
     }
 
     fn activation_priority(&self) -> u32 {
@@ -229,8 +226,8 @@ impl Panel for InfraPanel {
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(
-            |workspace: &mut Workspace, _: &ToggleInfraPanel, window, cx| {
-                workspace.toggle_panel_focus::<InfraPanel>(window, cx);
+            |workspace: &mut Workspace, _: &ToggleDevOpsPanel, window, cx| {
+                workspace.toggle_panel_focus::<DevOpsPanel>(window, cx);
             },
         );
     })

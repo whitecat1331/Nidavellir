@@ -26,7 +26,7 @@ use client::zed_urls;
 use collections::VecDeque;
 use debugger_ui::debugger_panel::DebugPanel;
 use debugger_ui::network_panel::NetworkPanel;
-use infra_panel::InfraPanel;
+use devops_panel::DevOpsPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
@@ -785,7 +785,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let network_panel = NetworkPanel::load(workspace_handle.clone(), cx);
-        let infra_panel = InfraPanel::load(workspace_handle.clone(), cx);
+        let devops_panel = DevOpsPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -810,7 +810,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(network_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(infra_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(devops_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
