@@ -595,6 +595,7 @@ fn main() {
         project::Project::init(&client, cx);
         debugger_ui::init(cx);
         debugger_tools::init(cx);
+        infra_panel::init(cx);
         client::init(&client, cx);
         feature_flags::FeatureFlagStore::init(cx);
 
