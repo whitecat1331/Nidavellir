@@ -48,6 +48,14 @@ pub struct GraphToolInput {
     /// Proof the node is done — commit sha, gate exit code, or report path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
+    /// For `advance`: whether the change touches protected surface (derived by
+    /// the D17 predicate; passed by the caller, never stored in progress.json).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected: Option<bool>,
+    /// For `advance`: whether the gate being advanced failed. A protected change
+    /// with a failed verification gate blocks the merge transition (D17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,6 +112,8 @@ struct DoneEntry {
     node: String,
     artifact: String,
     at: String,
+    #[serde(default)]
+    failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +154,13 @@ fn transitive_prereqs(node: &str, out: &mut Vec<&'static str>) {
 }
 
 /// The edge guard: a transition is refused unless every transitive prerequisite is done.
-fn advance(state: &mut GraphState, node: &str, artifact: &str) -> Result<(), String> {
+fn advance(
+    state: &mut GraphState,
+    node: &str,
+    artifact: &str,
+    protected: bool,
+    failed: bool,
+) -> Result<(), String> {
     if !ROUTE.contains(&node) {
         return Err(format!("unknown node: {node}"));
     }
@@ -168,10 +184,22 @@ fn advance(state: &mut GraphState, node: &str, artifact: &str) -> Result<(), Str
         ));
     }
 
+    // D17 conditional blocking: a protected change whose verification failed
+    // must not merge. Unprotected changes stay advisory.
+    if node == "merge" && protected {
+        let failed_gate = state.done.iter().any(|entry| {
+            matches!(entry.node.as_str(), "verify" | "compile" | "accept") && entry.failed
+        });
+        if failed_gate {
+            return Err("protected change: a verification gate failed — merge blocked".to_string());
+        }
+    }
+
     state.done.push(DoneEntry {
         node: node.to_string(),
         artifact: artifact.to_string(),
         at: chrono::Utc::now().to_rfc3339(),
+        failed,
     });
     state.current = Some(node.to_string());
     state.next = derive_next(state);
@@ -289,8 +317,14 @@ fn run_operation(input: GraphToolInput, path: PathBuf) -> Result<GraphToolOutput
             })?;
             let artifact = input.artifact.unwrap_or_default();
             let mut state = load_state(&path)?;
-            advance(&mut state, &node, &artifact)
-                .map_err(|error| GraphToolOutput::Error { error })?;
+            advance(
+                &mut state,
+                &node,
+                &artifact,
+                input.protected.unwrap_or(false),
+                input.failed.unwrap_or(false),
+            )
+            .map_err(|error| GraphToolOutput::Error { error })?;
             save_state(&path, &state)?;
             Ok(GraphToolOutput::Success {
                 message: format!("Advanced to {node}: {}", state_json(&state)),
@@ -318,7 +352,7 @@ mod tests {
     fn happy_path_walks_the_route() {
         let mut state = fresh();
         for node in ROUTE {
-            advance(&mut state, node, "artifact").unwrap();
+            advance(&mut state, node, "artifact", false, false).unwrap();
         }
         assert_eq!(state.current.as_deref(), Some("complete"));
         assert!(state.next.is_empty());
@@ -328,12 +362,57 @@ mod tests {
     fn edge_guard_refuses_skip_to_merge() {
         let mut state = fresh();
         for node in ["plan", "promote", "claim", "fork", "implement"] {
-            advance(&mut state, node, "").unwrap();
+            advance(&mut state, node, "", false, false).unwrap();
         }
-        let error = advance(&mut state, "merge", "").unwrap_err();
+        let error = advance(&mut state, "merge", "", false, false).unwrap_err();
         assert!(error.contains("verify"), "error was: {error}");
         assert!(error.contains("compile"), "error was: {error}");
         assert!(error.contains("accept"), "error was: {error}");
+    }
+
+    #[test]
+    fn protected_change_blocks_merge_on_failed_verify() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement"] {
+            advance(&mut state, node, "", false, false).unwrap();
+        }
+        advance(&mut state, "verify", "", false, true).unwrap();
+        advance(&mut state, "compile", "", false, false).unwrap();
+        advance(&mut state, "accept", "", false, false).unwrap();
+        let error = advance(&mut state, "merge", "", true, false).unwrap_err();
+        assert!(error.contains("protected"), "error was: {error}");
+    }
+
+    #[test]
+    fn protected_change_allows_merge_when_verification_passed() {
+        let mut state = fresh();
+        for node in [
+            "plan",
+            "promote",
+            "claim",
+            "fork",
+            "implement",
+            "verify",
+            "compile",
+            "accept",
+        ] {
+            advance(&mut state, node, "", false, false).unwrap();
+        }
+        advance(&mut state, "merge", "", true, false).unwrap();
+        assert_eq!(state.current.as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn unprotected_change_allows_merge_even_if_verification_failed() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement"] {
+            advance(&mut state, node, "", false, false).unwrap();
+        }
+        advance(&mut state, "verify", "", false, true).unwrap();
+        advance(&mut state, "compile", "", false, false).unwrap();
+        advance(&mut state, "accept", "", false, false).unwrap();
+        advance(&mut state, "merge", "", false, false).unwrap();
+        assert_eq!(state.current.as_deref(), Some("merge"));
     }
 
     #[test]
@@ -343,6 +422,7 @@ mod tests {
             node: "plan".to_string(),
             artifact: String::new(),
             at: String::new(),
+            failed: false,
         }];
         assert_eq!(derive_next(&state), vec!["promote".to_string()]);
     }
@@ -359,6 +439,8 @@ mod tests {
                 repo: Some("zed".to_string()),
                 node: None,
                 artifact: None,
+                protected: None,
+                failed: None,
             },
             path.clone(),
         )
