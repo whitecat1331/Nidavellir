@@ -1673,6 +1673,11 @@ impl NativeAgent {
             CONTINUE_COMMAND_NAME,
             "Continue this conversation in a new thread with a compressed summary",
         )
+        .input(acp_v1::AvailableCommandInput::Unstructured(
+            acp_v1::UnstructuredCommandInput::new(
+                "Optional goal to steer the continuation (leave blank to just fork)",
+            ),
+        ))
         .meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Native,
         ));
@@ -4656,6 +4661,10 @@ mod internal_tests {
             assert_eq!(
                 acp_thread::command_category_from_meta(&continue_command.meta),
                 Some(acp_thread::CommandCategory::Native),
+            );
+            assert!(
+                continue_command.input.is_some(),
+                "continue takes an optional goal, so it must require an argument"
             );
         });
     }
