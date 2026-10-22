@@ -1869,6 +1869,21 @@ impl ThreadView {
                 });
             })?;
 
+            // `/continue` consumes its trailing text as a goal argument that
+            // steers the fork, so forward the full text as the command instead
+            // of queueing the remainder as a follow-up message.
+            if native_command_consumes_argument(&command_name) {
+                this.update_in(cx, |this, window, cx| {
+                    this.send_content(
+                        Task::ready(Ok(Some((content, tracked_buffers)))),
+                        true,
+                        window,
+                        cx,
+                    );
+                })?;
+                return anyhow::Ok(());
+            }
+
             // Strip the leading `/command` from the first text block; whatever
             // remains (including any later mention blocks) becomes the queued
             // follow-up message.
@@ -13778,6 +13793,13 @@ fn leading_native_command(
     is_native.then(|| name.to_string())
 }
 
+/// Whether a native command consumes its trailing text as an argument rather
+/// than queueing it as a follow-up message. `/continue` is the only such
+/// command: its trailing text is the goal that steers the fork.
+fn native_command_consumes_argument(command_name: &str) -> bool {
+    command_name == agent::CONTINUE_COMMAND_NAME
+}
+
 /// Removes a leading `/command_name` token from `text`, returning the trimmed
 /// remainder. Falls back to the trimmed input if the prefix isn't present.
 fn strip_leading_command(text: &str, command_name: &str) -> String {
@@ -13912,6 +13934,12 @@ mod tests {
         );
         // No matching prefix: returns the trimmed input unchanged.
         assert_eq!(strip_leading_command("hello", "compact"), "hello");
+    }
+
+    #[test]
+    fn test_native_command_consumes_argument() {
+        assert!(native_command_consumes_argument("continue"));
+        assert!(!native_command_consumes_argument("compact"));
     }
 
     #[gpui::test]
