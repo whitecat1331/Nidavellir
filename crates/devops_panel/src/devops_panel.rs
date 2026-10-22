@@ -3,10 +3,12 @@ use std::time::Duration;
 use agent::containers::ContainerDriver;
 use agent::{ContainerStatus, VmStatus};
 use gpui::{
-    App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Task, WeakEntity,
-    Window, actions, px,
+    App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment, ListState,
+    Render, Task, WeakEntity, Window, actions, list, px,
 };
-use ui::{Button, IconName, Label, LabelSize, StatefulInteractiveElement, prelude::*};
+use ui::{
+    Button, IconName, Label, LabelSize, StatefulInteractiveElement, WithScrollbar, prelude::*,
+};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -14,13 +16,15 @@ actions!(devops, [ToggleDevOpsPanel]);
 
 const DEVOPS_PANEL_KEY: &str = "DevOpsPanel";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const SECTION_HEADER_COUNT: usize = 2;
 
-/// A read-only, bottom-dock panel showing the health of every VM and container
-/// registered in the seeded `vms.json` / `containers.json`. It holds no infra of
-/// its own — the targets and the health logic both come from the `agent` crate,
-/// which reads the seeded registries.
+/// A bottom-dock panel showing the health of every VM and container registered
+/// in the seeded vms.json / containers.json. It holds no infra of its own; the
+/// targets and the health logic both come from the agent crate, which reads the
+/// seeded registries.
 pub struct DevOpsPanel {
     focus_handle: FocusHandle,
+    list_state: ListState,
     vm_statuses: Vec<VmStatus>,
     container_statuses: Vec<ContainerStatus>,
     _refresh_task: Task<()>,
@@ -43,6 +47,7 @@ impl DevOpsPanel {
         cx.new(|cx| {
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
+                list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 vm_statuses: Vec::new(),
                 container_statuses: Vec::new(),
                 _refresh_task: Task::ready(()),
@@ -62,7 +67,6 @@ impl DevOpsPanel {
             })
         })
     }
-
     fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
         let http_client = cx.http_client();
         self._refresh_task = cx.spawn(async move |this, cx| {
@@ -71,6 +75,9 @@ impl DevOpsPanel {
                 let container_statuses = agent::container_statuses().await;
                 if this
                     .update(cx, |panel, cx| {
+                        panel.list_state.reset(
+                            vm_statuses.len() + container_statuses.len() + SECTION_HEADER_COUNT,
+                        );
                         panel.vm_statuses = vm_statuses;
                         panel.container_statuses = container_statuses;
                         cx.notify();
@@ -84,28 +91,27 @@ impl DevOpsPanel {
         });
     }
 
-    fn render_rows(&self) -> Vec<Div> {
-        let mut rows = Vec::new();
-        rows.push(section_header(&format!(
-            "Virtual machines ({})",
-            self.vm_statuses.len()
-        )));
-        for status in &self.vm_statuses {
-            rows.push(render_vm_row(status));
+    fn render_row(&self, ix: usize) -> AnyElement {
+        let vm_count = self.vm_statuses.len();
+        if ix == 0 {
+            return section_header(&format!("Virtual machines ({vm_count})")).into_any_element();
         }
-        rows.push(section_header(&format!(
-            "Containers ({})",
-            self.container_statuses.len()
-        )));
-        for status in &self.container_statuses {
-            rows.push(render_container_row(status));
+        if let Some(status) = self.vm_statuses.get(ix - 1) {
+            return render_vm_row(status).into_any_element();
         }
-        rows
+        if ix == vm_count + 1 {
+            return section_header(&format!("Containers ({})", self.container_statuses.len()))
+                .into_any_element();
+        }
+        if let Some(status) = self.container_statuses.get(ix - vm_count - 2) {
+            return render_container_row(status).into_any_element();
+        }
+        div().h_full().into_any_element()
     }
 }
 
 fn section_header(title: &str) -> Div {
-    h_flex().pt_2().pb_1().child(
+    h_flex().h_full().px_2().items_center().child(
         Label::new(title.to_string())
             .size(LabelSize::Small)
             .color(Color::Muted),
@@ -127,6 +133,8 @@ fn render_vm_row(status: &VmStatus) -> Div {
         status.name.clone()
     };
     h_flex()
+        .h_full()
+        .px_2()
         .justify_between()
         .child(Label::new(name))
         .child(Label::new(state_text).color(color))
@@ -140,6 +148,8 @@ fn render_container_row(status: &ContainerStatus) -> Div {
     };
     let name = format!("{} · {}", status.target, driver_label(status.driver));
     h_flex()
+        .h_full()
+        .px_2()
         .justify_between()
         .child(Label::new(name))
         .child(Label::new(state_text).color(color))
@@ -151,9 +161,8 @@ fn driver_label(driver: ContainerDriver) -> &'static str {
         ContainerDriver::Systemd => "systemd",
     }
 }
-
 impl Render for DevOpsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .child(
@@ -171,13 +180,18 @@ impl Render for DevOpsPanel {
                     ),
             )
             .child(
-                v_flex()
+                div()
                     .id("devops-rows")
                     .flex_1()
-                    .px_2()
-                    .pb_2()
-                    .overflow_y_scroll()
-                    .children(self.render_rows()),
+                    .min_h_0()
+                    .child(
+                        list(
+                            self.list_state.clone(),
+                            cx.processor(|this, ix, _window, _cx| this.render_row(ix)),
+                        )
+                        .size_full(),
+                    )
+                    .vertical_scrollbar_for(&self.list_state, window, cx),
             )
     }
 }
