@@ -4385,6 +4385,27 @@ enum BackgroundScannerPhase {
     Events,
 }
 
+/// Windows reports the location of a deleted-but-still-open directory through
+/// `GetFinalPathNameByHandleW` as the NTFS `$Extend\$Deleted\<file-id>`
+/// namespace. That path can never be opened, so it must not be mistaken for a
+/// renamed worktree root: doing so rewrites the workspace and every thread
+/// path list that recorded the root.
+///
+/// Only the volume-root namespace matches: an ordinary folder that happens to
+/// be named `$Extend\$Deleted` is a legitimate rename target.
+fn is_deleted_directory_placeholder(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path.as_ref());
+    let mut chars = path.chars();
+    let has_drive_prefix = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.next() == Some(':')
+        && chars.next() == Some('\\');
+    has_drive_prefix
+        && path
+            .get(3..)
+            .is_some_and(|rest| rest.to_ascii_lowercase().starts_with(r"$extend\$deleted"))
+}
+
 impl BackgroundScanner {
     async fn run(&mut self, mut fs_events_rx: Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>) {
         let root_abs_path;
@@ -4816,6 +4837,33 @@ impl BackgroundScanner {
             })
             .map(|path| SanitizedPath::new_arc(&path))
             .filter(|new_path| new_path != root_path);
+
+        // A deleted directory keeps its handle alive, and Windows then reports
+        // its location as the NTFS `$Extend\$Deleted\<file-id>` namespace,
+        // which cannot be opened. Treating that placeholder as a rename moves
+        // the root (and every path recorded from it) onto a nonexistent path.
+        let new_path = match new_path {
+            Some(new_path)
+                if !is_deleted_directory_placeholder(new_path.as_path())
+                    && self
+                        .fs
+                        .metadata(new_path.as_path())
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some() =>
+            {
+                Some(new_path)
+            }
+            Some(new_path) => {
+                log::info!(
+                    "ignoring worktree root rename target {:?}: it no longer exists",
+                    new_path.as_path(),
+                );
+                None
+            }
+            None => None,
+        };
 
         if let Some(new_path) = new_path {
             log::info!(
@@ -7464,6 +7512,31 @@ pub fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteCont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deleted_directory_placeholder_detection() {
+        assert!(is_deleted_directory_placeholder(Path::new(
+            r"C:\$Extend\$Deleted\001000000014CF5C6B721262"
+        )));
+        assert!(is_deleted_directory_placeholder(Path::new(
+            r"\\?\C:\$Extend\$Deleted\001000000014CF5C6B721262"
+        )));
+        assert!(is_deleted_directory_placeholder(Path::new(
+            r"C:\$EXTEND\$DELETED\001000000014CF5C6B721262"
+        )));
+        assert!(!is_deleted_directory_placeholder(Path::new(
+            r"C:\Users\ployd\Desktop\zed-wip-ghost-worktree-root"
+        )));
+        // Only the volume-root namespace is reserved; an ordinary folder
+        // with the same names is a legitimate rename target.
+        assert!(!is_deleted_directory_placeholder(Path::new(
+            r"C:\Users\ployd\Documents\$Extend\$Deleted\notes"
+        )));
+        // Unix paths have no drive prefix and can never be the namespace.
+        assert!(!is_deleted_directory_placeholder(Path::new(
+            "/tmp/$Extend/$Deleted"
+        )));
+    }
 
     /// Streams `bytes` the way `decode_file_text_to_rope` would, returning the
     /// decoded text and detected line ending, or `None` if the fast path bailed.
