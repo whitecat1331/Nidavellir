@@ -1,5 +1,5 @@
 pub mod automations;
-mod containers;
+pub mod containers;
 mod db;
 mod legacy_thread;
 mod memory;
@@ -15,7 +15,7 @@ mod thread;
 mod thread_store;
 mod tool_permissions;
 mod tools;
-mod vms;
+pub mod vms;
 mod window_control;
 
 use context_server::ContextServerId;

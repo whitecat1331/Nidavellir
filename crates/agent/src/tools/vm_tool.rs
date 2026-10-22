@@ -132,6 +132,155 @@ impl AgentTool for VmTool {
     }
 }
 
+/// One VM's read-only health, for non-agent consumers such as the infra
+/// dashboard panel. Holds no infra of its own — the targets come from the
+/// seeded `vms.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmStatus {
+    /// `vms.json` target id (the Proxmox node).
+    pub node: String,
+    /// VMID as registered in `vms.json`.
+    pub vmid: String,
+    /// Human-readable VM name.
+    pub name: String,
+    /// Whether this VM is infra-critical.
+    pub danger: bool,
+    /// Proxmox `status` field (`running`, `stopped`, …) when reachable.
+    pub state: Option<String>,
+    /// The failure reason when the status could not be read.
+    pub error: Option<String>,
+}
+
+fn tool_error(error: VmToolOutput) -> String {
+    match error {
+        VmToolOutput::Error { error } => error,
+        VmToolOutput::Success { message } => message,
+    }
+}
+
+/// Queries `status/current` for every VM registered in `vms.json`, best-effort:
+/// each VM is queried independently and an unreachable node/VM yields a row
+/// with `state: None` + `error` rather than aborting the sweep.
+pub async fn vm_statuses(
+    cx: &AsyncApp,
+    shared_http_client: Arc<dyn HttpClient>,
+) -> Vec<VmStatus> {
+    let store = match VmStore::load(VmStore::default_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return vec![VmStatus {
+                node: String::new(),
+                vmid: String::new(),
+                name: String::new(),
+                danger: false,
+                state: None,
+                error: Some(format!("Failed to load vm config: {error}")),
+            }];
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for (node, target) in &store.targets {
+        let api = match target.api.as_ref() {
+            Some(api) => api,
+            None => {
+                for (vmid, info) in &target.vms {
+                    statuses.push(VmStatus {
+                        node: node.clone(),
+                        vmid: vmid.clone(),
+                        name: info.name.clone(),
+                        danger: info.danger,
+                        state: None,
+                        error: Some(format!("target \"{node}\" has no `api` transport configured")),
+                    });
+                }
+                continue;
+            }
+        };
+
+        let http_client = match resolve_http_client(target, shared_http_client.clone()) {
+            Ok(client) => client,
+            Err(error) => {
+                let message = tool_error(error);
+                for (vmid, info) in &target.vms {
+                    statuses.push(VmStatus {
+                        node: node.clone(),
+                        vmid: vmid.clone(),
+                        name: info.name.clone(),
+                        danger: info.danger,
+                        state: None,
+                        error: Some(message.clone()),
+                    });
+                }
+                continue;
+            }
+        };
+
+        for (vmid, info) in &target.vms {
+            let mut status = VmStatus {
+                node: node.clone(),
+                vmid: vmid.clone(),
+                name: info.name.clone(),
+                danger: info.danger,
+                state: None,
+                error: None,
+            };
+
+            let vmid_number = match vmid.parse::<u32>() {
+                Ok(number) => number,
+                Err(error) => {
+                    status.error = Some(format!("invalid VMID: {error}"));
+                    statuses.push(status);
+                    continue;
+                }
+            };
+
+            let request = match assemble_api_request(
+                target,
+                VmOperation::Status,
+                Some(vmid_number),
+                None,
+                None,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    status.error = Some(error.to_string());
+                    statuses.push(status);
+                    continue;
+                }
+            };
+
+            let secret = match read_secret(cx, &api.token_secret_url).await {
+                Ok(secret) => secret,
+                Err(error) => {
+                    status.error = Some(tool_error(error));
+                    statuses.push(status);
+                    continue;
+                }
+            };
+
+            let value =
+                match call_api(&http_client, &request, &api.token_id, &secret, &api.base_url).await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        status.error = Some(tool_error(error));
+                        statuses.push(status);
+                        continue;
+                    }
+                };
+
+            status.state = value
+                .get("data")
+                .and_then(|data| data.get("status"))
+                .and_then(|state| state.as_str())
+                .map(str::to_string);
+            statuses.push(status);
+        }
+    }
+    statuses
+}
+
 /// Performs a VM operation against the configured targets on disk.
 async fn run_operation(
     input: VmToolInput,
