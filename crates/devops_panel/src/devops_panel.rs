@@ -791,7 +791,7 @@ fn driver_label(driver: ContainerDriver) -> &'static str {
 }
 
 fn format_interval(seconds: u64) -> String {
-    if seconds >= 60 && seconds % 60 == 0 {
+    if seconds.is_multiple_of(60) {
         format!("{}m", seconds / 60)
     } else {
         format!("{seconds}s")
