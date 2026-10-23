@@ -568,8 +568,18 @@ mod tests {
     fn synthesized_settings_json_is_valid() {
         let settings =
             synthesized_settings_json("{}", "deepseek", "deepseek-v4-pro", true, "\"high\"", "");
-        serde_json::from_str::<serde_json::Value>(&settings)
-            .expect("synthesized settings must be valid JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(&settings).expect("synthesized settings must be valid JSON");
+        assert_eq!(
+            value["agent"]["tool_permissions"]["tools"]["git"]["default"].as_str(),
+            Some("allow"),
+            "eval must auto-allow the git tool (default.json gives it a per-tool confirm)"
+        );
+        assert_eq!(
+            value["agent"]["sandbox_permissions"]["allow_unsandboxed"].as_bool(),
+            Some(true),
+            "eval must run the terminal unsandboxed (the sandboxed launcher rejects eval-cli)"
+        );
     }
 
     #[test]
@@ -625,7 +635,8 @@ fn synthesized_settings_json(
         r#"{{
                     "language_models": {language_models_settings},
                     "agent": {{
-                        "tool_permissions": {{"default": "allow"}},
+                        "tool_permissions": {{"default": "allow", "tools": {{"git": {{"default": "allow"}}}}}},
+                        "sandbox_permissions": {{"allow_unsandboxed": true, "allow_all_hosts": true}},
                         "default_model": {{
                             "provider": "{provider_id}",
                             "model": "{model_id}",
@@ -697,15 +708,14 @@ async fn run_agent(
             ));
         }
         let language_models_settings = format!("{{{}}}", language_models_fields.join(","));
-        // Disable specific tools (e.g. `fetch`/`search_web` on air-gapped
-        // benchmarks) the canonical way: via the agent profile. The model only
-        // sees a built-in tool when the active profile enables it (see
-        // Thread::enabled_tools), so we define a dedicated "eval" profile that
-        // mirrors the built-in "write" profile minus the disabled tools, and make
-        // it the default profile. A fresh profile key is NOT deep-merged against
-        // the defaults, so it can't inherit "write"'s tools — the full set is
-        // listed explicitly here. Keep WRITE_TOOLS in sync with the "write"
-        // profile in assets/settings/default.json.
+        // The eval agent always runs with a dedicated "eval" profile rather than
+        // the built-in "write" profile: "write" omits `terminal`, which the
+        // external-tool corpus needs, and a fresh profile key is NOT deep-merged
+        // against the defaults so it can't inherit "write"'s tools — the full set
+        // is listed explicitly here. `ZED_EVAL_DISABLE_TOOLS` strips tools from
+        // that set (e.g. `fetch`/`search_web` on air-gapped benchmarks). Keep
+        // WRITE_TOOLS in sync with the "write" profile in
+        // assets/settings/default.json.
         let profile_field = {
             let raw = std::env::var("ZED_EVAL_DISABLE_TOOLS").unwrap_or_default();
             let disabled = raw
@@ -713,44 +723,40 @@ async fn run_agent(
                 .map(|name| name.trim().to_string())
                 .filter(|name| !name.is_empty())
                 .collect::<std::collections::HashSet<String>>();
-            if disabled.is_empty() {
-                String::new()
-            } else {
-                const WRITE_TOOLS: &[&str] = &[
-                    "copy_path",
-                    "create_directory",
-                    "create_thread",
-                    "delete_path",
-                    "diagnostics",
-                    "apply_code_action",
-                    "edit_file",
-                    "write_file",
-                    "fetch",
-                    "find_path",
-                    "find_references",
-                    "get_code_actions",
-                    "go_to_definition",
-                    "list_agents_and_models",
-                    "list_directory",
-                    "move_path",
-                    "rename_symbol",
-                    "read_file",
-                    "grep",
-                    "skill",
-                    "spawn_agent",
-                    "terminal",
-                    "search_web",
-                ];
-                let tools = WRITE_TOOLS
-                    .iter()
-                    .filter(|tool| !disabled.contains(**tool))
-                    .map(|tool| format!(r#""{tool}": true"#))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    r#","default_profile": "eval", "profiles": {{"eval": {{"name": "Eval", "enable_all_context_servers": true, "tools": {{{tools}}}}}}}"#
-                )
-            }
+            const WRITE_TOOLS: &[&str] = &[
+                "copy_path",
+                "create_directory",
+                "create_thread",
+                "delete_path",
+                "diagnostics",
+                "apply_code_action",
+                "edit_file",
+                "write_file",
+                "fetch",
+                "find_path",
+                "find_references",
+                "get_code_actions",
+                "go_to_definition",
+                "list_agents_and_models",
+                "list_directory",
+                "move_path",
+                "rename_symbol",
+                "read_file",
+                "grep",
+                "skill",
+                "spawn_agent",
+                "terminal",
+                "search_web",
+            ];
+            let tools = WRITE_TOOLS
+                .iter()
+                .filter(|tool| !disabled.contains(**tool))
+                .map(|tool| format!(r#""{tool}": true"#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                r#","default_profile": "eval", "profiles": {{"eval": {{"name": "Eval", "enable_all_context_servers": true, "tools": {{{tools}}}}}}}"#
+            )
         };
         SettingsStore::update_global(cx, |store, cx| {
             let settings = synthesized_settings_json(
