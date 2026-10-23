@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::proxmox::{ProxmoxApiRequest, assemble_api_request, assemble_ssh_command};
-use crate::reachability::{HOST_PROBE_PORT, NODE_PROBE_PORT, Reachability, bare_host, probe_tcp};
 use crate::vms::{
     GatingTier, VmOperation, VmStore, VmTarget, VmTransport, gating_tier, resolve_vmid,
     validate_input,
@@ -350,8 +349,6 @@ pub struct VmNodeStatus {
     pub node: String,
     /// Whether this node is infra-critical.
     pub danger: bool,
-    /// TCP-connect reachability of the node's management endpoint.
-    pub ping: Reachability,
     /// Fraction of node CPU in use (0.0..=1.0) from `/nodes/{node}/status`.
     pub cpu: Option<f64>,
     /// Total node memory in bytes.
@@ -381,7 +378,6 @@ pub async fn vm_node_statuses(
             return vec![VmNodeStatus {
                 node: String::new(),
                 danger: false,
-                ping: Reachability::NotApplicable,
                 cpu: None,
                 memory_total: None,
                 memory_used: None,
@@ -398,7 +394,6 @@ pub async fn vm_node_statuses(
         let mut status = VmNodeStatus {
             node: node.clone(),
             danger: target.danger,
-            ping: Reachability::NotApplicable,
             cpu: None,
             memory_total: None,
             memory_used: None,
@@ -406,10 +401,6 @@ pub async fn vm_node_statuses(
             rootfs_used: None,
             uptime: None,
             error: None,
-        };
-        status.ping = match node_probe_endpoint(target) {
-            Some((host, port)) => probe_tcp(cx.background_executor(), &host, port).await,
-            None => Reachability::NotApplicable,
         };
 
         let Some(api) = target.api.as_ref() else {
@@ -491,25 +482,6 @@ pub async fn vm_node_statuses(
         statuses.push(status);
     }
     statuses
-}
-
-/// Derives the node's probeable management endpoint: the Proxmox API host/port
-/// when an `api` transport is configured, otherwise the SSH host on port 22.
-fn node_probe_endpoint(target: &VmTarget) -> Option<(String, u16)> {
-    if let Some(api) = target.api.as_ref() {
-        if let Ok(url) = url::Url::parse(&api.base_url) {
-            let host = url.host_str()?.to_string();
-            let port = url.port_or_known_default().unwrap_or(NODE_PROBE_PORT);
-            return Some((host, port));
-        }
-    }
-    if let Some(ssh) = target.ssh.as_ref() {
-        let host = bare_host(&ssh.host);
-        if !host.is_empty() {
-            return Some((host.to_string(), HOST_PROBE_PORT));
-        }
-    }
-    None
 }
 
 /// Performs a VM operation against the configured targets on disk.

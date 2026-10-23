@@ -79,6 +79,9 @@ pub struct VmInfo {
     /// Human-readable role(s), e.g. `["build"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// Override for the reachability probe port (default 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_port: Option<u16>,
 }
 
 /// One reachable ops target: a hypervisor node plus the VMs it hosts.
@@ -348,6 +351,7 @@ mod tests {
                             ip: None,
                             os: None,
                             roles: Vec::new(),
+                            probe_port: None,
                         },
                     )
                 })

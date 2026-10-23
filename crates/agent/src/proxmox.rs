@@ -197,6 +197,7 @@ mod tests {
                     ip: None,
                     os: None,
                     roles: Vec::new(),
+                    probe_port: None,
                 },
             )]
             .into_iter()

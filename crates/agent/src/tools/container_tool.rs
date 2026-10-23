@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use crate::containers::{ContainerDriver, ContainerOperation, ContainerStore, assemble_command};
-use crate::reachability::{HOST_PROBE_PORT, Reachability, bare_host, probe_tcp};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
-use gpui::{App, AppContext as _, AsyncApp, SharedString, Task};
+use gpui::{App, AppContext as _, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -200,8 +199,6 @@ pub struct ContainerStatus {
     /// The SSH endpoint the target is reached on (often a Tailscale DNS name),
     /// used to group targets under their host in the panel.
     pub host: String,
-    /// TCP-connect reachability of the host's SSH port.
-    pub ping: Reachability,
     /// LAN or Tailscale IP (enriched registry, D6).
     pub ip: Option<String>,
     /// Operating system (enriched registry, D6).
@@ -218,14 +215,13 @@ pub struct ContainerStatus {
 
 /// Queries each container target's read-only health (compose `ps` / systemd
 /// `is-active`) and returns one row per target, best-effort.
-pub async fn container_statuses(cx: &AsyncApp) -> Vec<ContainerStatus> {
+pub async fn container_statuses() -> Vec<ContainerStatus> {
     let store = match ContainerStore::load(ContainerStore::default_path()) {
         Ok(store) => store,
         Err(error) => {
             return vec![ContainerStatus {
                 target: String::new(),
                 host: String::new(),
-                ping: Reachability::NotApplicable,
                 ip: None,
                 os: None,
                 roles: Vec::new(),
@@ -238,13 +234,6 @@ pub async fn container_statuses(cx: &AsyncApp) -> Vec<ContainerStatus> {
 
     let mut statuses = Vec::new();
     for (target_id, target) in &store.targets {
-        let ping = probe_tcp(
-            cx.background_executor(),
-            bare_host(&target.host),
-            target.probe_port.unwrap_or(HOST_PROBE_PORT),
-        )
-        .await;
-
         let operation = match target.driver {
             ContainerDriver::Compose => ContainerOperation::Ps,
             ContainerDriver::Systemd => ContainerOperation::IsActive,
@@ -256,7 +245,6 @@ pub async fn container_statuses(cx: &AsyncApp) -> Vec<ContainerStatus> {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
                     host: target.host.clone(),
-                    ping,
                     ip: target.ip.clone(),
                     os: target.os.clone(),
                     roles: target.roles.clone(),
@@ -278,7 +266,6 @@ pub async fn container_statuses(cx: &AsyncApp) -> Vec<ContainerStatus> {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
                     host: target.host.clone(),
-                    ping,
                     ip: target.ip.clone(),
                     os: target.os.clone(),
                     roles: target.roles.clone(),
@@ -297,7 +284,6 @@ pub async fn container_statuses(cx: &AsyncApp) -> Vec<ContainerStatus> {
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
                 host: target.host.clone(),
-                ping,
                 ip: target.ip.clone(),
                 os: target.os.clone(),
                 roles: target.roles.clone(),
@@ -323,7 +309,6 @@ pub async fn container_statuses(cx: &AsyncApp) -> Vec<ContainerStatus> {
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
                 host: target.host.clone(),
-                ping,
                 ip: target.ip.clone(),
                 os: target.os.clone(),
                 roles: target.roles.clone(),

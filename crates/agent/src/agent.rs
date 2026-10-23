@@ -1,6 +1,7 @@
 pub mod automations;
 pub mod containers;
 mod db;
+mod devops;
 mod legacy_thread;
 mod memory;
 mod native_agent_server;
@@ -21,6 +22,7 @@ mod window_control;
 
 use context_server::ContextServerId;
 pub use db::*;
+pub use devops::*;
 use itertools::Itertools;
 pub use memory::*;
 pub use native_agent_server::NativeAgentServer;
