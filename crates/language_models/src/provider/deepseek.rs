@@ -648,6 +648,19 @@ impl DeepSeekEventMapper {
             Some("stop") => {
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
+            Some("length") => {
+                // The output-token limit was hit before the model could emit a
+                // full response. Reasoning models in particular can consume the
+                // whole budget on `reasoning_content`, leaving no text or tool
+                // call — surfacing it as MaxTokens makes the turn fail visibly
+                // instead of ending as a silent, truncated no-op (live
+                // 2026-10-23: a clamped 1,024-token budget produced two
+                // thinking-only turns that looked like the thread "stopped").
+                log::warn!("DeepSeek completion truncated by output token limit");
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
+            }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
                     match parse_tool_arguments(&tool_call.arguments) {
@@ -827,6 +840,73 @@ mod tests {
             Some(384_000),
         )?;
         assert_eq!(request.max_tokens, Some(deepseek::MIN_COMPLETION_BUDGET));
+        Ok(())
+    }
+
+    /// `finish_reason: "length"` means the output-token limit was hit before a
+    /// full response was produced. It must surface as `StopReason::MaxTokens`
+    /// (which the agent renders as a failure) rather than a normal `EndTurn` —
+    /// otherwise a reasoning model that burns its budget on thinking ends the
+    /// turn silently with no text or tool call.
+    #[test]
+    fn deepseek_length_finish_reason_surfaces_max_tokens() {
+        let mut mapper = DeepSeekEventMapper::new();
+        let events = mapper.map_event(deepseek::StreamResponse {
+            id: "id".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "deepseek-flash".into(),
+            choices: vec![deepseek::StreamChoice {
+                index: 0,
+                delta: deepseek::StreamDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("length".into()),
+            }],
+            usage: None,
+        });
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(LanguageModelCompletionEvent::Stop(StopReason::MaxTokens))
+        )));
+    }
+
+    /// Base64 image payloads must not be counted as text tokens. An image's
+    /// serialized form is large (the base64 body), but DeepSeek bills it per
+    /// image — charging it by the ÷4 byte heuristic inflates the estimate and
+    /// wrongly clamps the completion budget (live 2026-10-23: eight screenshots
+    /// added ~1.4M phantom tokens and floored `max_tokens` to 1,024).
+    #[test]
+    fn estimated_input_tokens_counts_images_at_a_fixed_allowance() -> Result<()> {
+        let request = into_deepseek(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![
+                        MessageContent::Text("small prompt".to_string()),
+                        MessageContent::Image(language_model::LanguageModelImage {
+                            source: "A".repeat(800_000).into(),
+                        }),
+                    ],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                ..Default::default()
+            },
+            &deepseek::Model::Flash,
+            Some(384_000),
+        )?;
+
+        let estimate = request.estimated_input_tokens();
+        assert!(
+            estimate < 10_000,
+            "image payload must not inflate the estimate: {estimate}"
+        );
+        assert_eq!(request.max_tokens, Some(384_000));
         Ok(())
     }
 }
