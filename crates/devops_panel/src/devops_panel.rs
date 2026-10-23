@@ -1,21 +1,27 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent::containers::{ContainerDriver, ContainerOperation};
 use agent::vms::VmOperation;
-use agent::{ContainerStatus, Reachability, VmNodeStatus, VmStatus};
+use agent::{ContainerStatus, DevOpsConfig, PingStatuses, Reachability, VmNodeStatus, VmStatus};
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
-    ListState, Render, Task, WeakEntity, Window, actions, list, px,
+    ListState, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
 };
-use ui::{Button, ButtonSize, IconName, Label, LabelSize, WithScrollbar, prelude::*};
+use ui::{
+    Button, ButtonSize, Checkbox, ContextMenu, DropdownMenu, IconName, Label, LabelSize,
+    WithScrollbar, prelude::*,
+};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 actions!(devops, [ToggleDevOpsPanel]);
 
 const DEVOPS_PANEL_KEY: &str = "DevOpsPanel";
-const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the scheduler wakes to check whether a signal is due.
+const SCHEDULER_TICK: Duration = Duration::from_millis(500);
+/// Interval presets offered by the three interval dropdowns, in seconds.
+const INTERVAL_PRESETS_SECS: &[u64] = &[1, 2, 5, 10, 15, 30, 60, 120, 300];
 
 /// A bottom-dock panel showing the health of every VM and container registered
 /// in the seeded vms.json / containers.json. It holds no infra of its own; the
@@ -26,7 +32,21 @@ pub struct DevOpsPanel {
     list_state: ListState,
     rows: Vec<Row>,
     last_error: Option<String>,
-    _refresh_task: Task<()>,
+    config: DevOpsConfig,
+    pings: PingStatuses,
+    node_reports: Vec<VmNodeStatus>,
+    vm_reports: Vec<VmStatus>,
+    container_reports: Vec<ContainerStatus>,
+    active: bool,
+    _task: Task<()>,
+}
+
+/// Which poll signal an interval control edits.
+#[derive(Debug, Clone, Copy)]
+enum IntervalKind {
+    Ping,
+    Proxmox,
+    Container,
 }
 
 /// One rendered row in the flat list backing the panel.
@@ -53,14 +73,24 @@ impl DevOpsPanel {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         cx.new(|cx| {
+            let config = DevOpsConfig::load(DevOpsConfig::default_path()).unwrap_or_else(|error| {
+                log::error!("failed to load devops config, using defaults: {error}");
+                DevOpsConfig::default()
+            });
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 rows: Vec::new(),
                 last_error: None,
-                _refresh_task: Task::ready(()),
+                config,
+                pings: PingStatuses::default(),
+                node_reports: Vec::new(),
+                vm_reports: Vec::new(),
+                container_reports: Vec::new(),
+                active: false,
+                _task: Task::ready(()),
             };
-            this.schedule_refresh(cx);
+            this.start_scheduler(cx);
             this
         })
     }
@@ -76,26 +106,223 @@ impl DevOpsPanel {
         })
     }
 
-    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+    /// Starts the single scheduler loop that runs the ping and report sweeps on
+    /// their own cadences. When the panel is not live (unchecked or closed) the
+    /// loop idles without making any network calls.
+    fn start_scheduler(&mut self, cx: &mut Context<Self>) {
         let http_client = cx.http_client();
-        self._refresh_task = cx.spawn(async move |this, cx| {
+        self._task = cx.spawn(async move |this, cx| {
+            let mut next_ping = Instant::now();
+            let mut next_proxmox = Instant::now();
+            let mut next_container = Instant::now();
             loop {
-                let vm_node_statuses = agent::vm_node_statuses(cx, http_client.clone()).await;
-                let vm_statuses = agent::vm_statuses(cx, http_client.clone()).await;
-                let container_statuses = agent::container_statuses(cx).await;
-                if this
-                    .update(cx, |panel, cx| {
-                        panel.rows = build_rows(vm_node_statuses, vm_statuses, container_statuses);
-                        panel.list_state.reset(panel.rows.len());
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
+                let (running, ping_interval, proxmox_interval, container_interval) = match this
+                    .read_with(cx, |panel, _cx| {
+                        (
+                            panel.live(),
+                            panel.ping_interval(),
+                            panel.proxmox_interval(),
+                            panel.container_interval(),
+                        )
+                    }) {
+                    Ok(intervals) => intervals,
+                    Err(_) => break,
+                };
+                let now = Instant::now();
+                if running {
+                    if now >= next_ping {
+                        let pings = agent::ping_statuses(cx).await;
+                        if this
+                            .update(cx, |panel, cx| {
+                                panel.pings = pings;
+                                panel.rebuild_rows(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        next_ping = Instant::now() + ping_interval;
+                    }
+                    if now >= next_proxmox {
+                        let nodes = agent::vm_node_statuses(cx, http_client.clone()).await;
+                        let vms = agent::vm_statuses(cx, http_client.clone()).await;
+                        if this
+                            .update(cx, |panel, cx| {
+                                panel.node_reports = nodes;
+                                panel.vm_reports = vms;
+                                panel.rebuild_rows(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        next_proxmox = Instant::now() + proxmox_interval;
+                    }
+                    if now >= next_container {
+                        let containers = agent::container_statuses().await;
+                        if this
+                            .update(cx, |panel, cx| {
+                                panel.container_reports = containers;
+                                panel.rebuild_rows(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        next_container = Instant::now() + container_interval;
+                    }
                 }
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
+                cx.background_executor().timer(SCHEDULER_TICK).await;
             }
         });
+    }
+
+    /// One-shot full refresh, used after a lifecycle action so the result shows
+    /// promptly regardless of the live/scheduled cadence.
+    fn refresh_now(&mut self, cx: &mut Context<Self>) {
+        let http_client = cx.http_client();
+        cx.spawn(async move |this, cx| {
+            let (pings, nodes, vms, containers) = futures::join!(
+                agent::ping_statuses(cx),
+                agent::vm_node_statuses(cx, http_client.clone()),
+                agent::vm_statuses(cx, http_client.clone()),
+                agent::container_statuses(),
+            );
+            this.update(cx, |panel, cx| {
+                panel.pings = pings;
+                panel.node_reports = nodes;
+                panel.vm_reports = vms;
+                panel.container_reports = containers;
+                panel.rebuild_rows(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
+        self.rows = build_rows(
+            &self.node_reports,
+            &self.vm_reports,
+            &self.container_reports,
+        );
+        self.list_state.reset(self.rows.len());
+        cx.notify();
+    }
+
+    /// Whether polling should run: the live checkbox is on and the dock is open.
+    fn live(&self) -> bool {
+        self.config.live && self.active
+    }
+
+    fn ping_interval(&self) -> Duration {
+        let secs = if self.config.live {
+            self.config.live_ping_interval_secs
+        } else {
+            self.config.ping_interval_secs
+        };
+        Duration::from_secs(secs.max(1))
+    }
+
+    fn proxmox_interval(&self) -> Duration {
+        let secs = if self.config.live {
+            self.config.live_proxmox_interval_secs
+        } else {
+            self.config.proxmox_interval_secs
+        };
+        Duration::from_secs(secs.max(1))
+    }
+
+    fn container_interval(&self) -> Duration {
+        let secs = if self.config.live {
+            self.config.live_container_interval_secs
+        } else {
+            self.config.container_interval_secs
+        };
+        Duration::from_secs(secs.max(1))
+    }
+
+    fn set_live(&mut self, live: bool, cx: &mut Context<Self>) {
+        self.config.live = live;
+        self.save_config();
+        cx.notify();
+    }
+
+    fn set_interval(&mut self, kind: IntervalKind, seconds: u64, cx: &mut Context<Self>) {
+        match kind {
+            IntervalKind::Ping => self.config.ping_interval_secs = seconds,
+            IntervalKind::Proxmox => self.config.proxmox_interval_secs = seconds,
+            IntervalKind::Container => self.config.container_interval_secs = seconds,
+        }
+        self.save_config();
+        cx.notify();
+    }
+
+    fn save_config(&self) {
+        if let Err(error) = self.config.save(DevOpsConfig::default_path()) {
+            log::error!("failed to save devops config: {error}");
+        }
+    }
+
+    fn live_checkbox(&self, cx: &mut Context<Self>) -> Checkbox {
+        let weak = cx.weak_entity();
+        Checkbox::new(
+            "devops-live",
+            if self.config.live {
+                ToggleState::Selected
+            } else {
+                ToggleState::Unselected
+            },
+        )
+        .label("Live")
+        .label_size(LabelSize::Small)
+        .on_click(move |state, _window, cx| {
+            let live = *state == ToggleState::Selected;
+            weak.update(cx, |this, cx| this.set_live(live, cx)).ok();
+        })
+    }
+
+    fn interval_menu(
+        &self,
+        kind: IntervalKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> DropdownMenu {
+        let (id, label, current_secs) = match kind {
+            IntervalKind::Ping => (
+                "devops-ping-interval",
+                "ping",
+                self.config.ping_interval_secs,
+            ),
+            IntervalKind::Proxmox => (
+                "devops-proxmox-interval",
+                "proxmox",
+                self.config.proxmox_interval_secs,
+            ),
+            IntervalKind::Container => (
+                "devops-container-interval",
+                "docker",
+                self.config.container_interval_secs,
+            ),
+        };
+        let weak = cx.weak_entity();
+        DropdownMenu::new(
+            id,
+            format!("{label} {}", format_interval(current_secs)),
+            ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                let mut menu = menu;
+                for seconds in INTERVAL_PRESETS_SECS {
+                    let weak = weak.clone();
+                    let seconds = *seconds;
+                    menu = menu.entry(format_interval(seconds), None, move |_window, cx| {
+                        weak.update(cx, |this, cx| this.set_interval(kind, seconds, cx))
+                            .ok();
+                    });
+                }
+                menu
+            }),
+        )
+        .trigger_size(ButtonSize::Compact)
     }
 
     fn run_vm_action(
@@ -121,7 +348,7 @@ impl DevOpsPanel {
             });
             this.update(cx, |panel, cx| {
                 panel.last_error = error;
-                panel.schedule_refresh(cx);
+                panel.refresh_now(cx);
             })
             .ok();
         })
@@ -144,7 +371,7 @@ impl DevOpsPanel {
             };
             this.update(cx, |panel, cx| {
                 panel.last_error = error;
-                panel.schedule_refresh(cx);
+                panel.refresh_now(cx);
             })
             .ok();
         })
@@ -154,21 +381,54 @@ impl DevOpsPanel {
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         match self.rows.get(ix) {
             Some(Row::SectionHeader(title)) => section_header(title).into_any_element(),
-            Some(Row::NodeHeader(node)) => render_node_header(node).into_any_element(),
-            Some(Row::Vm(status)) => render_vm_row(status, cx).into_any_element(),
+            Some(Row::NodeHeader(node)) => {
+                let ping = self.ping_for_node(&node.node);
+                render_node_header(node, ping).into_any_element()
+            }
+            Some(Row::Vm(status)) => {
+                let ping = self.ping_for_vm(&status.node, &status.vmid);
+                render_vm_row(status, ping, cx).into_any_element()
+            }
             Some(Row::HostHeader(host)) => render_host_header(host).into_any_element(),
-            Some(Row::Container(status)) => render_container_row(status, cx).into_any_element(),
+            Some(Row::Container(status)) => {
+                let ping = self.ping_for_host(&status.target);
+                render_container_row(status, ping, cx).into_any_element()
+            }
             None => div().h_full().into_any_element(),
         }
+    }
+
+    fn ping_for_node(&self, node: &str) -> Reachability {
+        self.pings
+            .nodes
+            .get(node)
+            .copied()
+            .unwrap_or(Reachability::NotApplicable)
+    }
+
+    fn ping_for_vm(&self, node: &str, vmid: &str) -> Reachability {
+        self.pings
+            .vms
+            .get(&(node.to_string(), vmid.to_string()))
+            .copied()
+            .unwrap_or(Reachability::NotApplicable)
+    }
+
+    fn ping_for_host(&self, target: &str) -> Reachability {
+        self.pings
+            .hosts
+            .get(target)
+            .copied()
+            .unwrap_or(Reachability::NotApplicable)
     }
 }
 
 /// Flattens the three status sweeps into the panel's row list, grouping VMs
 /// under their Proxmox node and containers under their SSH host.
 fn build_rows(
-    vm_node_statuses: Vec<VmNodeStatus>,
-    vm_statuses: Vec<VmStatus>,
-    container_statuses: Vec<ContainerStatus>,
+    vm_node_statuses: &[VmNodeStatus],
+    vm_statuses: &[VmStatus],
+    container_statuses: &[ContainerStatus],
 ) -> Vec<Row> {
     let mut rows = Vec::new();
 
@@ -189,7 +449,10 @@ fn build_rows(
     )));
     let mut by_host: BTreeMap<String, Vec<ContainerStatus>> = BTreeMap::new();
     for status in container_statuses {
-        by_host.entry(status.host.clone()).or_default().push(status);
+        by_host
+            .entry(status.host.clone())
+            .or_default()
+            .push(status.clone());
     }
     for (host, statuses) in by_host {
         rows.push(Row::HostHeader(host));
@@ -201,15 +464,20 @@ fn build_rows(
     rows
 }
 
-fn section_header(title: &str) -> Div {
-    h_flex().h_full().px_2().items_center().child(
+fn section_header(title: &str) -> Stateful<Div> {
+    let id = if title.starts_with("Virtual machines") {
+        "devops-vm-section"
+    } else {
+        "devops-container-section"
+    };
+    h_flex().id(id).h_full().px_2().items_center().child(
         Label::new(title.to_string())
             .size(LabelSize::Small)
             .color(Color::Muted),
     )
 }
 
-fn render_node_header(node: &VmNodeStatus) -> Div {
+fn render_node_header(node: &VmNodeStatus, ping: Reachability) -> Stateful<Div> {
     let name = if node.danger {
         format!("{} ⚠", node.node)
     } else {
@@ -220,6 +488,7 @@ fn render_node_header(node: &VmNodeStatus) -> Div {
         None => (node_resource_summary(node), Color::Muted),
     };
     v_flex()
+        .id(format!("devops-node-{}", node.node))
         .h_full()
         .px_2()
         .py_1()
@@ -236,7 +505,7 @@ fn render_node_header(node: &VmNodeStatus) -> Div {
                         .weight(FontWeight::SEMIBOLD)
                         .truncate(),
                 )
-                .child(ping_label(&node.ping)),
+                .child(ping_label(&ping)),
         )
         .child(
             Label::new(resource)
@@ -278,7 +547,11 @@ fn node_resource_summary(node: &VmNodeStatus) -> String {
     }
 }
 
-fn render_vm_row(status: &VmStatus, cx: &mut Context<DevOpsPanel>) -> Div {
+fn render_vm_row(
+    status: &VmStatus,
+    ping: Reachability,
+    cx: &mut Context<DevOpsPanel>,
+) -> Stateful<Div> {
     let (state_text, color) = vm_state(status);
     let name = if status.danger {
         format!("{} ⚠", status.name)
@@ -290,6 +563,7 @@ fn render_vm_row(status: &VmStatus, cx: &mut Context<DevOpsPanel>) -> Div {
     let detail = vm_detail(status);
 
     h_flex()
+        .id(format!("devops-vm-{}-{}", status.node, status.vmid))
         .h_full()
         .pl_4()
         .pr_2()
@@ -313,6 +587,7 @@ fn render_vm_row(status: &VmStatus, cx: &mut Context<DevOpsPanel>) -> Div {
                 .gap_2()
                 .items_center()
                 .child(Label::new(state_text).color(color))
+                .child(ping_label(&ping))
                 .child(vm_buttons(cx, &target, vmid)),
         )
 }
@@ -395,16 +670,25 @@ fn vm_button(
         }))
 }
 
-fn render_host_header(host: &str) -> Div {
-    h_flex().h_full().px_2().justify_between().child(
-        Label::new(format!("host · {host}"))
-            .size(LabelSize::Small)
-            .weight(FontWeight::SEMIBOLD)
-            .truncate(),
-    )
+fn render_host_header(host: &str) -> Stateful<Div> {
+    h_flex()
+        .id(format!("devops-host-{}", host))
+        .h_full()
+        .px_2()
+        .justify_between()
+        .child(
+            Label::new(format!("host · {host}"))
+                .size(LabelSize::Small)
+                .weight(FontWeight::SEMIBOLD)
+                .truncate(),
+        )
 }
 
-fn render_container_row(status: &ContainerStatus, cx: &mut Context<DevOpsPanel>) -> Div {
+fn render_container_row(
+    status: &ContainerStatus,
+    ping: Reachability,
+    cx: &mut Context<DevOpsPanel>,
+) -> Stateful<Div> {
     let (state_text, color) = match (&status.state, &status.error) {
         (Some(_), _) => ("healthy".to_string(), Color::Success),
         (None, Some(_)) => ("unreachable".to_string(), Color::Error),
@@ -415,6 +699,7 @@ fn render_container_row(status: &ContainerStatus, cx: &mut Context<DevOpsPanel>)
     let target = status.target.clone();
 
     h_flex()
+        .id(format!("devops-container-{}", status.target))
         .h_full()
         .pl_4()
         .pr_2()
@@ -438,7 +723,7 @@ fn render_container_row(status: &ContainerStatus, cx: &mut Context<DevOpsPanel>)
                 .gap_2()
                 .items_center()
                 .child(Label::new(state_text).color(color))
-                .child(ping_label(&status.ping))
+                .child(ping_label(&ping))
                 .child(container_buttons(cx, &target)),
         )
 }
@@ -505,6 +790,14 @@ fn driver_label(driver: ContainerDriver) -> &'static str {
     }
 }
 
+fn format_interval(seconds: u64) -> String {
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn ping_label(ping: &Reachability) -> Label {
     let (text, color) = match ping {
         Reachability::Reachable(latency) => (format_ping(latency), Color::Muted),
@@ -562,11 +855,13 @@ impl Render for DevOpsPanel {
                     .py_1()
                     .child(Label::new("DevOps"))
                     .child(
-                        Button::new("devops-refresh", "Refresh").on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.schedule_refresh(cx);
-                            },
-                        )),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(self.live_checkbox(cx))
+                            .child(self.interval_menu(IntervalKind::Ping, window, cx))
+                            .child(self.interval_menu(IntervalKind::Proxmox, window, cx))
+                            .child(self.interval_menu(IntervalKind::Container, window, cx)),
                     ),
             )
             .when_some(self.last_error.clone(), |this, error| {
@@ -614,6 +909,14 @@ impl Panel for DevOpsPanel {
     }
 
     fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        cx.notify();
+    }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> gpui::Pixels {
         px(300.)

@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 agent.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 gpui.workspace = true
 log.workspace = true
 ui.workspace = true
