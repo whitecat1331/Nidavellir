@@ -7,6 +7,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod proxmox;
+mod reachability;
 mod sandboxing;
 mod templates;
 #[cfg(test)]
@@ -25,6 +26,7 @@ pub use memory::*;
 pub use native_agent_server::NativeAgentServer;
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
+pub use reachability::*;
 pub use sandboxing::{
     ThreadSandbox, sandbox_worktree_writable_paths, settings_sandbox_policy,
     settings_thread_sandbox,

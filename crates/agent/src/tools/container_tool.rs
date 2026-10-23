@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::containers::{ContainerDriver, ContainerOperation, ContainerStore, assemble_command};
+use crate::reachability::{HOST_PROBE_PORT, Reachability, bare_host, probe_tcp};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, AppContext as _, SharedString, Task};
@@ -181,6 +182,8 @@ pub struct ContainerStatus {
     /// The SSH endpoint the target is reached on (often a Tailscale DNS name),
     /// used to group targets under their host in the panel.
     pub host: String,
+    /// TCP-connect reachability of the host's SSH port.
+    pub ping: Reachability,
     /// How the target is operated (compose stack vs systemd unit).
     pub driver: ContainerDriver,
     /// A short success summary (compose service list / `is-active` state).
@@ -198,6 +201,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             return vec![ContainerStatus {
                 target: String::new(),
                 host: String::new(),
+                ping: Reachability::NotApplicable,
                 driver: ContainerDriver::Compose,
                 state: None,
                 error: Some(format!("Failed to load container config: {error}")),
@@ -207,6 +211,8 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
 
     let mut statuses = Vec::new();
     for (target_id, target) in &store.targets {
+        let ping = probe_tcp(bare_host(&target.host), HOST_PROBE_PORT).await;
+
         let operation = match target.driver {
             ContainerDriver::Compose => ContainerOperation::Ps,
             ContainerDriver::Systemd => ContainerOperation::IsActive,
@@ -218,6 +224,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
                     host: target.host.clone(),
+                    ping,
                     driver: target.driver,
                     state: None,
                     error: Some(error.to_string()),
@@ -236,6 +243,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
                     host: target.host.clone(),
+                    ping,
                     driver: target.driver,
                     state: None,
                     error: Some(format!("Failed to run `{}`: {error}", assembled.display())),
@@ -251,6 +259,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
                 host: target.host.clone(),
+                ping,
                 driver: target.driver,
                 state: Some(if summary.is_empty() {
                     "healthy".to_string()
@@ -273,6 +282,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
                 host: target.host.clone(),
+                ping,
                 driver: target.driver,
                 state: None,
                 error: Some(message),

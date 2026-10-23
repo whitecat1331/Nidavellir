@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use agent::containers::ContainerDriver;
-use agent::{ContainerStatus, VmNodeStatus, VmStatus};
+use agent::{ContainerStatus, Reachability, VmNodeStatus, VmStatus};
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
     ListState, Render, Task, WeakEntity, Window, actions, list, px,
@@ -158,7 +158,7 @@ fn render_node_header(node: &VmNodeStatus) -> Div {
     } else {
         node.node.clone()
     };
-    let (summary, color) = match &node.error {
+    let (summary, summary_color) = match &node.error {
         Some(_) => ("unreachable".to_string(), Color::Error),
         None => (node_resource_summary(node), Color::Muted),
     };
@@ -171,7 +171,16 @@ fn render_node_header(node: &VmNodeStatus) -> Div {
                 .size(LabelSize::Small)
                 .weight(FontWeight::SEMIBOLD),
         )
-        .child(Label::new(summary).size(LabelSize::Small).color(color))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Label::new(summary)
+                        .size(LabelSize::Small)
+                        .color(summary_color),
+                )
+                .child(ping_label(&node.ping)),
+        )
 }
 
 fn node_resource_summary(node: &VmNodeStatus) -> String {
@@ -244,13 +253,36 @@ fn render_container_row(status: &ContainerStatus) -> Div {
         .pr_2()
         .justify_between()
         .child(Label::new(name))
-        .child(Label::new(state_text).color(color))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(Label::new(state_text).color(color))
+                .child(ping_label(&status.ping)),
+        )
 }
 
 fn driver_label(driver: ContainerDriver) -> &'static str {
     match driver {
         ContainerDriver::Compose => "docker compose",
         ContainerDriver::Systemd => "systemd",
+    }
+}
+
+fn ping_label(ping: &Reachability) -> Label {
+    let (text, color) = match ping {
+        Reachability::Reachable(latency) => (format_ping(latency), Color::Muted),
+        Reachability::Timeout => ("timeout".to_string(), Color::Warning),
+        Reachability::NotApplicable => ("n/a".to_string(), Color::Muted),
+    };
+    Label::new(text).size(LabelSize::Small).color(color)
+}
+
+fn format_ping(latency: &Duration) -> String {
+    let millis = latency.as_secs_f64() * 1000.0;
+    if millis >= 1.0 {
+        format!("{millis:.0} ms")
+    } else {
+        format!("{millis:.1} ms")
     }
 }
 
