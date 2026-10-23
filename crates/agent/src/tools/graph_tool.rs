@@ -107,15 +107,6 @@ pub struct NodeCost {
     pub wall_clock_ms: u64,
 }
 
-impl NodeCost {
-    fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
-    }
-}
-
 /// A plan's stated budget (D13) — the ceiling on total tokens and wall-clock.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CostBudget {
@@ -834,6 +825,12 @@ mod tests {
             .unwrap();
         let recorded = entry.cost.as_ref().expect("cost should be recorded");
         assert_eq!(recorded.wall_clock_ms, 1500);
-        assert_eq!(recorded.total_tokens(), 155);
+        assert_eq!(
+            recorded.input_tokens
+                + recorded.output_tokens
+                + recorded.cache_creation_input_tokens
+                + recorded.cache_read_input_tokens,
+            155
+        );
     }
 }
