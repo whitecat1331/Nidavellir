@@ -568,8 +568,8 @@ mod tests {
     fn synthesized_settings_json_is_valid() {
         let settings =
             synthesized_settings_json("{}", "deepseek", "deepseek-v4-pro", true, "\"high\"", "");
-        let value: serde_json::Value = serde_json::from_str(&settings)
-            .expect("synthesized settings must be valid JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(&settings).expect("synthesized settings must be valid JSON");
         assert_eq!(
             value["agent"]["tool_permissions"]["tools"]["git"]["default"].as_str(),
             Some("allow"),
