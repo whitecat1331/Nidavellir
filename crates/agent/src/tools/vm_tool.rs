@@ -161,10 +161,7 @@ fn tool_error(error: VmToolOutput) -> String {
 /// Queries `status/current` for every VM registered in `vms.json`, best-effort:
 /// each VM is queried independently and an unreachable node/VM yields a row
 /// with `state: None` + `error` rather than aborting the sweep.
-pub async fn vm_statuses(
-    cx: &AsyncApp,
-    shared_http_client: Arc<dyn HttpClient>,
-) -> Vec<VmStatus> {
+pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>) -> Vec<VmStatus> {
     let store = match VmStore::load(VmStore::default_path()) {
         Ok(store) => store,
         Err(error) => {
@@ -191,7 +188,9 @@ pub async fn vm_statuses(
                         name: info.name.clone(),
                         danger: info.danger,
                         state: None,
-                        error: Some(format!("target \"{node}\" has no `api` transport configured")),
+                        error: Some(format!(
+                            "target \"{node}\" has no `api` transport configured"
+                        )),
                     });
                 }
                 continue;
@@ -259,16 +258,22 @@ pub async fn vm_statuses(
                 }
             };
 
-            let value =
-                match call_api(&http_client, &request, &api.token_id, &secret, &api.base_url).await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        status.error = Some(tool_error(error));
-                        statuses.push(status);
-                        continue;
-                    }
-                };
+            let value = match call_api(
+                &http_client,
+                &request,
+                &api.token_id,
+                &secret,
+                &api.base_url,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    status.error = Some(tool_error(error));
+                    statuses.push(status);
+                    continue;
+                }
+            };
 
             status.state = value
                 .get("data")
@@ -277,6 +282,143 @@ pub async fn vm_statuses(
                 .map(str::to_string);
             statuses.push(status);
         }
+    }
+    statuses
+}
+
+/// One Proxmox node's read-only health, for non-agent consumers such as the
+/// infra dashboard panel. Holds no infra of its own — the targets come from the
+/// seeded `vms.json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VmNodeStatus {
+    /// `vms.json` target id (the Proxmox node).
+    pub node: String,
+    /// Whether this node is infra-critical.
+    pub danger: bool,
+    /// Fraction of node CPU in use (0.0..=1.0) from `/nodes/{node}/status`.
+    pub cpu: Option<f64>,
+    /// Total node memory in bytes.
+    pub memory_total: Option<u64>,
+    /// Used node memory in bytes.
+    pub memory_used: Option<u64>,
+    /// Total root filesystem size in bytes.
+    pub rootfs_total: Option<u64>,
+    /// Used root filesystem space in bytes.
+    pub rootfs_used: Option<u64>,
+    /// The failure reason when the status could not be read.
+    pub error: Option<String>,
+}
+
+/// Queries `/nodes/{node}/status` for every node registered in `vms.json`,
+/// best-effort: each node is queried independently and an unreachable node
+/// yields a row with `error` rather than aborting the sweep.
+pub async fn vm_node_statuses(
+    cx: &AsyncApp,
+    shared_http_client: Arc<dyn HttpClient>,
+) -> Vec<VmNodeStatus> {
+    let store = match VmStore::load(VmStore::default_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return vec![VmNodeStatus {
+                node: String::new(),
+                danger: false,
+                cpu: None,
+                memory_total: None,
+                memory_used: None,
+                rootfs_total: None,
+                rootfs_used: None,
+                error: Some(format!("Failed to load vm config: {error}")),
+            }];
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for (node, target) in &store.targets {
+        let mut status = VmNodeStatus {
+            node: node.clone(),
+            danger: target.danger,
+            cpu: None,
+            memory_total: None,
+            memory_used: None,
+            rootfs_total: None,
+            rootfs_used: None,
+            error: None,
+        };
+
+        let Some(api) = target.api.as_ref() else {
+            status.error = Some(format!(
+                "target \"{node}\" has no `api` transport configured"
+            ));
+            statuses.push(status);
+            continue;
+        };
+
+        let http_client = match resolve_http_client(target, shared_http_client.clone()) {
+            Ok(client) => client,
+            Err(error) => {
+                status.error = Some(tool_error(error));
+                statuses.push(status);
+                continue;
+            }
+        };
+
+        let request = match assemble_api_request(target, VmOperation::NodeStatus, None, None, None)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                status.error = Some(error.to_string());
+                statuses.push(status);
+                continue;
+            }
+        };
+
+        let secret = match read_secret(cx, &api.token_secret_url).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                status.error = Some(tool_error(error));
+                statuses.push(status);
+                continue;
+            }
+        };
+
+        let value = match call_api(
+            &http_client,
+            &request,
+            &api.token_id,
+            &secret,
+            &api.base_url,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                status.error = Some(tool_error(error));
+                statuses.push(status);
+                continue;
+            }
+        };
+
+        let data = value.get("data");
+        status.cpu = data
+            .and_then(|data| data.get("cpu"))
+            .and_then(|cpu| cpu.as_f64());
+        status.memory_total = data
+            .and_then(|data| data.get("memory"))
+            .and_then(|memory| memory.get("total"))
+            .and_then(|total| total.as_u64());
+        status.memory_used = data
+            .and_then(|data| data.get("memory"))
+            .and_then(|memory| memory.get("used"))
+            .and_then(|used| used.as_u64());
+        status.rootfs_total = data
+            .and_then(|data| data.get("rootfs"))
+            .and_then(|rootfs| rootfs.get("total"))
+            .and_then(|total| total.as_u64());
+        status.rootfs_used = data
+            .and_then(|data| data.get("rootfs"))
+            .and_then(|rootfs| rootfs.get("used"))
+            .and_then(|used| used.as_u64());
+        statuses.push(status);
     }
     statuses
 }

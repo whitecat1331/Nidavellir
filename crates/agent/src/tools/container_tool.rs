@@ -178,6 +178,9 @@ async fn run_operation(
 pub struct ContainerStatus {
     /// `containers.json` target id.
     pub target: String,
+    /// The SSH endpoint the target is reached on (often a Tailscale DNS name),
+    /// used to group targets under their host in the panel.
+    pub host: String,
     /// How the target is operated (compose stack vs systemd unit).
     pub driver: ContainerDriver,
     /// A short success summary (compose service list / `is-active` state).
@@ -194,6 +197,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
         Err(error) => {
             return vec![ContainerStatus {
                 target: String::new(),
+                host: String::new(),
                 driver: ContainerDriver::Compose,
                 state: None,
                 error: Some(format!("Failed to load container config: {error}")),
@@ -213,6 +217,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             Err(error) => {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
+                    host: target.host.clone(),
                     driver: target.driver,
                     state: None,
                     error: Some(error.to_string()),
@@ -230,6 +235,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             Err(error) => {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
+                    host: target.host.clone(),
                     driver: target.driver,
                     state: None,
                     error: Some(format!("Failed to run `{}`: {error}", assembled.display())),
@@ -244,6 +250,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             let summary = stdout.trim().to_string();
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
+                host: target.host.clone(),
                 driver: target.driver,
                 state: Some(if summary.is_empty() {
                     "healthy".to_string()
@@ -265,6 +272,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             }
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
+                host: target.host.clone(),
                 driver: target.driver,
                 state: None,
                 error: Some(message),
