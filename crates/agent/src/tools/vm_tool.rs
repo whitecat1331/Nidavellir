@@ -146,6 +146,20 @@ pub struct VmStatus {
     pub name: String,
     /// Whether this VM is infra-critical.
     pub danger: bool,
+    /// LAN or Tailscale IP (enriched registry, D6).
+    pub ip: Option<String>,
+    /// Operating system (enriched registry, D6).
+    pub os: Option<String>,
+    /// Human-readable role(s) (enriched registry, D6).
+    pub roles: Vec<String>,
+    /// Live memory usage in bytes (`data.mem`).
+    pub memory_used: Option<u64>,
+    /// Live memory maximum in bytes (`data.maxmem`).
+    pub memory_total: Option<u64>,
+    /// Live CPU count (`data.cpus`).
+    pub cpus: Option<u64>,
+    /// Live uptime in seconds (`data.uptime`).
+    pub uptime: Option<u64>,
     /// Proxmox `status` field (`running`, `stopped`, …) when reachable.
     pub state: Option<String>,
     /// The failure reason when the status could not be read.
@@ -171,6 +185,13 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                 vmid: String::new(),
                 name: String::new(),
                 danger: false,
+                ip: None,
+                os: None,
+                roles: Vec::new(),
+                memory_used: None,
+                memory_total: None,
+                cpus: None,
+                uptime: None,
                 state: None,
                 error: Some(format!("Failed to load vm config: {error}")),
             }];
@@ -188,6 +209,13 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                         vmid: vmid.clone(),
                         name: info.name.clone(),
                         danger: info.danger,
+                        ip: info.ip.clone(),
+                        os: info.os.clone(),
+                        roles: info.roles.clone(),
+                        memory_used: None,
+                        memory_total: None,
+                        cpus: None,
+                        uptime: None,
                         state: None,
                         error: Some(format!(
                             "target \"{node}\" has no `api` transport configured"
@@ -208,6 +236,13 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                         vmid: vmid.clone(),
                         name: info.name.clone(),
                         danger: info.danger,
+                        ip: info.ip.clone(),
+                        os: info.os.clone(),
+                        roles: info.roles.clone(),
+                        memory_used: None,
+                        memory_total: None,
+                        cpus: None,
+                        uptime: None,
                         state: None,
                         error: Some(message.clone()),
                     });
@@ -222,6 +257,13 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                 vmid: vmid.clone(),
                 name: info.name.clone(),
                 danger: info.danger,
+                ip: info.ip.clone(),
+                os: info.os.clone(),
+                roles: info.roles.clone(),
+                memory_used: None,
+                memory_total: None,
+                cpus: None,
+                uptime: None,
                 state: None,
                 error: None,
             };
@@ -276,11 +318,23 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                 }
             };
 
-            status.state = value
-                .get("data")
+            let data = value.get("data");
+            status.state = data
                 .and_then(|data| data.get("status"))
                 .and_then(|state| state.as_str())
                 .map(str::to_string);
+            status.memory_used = data
+                .and_then(|data| data.get("mem"))
+                .and_then(|mem| mem.as_u64());
+            status.memory_total = data
+                .and_then(|data| data.get("maxmem"))
+                .and_then(|maxmem| maxmem.as_u64());
+            status.cpus = data
+                .and_then(|data| data.get("cpus"))
+                .and_then(|cpus| cpus.as_u64());
+            status.uptime = data
+                .and_then(|data| data.get("uptime"))
+                .and_then(|uptime| uptime.as_u64());
             statuses.push(status);
         }
     }
@@ -308,6 +362,8 @@ pub struct VmNodeStatus {
     pub rootfs_total: Option<u64>,
     /// Used root filesystem space in bytes.
     pub rootfs_used: Option<u64>,
+    /// Live node uptime in seconds.
+    pub uptime: Option<u64>,
     /// The failure reason when the status could not be read.
     pub error: Option<String>,
 }
@@ -331,6 +387,7 @@ pub async fn vm_node_statuses(
                 memory_used: None,
                 rootfs_total: None,
                 rootfs_used: None,
+                uptime: None,
                 error: Some(format!("Failed to load vm config: {error}")),
             }];
         }
@@ -347,10 +404,11 @@ pub async fn vm_node_statuses(
             memory_used: None,
             rootfs_total: None,
             rootfs_used: None,
+            uptime: None,
             error: None,
         };
         status.ping = match node_probe_endpoint(target) {
-            Some((host, port)) => probe_tcp(&host, port).await,
+            Some((host, port)) => probe_tcp(cx.background_executor(), &host, port).await,
             None => Reachability::NotApplicable,
         };
 
@@ -427,6 +485,9 @@ pub async fn vm_node_statuses(
             .and_then(|data| data.get("rootfs"))
             .and_then(|rootfs| rootfs.get("used"))
             .and_then(|used| used.as_u64());
+        status.uptime = data
+            .and_then(|data| data.get("uptime"))
+            .and_then(|uptime| uptime.as_u64());
         statuses.push(status);
     }
     statuses
@@ -519,6 +580,35 @@ async fn run_operation(
             .await
         }
     }
+}
+
+/// Public, panel-facing mutation entry point that reuses the private
+/// `run_operation` (gating/validation/transport/token).
+pub async fn vm_operation(
+    cx: &AsyncApp,
+    target: String,
+    operation: VmOperation,
+    vmid: Option<u32>,
+    confirm: bool,
+    reason: Option<String>,
+) -> Result<VmToolOutput, VmToolOutput> {
+    let shared_http_client = cx.update(|cx| cx.http_client());
+    run_operation(
+        VmToolInput {
+            target,
+            operation,
+            transport: None,
+            vmid,
+            snapname: None,
+            migrate_target: None,
+            args: Vec::new(),
+            confirm,
+            reason,
+        },
+        shared_http_client,
+        cx,
+    )
+    .await
 }
 
 /// Resolves the HTTP client for the API transport: the shared client by

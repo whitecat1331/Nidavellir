@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
-use smol::Timer;
+use gpui::BackgroundExecutor;
 use smol::net::TcpStream;
 
 /// How long a single TCP-connect probe waits before declaring a timeout.
@@ -28,7 +28,7 @@ pub enum Reachability {
 /// Deterministic: a success returns the measured round trip; a connect failure
 /// or a host that does not answer within [`PROBE_TIMEOUT`] returns `Timeout`;
 /// an empty host returns `NotApplicable`.
-pub async fn probe_tcp(host: &str, port: u16) -> Reachability {
+pub async fn probe_tcp(executor: &BackgroundExecutor, host: &str, port: u16) -> Reachability {
     let host = host.trim();
     if host.is_empty() {
         return Reachability::NotApplicable;
@@ -36,7 +36,7 @@ pub async fn probe_tcp(host: &str, port: u16) -> Reachability {
 
     let started = Instant::now();
     let connect = async { TcpStream::connect((host, port)).await.map(|_stream| ()) }.fuse();
-    let timeout = Timer::after(PROBE_TIMEOUT).fuse();
+    let timeout = executor.timer(PROBE_TIMEOUT).fuse();
     futures::pin_mut!(connect, timeout);
 
     futures::select! {

@@ -70,6 +70,15 @@ pub struct VmInfo {
     /// Whether this VM is infra-critical (danger-tier for stop/reboot).
     #[serde(default)]
     pub danger: bool,
+    /// LAN or Tailscale IP, when known (enriched registry, D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    /// Operating system, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Human-readable role(s), e.g. `["build"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 /// One reachable ops target: a hypervisor node plus the VMs it hosts.
@@ -336,6 +345,9 @@ mod tests {
                         VmInfo {
                             name: format!("vm-{id}"),
                             danger: *danger,
+                            ip: None,
+                            os: None,
+                            roles: Vec::new(),
                         },
                     )
                 })

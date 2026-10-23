@@ -38,6 +38,18 @@ pub struct ContainerTarget {
     /// Systemd: the unit name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    /// LAN or Tailscale IP, when known (enriched registry, D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    /// Operating system, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Human-readable role(s), e.g. `["postgres"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    /// Override for the reachability probe port (default 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_port: Option<u16>,
 }
 
 /// The set of configured targets, persisted as a single JSON file.
@@ -94,6 +106,10 @@ pub enum ContainerOperation {
     Up,
     /// Stop and remove services (compose).
     Down,
+    /// Start stopped services (compose) / start a unit (systemd).
+    Start,
+    /// Stop running services (compose) / stop a unit (systemd).
+    Stop,
     /// Restart a service or unit.
     Restart,
     /// Run a command in a service container (compose).
@@ -116,6 +132,8 @@ impl ContainerOperation {
             Self::Pull => "pull",
             Self::Up => "up",
             Self::Down => "down",
+            Self::Start => "start",
+            Self::Stop => "stop",
             Self::Restart => "restart",
             Self::Exec => "exec",
             Self::Rm => "rm",
@@ -127,7 +145,15 @@ impl ContainerOperation {
     pub fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::Pull | Self::Up | Self::Down | Self::Restart | Self::Exec | Self::Rm | Self::Run
+            Self::Pull
+                | Self::Up
+                | Self::Down
+                | Self::Start
+                | Self::Stop
+                | Self::Restart
+                | Self::Exec
+                | Self::Rm
+                | Self::Run
         )
     }
 }
@@ -205,6 +231,8 @@ pub fn assemble_command(
                 operation,
                 ContainerOperation::Status
                     | ContainerOperation::IsActive
+                    | ContainerOperation::Start
+                    | ContainerOperation::Stop
                     | ContainerOperation::Restart
             ) {
                 bail!(
@@ -278,6 +306,10 @@ mod tests {
             file: None,
             env_file: None,
             service: None,
+            ip: None,
+            os: None,
+            roles: Vec::new(),
+            probe_port: None,
         }
     }
 
@@ -290,6 +322,10 @@ mod tests {
             file: None,
             env_file: None,
             service: Some(service.to_string()),
+            ip: None,
+            os: None,
+            roles: Vec::new(),
+            probe_port: None,
         }
     }
 
@@ -312,6 +348,8 @@ mod tests {
             ContainerOperation::Pull,
             ContainerOperation::Up,
             ContainerOperation::Down,
+            ContainerOperation::Start,
+            ContainerOperation::Stop,
             ContainerOperation::Restart,
             ContainerOperation::Exec,
             ContainerOperation::Rm,

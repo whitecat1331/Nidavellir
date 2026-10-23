@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use agent::containers::ContainerDriver;
+use agent::containers::{ContainerDriver, ContainerOperation};
+use agent::vms::VmOperation;
 use agent::{ContainerStatus, Reachability, VmNodeStatus, VmStatus};
+use editor::Editor;
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
     ListState, Render, Task, WeakEntity, Window, actions, list, px,
 };
-use ui::{Button, IconName, Label, LabelSize, WithScrollbar, prelude::*};
+use ui::{Button, ButtonSize, IconName, Label, LabelSize, WithScrollbar, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -24,14 +26,23 @@ pub struct DevOpsPanel {
     focus_handle: FocusHandle,
     list_state: ListState,
     rows: Vec<Row>,
+    pending: Option<PendingAction>,
     _refresh_task: Task<()>,
+}
+
+/// A danger-tier VM lifecycle action awaiting a reason from the user.
+struct PendingAction {
+    editor: Entity<Editor>,
+    target: String,
+    vmid: u32,
+    operation: VmOperation,
 }
 
 /// One rendered row in the flat list backing the panel.
 enum Row {
     SectionHeader(String),
     NodeHeader(VmNodeStatus),
-    Vm(VmStatus),
+    Vm { status: VmStatus, node_danger: bool },
     HostHeader(String),
     Container(ContainerStatus),
 }
@@ -55,6 +66,7 @@ impl DevOpsPanel {
                 focus_handle: cx.focus_handle(),
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 rows: Vec::new(),
+                pending: None,
                 _refresh_task: Task::ready(()),
             };
             this.schedule_refresh(cx);
@@ -72,13 +84,14 @@ impl DevOpsPanel {
             })
         })
     }
+
     fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
         let http_client = cx.http_client();
         self._refresh_task = cx.spawn(async move |this, cx| {
             loop {
                 let vm_node_statuses = agent::vm_node_statuses(cx, http_client.clone()).await;
                 let vm_statuses = agent::vm_statuses(cx, http_client.clone()).await;
-                let container_statuses = agent::container_statuses().await;
+                let container_statuses = agent::container_statuses(cx).await;
                 if this
                     .update(cx, |panel, cx| {
                         panel.rows = build_rows(vm_node_statuses, vm_statuses, container_statuses);
@@ -94,15 +107,144 @@ impl DevOpsPanel {
         });
     }
 
-    fn render_row(&self, ix: usize) -> AnyElement {
+    fn run_vm_action(
+        &mut self,
+        target: String,
+        vmid: u32,
+        operation: VmOperation,
+        danger: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if danger && matches!(operation, VmOperation::Shutdown | VmOperation::Reboot) {
+            self.begin_reason_prompt(target, vmid, operation, window, cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            match agent::vm_operation(cx, target, operation, Some(vmid), true, None).await {
+                Ok(_) => {}
+                Err(error) => log::error!("vm {operation:?} failed: {error:?}"),
+            }
+            this.update(cx, |panel, cx| panel.schedule_refresh(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn run_container_action(
+        &mut self,
+        target: String,
+        operation: ContainerOperation,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            match agent::container_operation(target, operation, None, true).await {
+                Ok(_) => {}
+                Err(error) => log::error!("container {operation:?} failed: {error:?}"),
+            }
+            this.update(cx, |panel, cx| panel.schedule_refresh(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn begin_reason_prompt(
+        &mut self,
+        target: String,
+        vmid: u32,
+        operation: VmOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Reason (required)", window, cx);
+            editor
+        });
+        self.pending = Some(PendingAction {
+            editor,
+            target,
+            vmid,
+            operation,
+        });
+        cx.notify();
+        let focus_handle = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.editor.focus_handle(cx));
+        if let Some(focus_handle) = focus_handle {
+            focus_handle.focus(window, cx);
+        }
+    }
+
+    fn confirm_pending(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let reason = pending.editor.read(cx).text(cx);
+        let reason = reason.trim().to_string();
+        if reason.is_empty() {
+            return;
+        }
+        let target = pending.target.clone();
+        let vmid = pending.vmid;
+        let operation = pending.operation;
+        cx.spawn(async move |this, cx| {
+            match agent::vm_operation(cx, target, operation, Some(vmid), true, Some(reason)).await {
+                Ok(_) => {}
+                Err(error) => log::error!("vm {operation:?} failed: {error:?}"),
+            }
+            this.update(cx, |panel, cx| panel.schedule_refresh(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn cancel_pending(&mut self, cx: &mut Context<Self>) {
+        self.pending = None;
+        cx.notify();
+    }
+
+    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         match self.rows.get(ix) {
             Some(Row::SectionHeader(title)) => section_header(title).into_any_element(),
             Some(Row::NodeHeader(node)) => render_node_header(node).into_any_element(),
-            Some(Row::Vm(status)) => render_vm_row(status).into_any_element(),
+            Some(Row::Vm {
+                status,
+                node_danger,
+            }) => render_vm_row(status, *node_danger, cx).into_any_element(),
             Some(Row::HostHeader(host)) => render_host_header(host).into_any_element(),
-            Some(Row::Container(status)) => render_container_row(status).into_any_element(),
+            Some(Row::Container(status)) => render_container_row(status, cx).into_any_element(),
             None => div().h_full().into_any_element(),
         }
+    }
+
+    fn render_reason_bar(&self, pending: &PendingAction, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Label::new("Reason (required)")
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
+            )
+            .child(div().flex_1().min_h_0().child(pending.editor.clone()))
+            .child(
+                Button::new("devops-reason-confirm", "Confirm").on_click(cx.listener(
+                    |this, _event, _window, cx| {
+                        this.confirm_pending(cx);
+                    },
+                )),
+            )
+            .child(
+                Button::new("devops-reason-cancel", "Cancel").on_click(cx.listener(
+                    |this, _event, _window, cx| {
+                        this.cancel_pending(cx);
+                    },
+                )),
+            )
     }
 }
 
@@ -122,7 +264,10 @@ fn build_rows(
     for node in vm_node_statuses {
         rows.push(Row::NodeHeader(node.clone()));
         for status in vm_statuses.iter().filter(|status| status.node == node.node) {
-            rows.push(Row::Vm(status.clone()));
+            rows.push(Row::Vm {
+                status: status.clone(),
+                node_danger: node.danger,
+            });
         }
     }
 
@@ -197,39 +342,130 @@ fn node_resource_summary(node: &VmNodeStatus) -> String {
             Some(memory_total),
             Some(rootfs_used),
             Some(rootfs_total),
-        ) => format!(
-            "cpu {:.0}% · mem {} / {} · disk {} / {}",
-            cpu * 100.0,
-            format_bytes(memory_used),
-            format_bytes(memory_total),
-            format_bytes(rootfs_used),
-            format_bytes(rootfs_total)
-        ),
+        ) => {
+            let mut summary = format!(
+                "cpu {:.0}% · mem {} / {} · disk {} / {}",
+                cpu * 100.0,
+                format_bytes(memory_used),
+                format_bytes(memory_total),
+                format_bytes(rootfs_used),
+                format_bytes(rootfs_total)
+            );
+            if let Some(uptime) = node.uptime {
+                summary.push_str(&format!(" · up {}", format_uptime(uptime)));
+            }
+            summary
+        }
         _ => "—".to_string(),
     }
 }
 
-fn render_vm_row(status: &VmStatus) -> Div {
+fn render_vm_row(status: &VmStatus, node_danger: bool, cx: &mut Context<DevOpsPanel>) -> Div {
+    let danger = status.danger || node_danger;
     let (state_text, color) = match (&status.state, &status.error) {
-        (Some(state), _) if state == "running" => {
-            (format!("running · vmid {}", status.vmid), Color::Success)
-        }
-        (Some(state), _) => (format!("{state} · vmid {}", status.vmid), Color::Warning),
+        (Some(state), _) if state == "running" => ("running".to_string(), Color::Success),
+        (Some(state), _) => (state.clone(), Color::Warning),
         (None, Some(_)) => ("unreachable".to_string(), Color::Error),
         (None, None) => ("unknown".to_string(), Color::Muted),
     };
-    let name = if status.danger {
+    let name = if danger {
         format!("{} ⚠", status.name)
     } else {
         status.name.clone()
     };
+    let target = status.node.clone();
+    let vmid = status.vmid.parse::<u32>().unwrap_or(0);
+    let detail = vm_detail(status);
+
     h_flex()
         .h_full()
         .pl_4()
         .pr_2()
         .justify_between()
-        .child(Label::new(name))
-        .child(Label::new(state_text).color(color))
+        .child(
+            h_flex().gap_2().child(Label::new(name)).child(
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(Label::new(state_text).color(color))
+                .child(vm_buttons(cx, &target, vmid, danger)),
+        )
+}
+
+fn vm_detail(status: &VmStatus) -> String {
+    let mut parts = vec![format!("vmid {}", status.vmid)];
+    if !status.roles.is_empty() {
+        parts.push(status.roles.join(", "));
+    }
+    if let Some(ip) = &status.ip {
+        parts.push(ip.clone());
+    }
+    if let Some(os) = &status.os {
+        parts.push(os.clone());
+    }
+    if let (Some(used), Some(total)) = (status.memory_used, status.memory_total) {
+        parts.push(format!(
+            "mem {} / {}",
+            format_bytes(used),
+            format_bytes(total)
+        ));
+    }
+    parts.join(" · ")
+}
+
+fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32, danger: bool) -> Div {
+    h_flex()
+        .gap_1()
+        .child(vm_button(
+            cx,
+            "vm-start",
+            target,
+            vmid,
+            VmOperation::Start,
+            danger,
+            "Start",
+        ))
+        .child(vm_button(
+            cx,
+            "vm-stop",
+            target,
+            vmid,
+            VmOperation::Shutdown,
+            danger,
+            "Stop",
+        ))
+        .child(vm_button(
+            cx,
+            "vm-restart",
+            target,
+            vmid,
+            VmOperation::Reboot,
+            danger,
+            "Restart",
+        ))
+}
+
+fn vm_button(
+    cx: &mut Context<DevOpsPanel>,
+    kind: &'static str,
+    target: &str,
+    vmid: u32,
+    operation: VmOperation,
+    danger: bool,
+    label: &'static str,
+) -> Button {
+    let target = target.to_string();
+    Button::new(format!("{kind}-{target}-{vmid}"), label)
+        .size(ButtonSize::Compact)
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            this.run_vm_action(target.clone(), vmid, operation, danger, window, cx);
+        }))
 }
 
 fn render_host_header(host: &str) -> Div {
@@ -240,25 +476,91 @@ fn render_host_header(host: &str) -> Div {
     )
 }
 
-fn render_container_row(status: &ContainerStatus) -> Div {
+fn render_container_row(status: &ContainerStatus, cx: &mut Context<DevOpsPanel>) -> Div {
     let (state_text, color) = match (&status.state, &status.error) {
         (Some(_), _) => ("healthy".to_string(), Color::Success),
         (None, Some(_)) => ("unreachable".to_string(), Color::Error),
         (None, None) => ("unknown".to_string(), Color::Muted),
     };
     let name = format!("{} · {}", status.target, driver_label(status.driver));
+    let detail = container_detail(status);
+    let target = status.target.clone();
+
     h_flex()
         .h_full()
         .pl_4()
         .pr_2()
         .justify_between()
-        .child(Label::new(name))
+        .child(
+            h_flex().gap_2().child(Label::new(name)).child(
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
         .child(
             h_flex()
                 .gap_2()
+                .items_center()
                 .child(Label::new(state_text).color(color))
-                .child(ping_label(&status.ping)),
+                .child(ping_label(&status.ping))
+                .child(container_buttons(cx, &target)),
         )
+}
+
+fn container_detail(status: &ContainerStatus) -> String {
+    let mut parts = Vec::new();
+    if !status.roles.is_empty() {
+        parts.push(status.roles.join(", "));
+    }
+    if let Some(ip) = &status.ip {
+        parts.push(ip.clone());
+    }
+    if let Some(os) = &status.os {
+        parts.push(os.clone());
+    }
+    parts.join(" · ")
+}
+
+fn container_buttons(cx: &mut Context<DevOpsPanel>, target: &str) -> Div {
+    h_flex()
+        .gap_1()
+        .child(container_button(
+            cx,
+            "container-start",
+            target,
+            ContainerOperation::Start,
+            "Start",
+        ))
+        .child(container_button(
+            cx,
+            "container-stop",
+            target,
+            ContainerOperation::Stop,
+            "Stop",
+        ))
+        .child(container_button(
+            cx,
+            "container-restart",
+            target,
+            ContainerOperation::Restart,
+            "Restart",
+        ))
+}
+
+fn container_button(
+    cx: &mut Context<DevOpsPanel>,
+    kind: &'static str,
+    target: &str,
+    operation: ContainerOperation,
+    label: &'static str,
+) -> Button {
+    let target = target.to_string();
+    Button::new(format!("{kind}-{target}"), label)
+        .size(ButtonSize::Compact)
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.run_container_action(target.clone(), operation, cx);
+        }))
 }
 
 fn driver_label(driver: ContainerDriver) -> &'static str {
@@ -286,6 +588,19 @@ fn format_ping(latency: &Duration) -> String {
     }
 }
 
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86400;
+    let hours = (seconds % 86400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -303,6 +618,11 @@ fn format_bytes(bytes: u64) -> String {
 
 impl Render for DevOpsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let reason_bar = self
+            .pending
+            .as_ref()
+            .map(|pending| self.render_reason_bar(pending, cx));
+
         v_flex()
             .size_full()
             .child(
@@ -327,12 +647,13 @@ impl Render for DevOpsPanel {
                     .child(
                         list(
                             self.list_state.clone(),
-                            cx.processor(|this, ix, _window, _cx| this.render_row(ix)),
+                            cx.processor(|this, ix, _window, cx| this.render_row(ix, cx)),
                         )
                         .size_full(),
                     )
                     .vertical_scrollbar_for(&self.list_state, window, cx),
             )
+            .when_some(reason_bar, |this, bar| this.child(bar))
     }
 }
 
