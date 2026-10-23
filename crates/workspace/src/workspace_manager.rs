@@ -78,6 +78,115 @@ pub struct ManagedWorkspaceProject {
     pub remote_connection_id: Option<i64>,
 }
 
+/// An in-memory snapshot of `managed_workspace_projects`, built from a single
+/// query. Hot reload paths (thread tagging, window identity) build one of these
+/// per reload and resolve every path set against it, instead of issuing one
+/// full table scan per set.
+#[derive(Default)]
+pub struct MembershipIndex {
+    exact: collections::HashMap<Vec<String>, ManagedWorkspaceId>,
+    supersets: Vec<(ManagedWorkspaceId, collections::HashSet<String>)>,
+}
+
+impl MembershipIndex {
+    /// Resolve the workspace whose membership is exactly the given folder set.
+    pub fn workspace_id_for_paths(&self, paths: &PathList) -> Option<ManagedWorkspaceId> {
+        if paths.is_empty() {
+            return None;
+        }
+        let mut target = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        target.sort();
+        self.exact.get(&target).copied()
+    }
+
+    /// Resolve the workspace that best represents the given folder set: exact
+    /// first, then the closest superset by extra-folder count, then the
+    /// workspace with the strongest path overlap. The overlap step keeps a
+    /// thread attached after its workspace changes shape: its saved paths then
+    /// name worktrees the workspace has since removed, so it is neither an
+    /// exact match nor a subset. This is the in-memory counterpart of the
+    /// live-table lookup in [`WorkspaceManager::workspace_id_for_paths_relaxed`];
+    /// the two must agree.
+    pub fn workspace_id_for_paths_relaxed(&self, paths: &PathList) -> Option<ManagedWorkspaceId> {
+        if let Some(id) = self.workspace_id_for_paths(paths) {
+            return Some(id);
+        }
+        if paths.is_empty() {
+            return None;
+        }
+        let target = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<collections::HashSet<_>>();
+        let mut closest: Option<(usize, ManagedWorkspaceId)> = None;
+        for (id, member_set) in &self.supersets {
+            if member_set.len() < target.len() || !target.is_subset(member_set) {
+                continue;
+            }
+            let extra = member_set.len() - target.len();
+            if closest.map_or(true, |(closest_extra, _)| extra < closest_extra) {
+                closest = Some((extra, *id));
+            }
+        }
+        closest
+            .map(|(_, id)| id)
+            .or_else(|| self.best_overlap_workspace(&target))
+    }
+
+    /// The workspace that best represents `paths` by overlap, used when no
+    /// workspace is an exact or superset match. Accept a clear majority overlap
+    /// (Jaccard similarity at least 1/2) or a near superset (at least 80% of
+    /// the smaller set), and require two shared paths so one coincidence cannot
+    /// move a thread to another project. Keep this in lockstep with the
+    /// live-table overlap step in
+    /// [`WorkspaceManager::workspace_id_for_paths_relaxed`].
+    fn best_overlap_workspace(
+        &self,
+        paths: &collections::HashSet<String>,
+    ) -> Option<ManagedWorkspaceId> {
+        let mut candidates: Vec<(f64, usize, usize, String, ManagedWorkspaceId)> = self
+            .supersets
+            .iter()
+            .filter_map(|(workspace_id, members)| {
+                let overlap = paths.intersection(members).count();
+                if overlap < 2 {
+                    return None;
+                }
+                let union = paths.union(members).count();
+                let jaccard = overlap as f64 / union as f64;
+                let smaller = paths.len().min(members.len());
+                if jaccard < 0.5 && overlap * 5 < smaller * 4 {
+                    return None;
+                }
+                Some((
+                    jaccard,
+                    overlap,
+                    members.len().saturating_sub(overlap),
+                    workspace_id.to_key_string(),
+                    *workspace_id,
+                ))
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+
+        candidates
+            .first()
+            .map(|(_, _, _, _, workspace_id)| *workspace_id)
+    }
+}
+
 /// A managed workspace that contains a folder being opened — one option in the
 /// open-folder ask.
 #[derive(Debug, Clone)]
@@ -284,6 +393,35 @@ impl WorkspaceManager {
         best_overlap_workspace(&target, &by_workspace)
             .map(|workspace_id| ManagedWorkspaceId::from_key_string(&workspace_id))
             .transpose()
+    }
+
+    /// Build a single-query snapshot of the managed-workspace membership for
+    /// [`MembershipIndex`], so a caller that resolves many path sets (a thread
+    /// reload, a window restore) pays one scan instead of one per set.
+    pub fn membership_index(&self) -> Result<MembershipIndex> {
+        let rows = self
+            .select_bound::<(), (String, String)>(sql! {
+                SELECT workspace_id, path FROM managed_workspace_projects ORDER BY workspace_id, position
+            })?
+            (())?;
+
+        let mut by_workspace: collections::HashMap<String, Vec<String>> =
+            collections::HashMap::default();
+        for (workspace_id, path) in rows {
+            by_workspace.entry(workspace_id).or_default().push(path);
+        }
+
+        let mut index = MembershipIndex::default();
+        for (workspace_id, project_paths) in by_workspace {
+            let id = ManagedWorkspaceId::from_key_string(&workspace_id)?;
+            let mut sorted = project_paths.clone();
+            sorted.sort();
+            index.exact.insert(sorted, id);
+            index
+                .supersets
+                .push((id, project_paths.into_iter().collect()));
+        }
+        Ok(index)
     }
 
     /// Create a managed workspace for the given paths unless one with identical
@@ -563,4 +701,43 @@ mod tests {
             Some("a-workspace".to_string())
         );
     }
+
+    #[test]
+    fn membership_index_relaxed_resolves_drifted_paths_by_overlap() {
+        let main_id = ManagedWorkspaceId::new();
+        let test_id = ManagedWorkspaceId::new();
+
+        let mut index = MembershipIndex::default();
+        index
+            .supersets
+            .push((main_id, set(&["/a", "/b", "/c", "/d"])));
+        index.supersets.push((test_id, set(&["/a", "/b"])));
+
+        // The thread's saved paths name worktrees the workspace has since
+        // dropped: "/stale" is gone, so the set is neither an exact match nor a
+        // subset of `main`. Overlap must still resolve it to `main`.
+        let paths = PathList::new(&[
+            Path::new("/a"),
+            Path::new("/b"),
+            Path::new("/c"),
+            Path::new("/stale"),
+        ]);
+
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&paths),
+            Some(main_id)
+        );
+    }
+
+    #[test]
+    fn membership_index_relaxed_ignores_a_single_shared_path() {
+        let main_id = ManagedWorkspaceId::new();
+        let mut index = MembershipIndex::default();
+        index.supersets.push((main_id, set(&["/a", "/b", "/c"])));
+
+        let paths = PathList::new(&[Path::new("/a"), Path::new("/unrelated")]);
+
+        assert_eq!(index.workspace_id_for_paths_relaxed(&paths), None);
+    }
 }
+

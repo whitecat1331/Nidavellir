@@ -725,7 +725,8 @@ impl ThreadMetadataStore {
     }
 
     /// Replace the in-memory cache with the given rows, and rebuild the
-    /// managed-workspace index from their folder paths.
+    /// managed-workspace index from their folder paths. The membership index is
+    /// resolved once per reload, not once per thread.
     fn apply_rows(&mut self, rows: Vec<ThreadMetadata>, cx: &App) {
         self.threads.clear();
         self.threads_by_paths.clear();
@@ -737,15 +738,20 @@ impl ThreadMetadataStore {
             self.cache_thread_metadata(row);
         }
 
+        let index = if self.threads.is_empty() {
+            None
+        } else {
+            WorkspaceManager::global(cx).membership_index().log_err()
+        };
+
         let workspace_threads: Vec<(ManagedWorkspaceId, ThreadId)> = self
             .threads
             .iter()
             .filter_map(|(thread_id, metadata)| {
                 let workspace_id = metadata.workspace_id.or_else(|| {
-                    WorkspaceManager::global(cx)
-                        .workspace_id_for_paths_relaxed(metadata.folder_paths())
-                        .log_err()
-                        .flatten()
+                    index.as_ref().and_then(|index| {
+                        index.workspace_id_for_paths_relaxed(metadata.folder_paths())
+                    })
                 });
                 workspace_id.map(|workspace_id| (workspace_id, *thread_id))
             })

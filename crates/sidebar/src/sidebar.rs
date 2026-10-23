@@ -1551,6 +1551,8 @@ impl Sidebar {
             }
         }
 
+        let membership_index = WorkspaceManager::global(cx).membership_index().log_err();
+
         for group in &groups {
             let group_key = &group.key;
             let group_workspaces = &group.workspaces;
@@ -1747,10 +1749,9 @@ impl Sidebar {
                     .filter(|active| group_workspaces.contains(active))
                     .cloned()
                     .or_else(|| group_workspaces.first().cloned());
-                if let Some(group_workspace_id) = WorkspaceManager::global(cx)
-                    .workspace_id_for_paths_relaxed(group_key.path_list())
-                    .log_err()
-                    .flatten()
+                if let Some(group_workspace_id) = membership_index
+                    .as_ref()
+                    .and_then(|index| index.workspace_id_for_paths_relaxed(group_key.path_list()))
                 {
                     for row in thread_store
                         .read(cx)
