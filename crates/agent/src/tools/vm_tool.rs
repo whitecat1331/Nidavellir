@@ -611,6 +611,41 @@ pub async fn vm_operation(
     .await
 }
 
+/// Powers a VM off: graceful shutdown first, then a hard stop if the guest
+/// ignores ACPI. A `shutdown` task can report success while the VM is still
+/// `running` (`poll_task` does not inspect `exitstatus`), so re-check the live
+/// status before declaring success and fall back to a hard stop.
+pub async fn vm_stop(
+    cx: &AsyncApp,
+    target: String,
+    vmid: u32,
+) -> Result<VmToolOutput, VmToolOutput> {
+    vm_operation(
+        cx,
+        target.clone(),
+        VmOperation::Shutdown,
+        Some(vmid),
+        true,
+        None,
+    )
+    .await?;
+
+    let http_client = cx.update(|cx| cx.http_client());
+    let statuses = vm_statuses(cx, http_client).await;
+    let still_running = statuses.iter().any(|status| {
+        status.node == target
+            && status.vmid == vmid.to_string()
+            && status.state.as_deref() == Some("running")
+    });
+
+    if still_running {
+        return vm_operation(cx, target, VmOperation::Stop, Some(vmid), true, None).await;
+    }
+    Ok(VmToolOutput::Success {
+        message: format!("VM {vmid} stopped"),
+    })
+}
+
 /// Resolves the HTTP client for the API transport: the shared client by
 /// default, or a pinned client when the target's `tls_ca` names a PEM file of
 /// certificates to trust (e.g. a hypervisor's self-signed node certs).

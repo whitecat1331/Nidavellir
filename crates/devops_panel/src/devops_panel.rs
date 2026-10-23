@@ -4,7 +4,6 @@ use std::time::Duration;
 use agent::containers::{ContainerDriver, ContainerOperation};
 use agent::vms::VmOperation;
 use agent::{ContainerStatus, Reachability, VmNodeStatus, VmStatus};
-use editor::Editor;
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
     ListState, Render, Task, WeakEntity, Window, actions, list, px,
@@ -26,23 +25,15 @@ pub struct DevOpsPanel {
     focus_handle: FocusHandle,
     list_state: ListState,
     rows: Vec<Row>,
-    pending: Option<PendingAction>,
+    last_error: Option<String>,
     _refresh_task: Task<()>,
-}
-
-/// A danger-tier VM lifecycle action awaiting a reason from the user.
-struct PendingAction {
-    editor: Entity<Editor>,
-    target: String,
-    vmid: u32,
-    operation: VmOperation,
 }
 
 /// One rendered row in the flat list backing the panel.
 enum Row {
     SectionHeader(String),
     NodeHeader(VmNodeStatus),
-    Vm { status: VmStatus, node_danger: bool },
+    Vm(VmStatus),
     HostHeader(String),
     Container(ContainerStatus),
 }
@@ -66,7 +57,7 @@ impl DevOpsPanel {
                 focus_handle: cx.focus_handle(),
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
                 rows: Vec::new(),
-                pending: None,
+                last_error: None,
                 _refresh_task: Task::ready(()),
             };
             this.schedule_refresh(cx);
@@ -112,20 +103,27 @@ impl DevOpsPanel {
         target: String,
         vmid: u32,
         operation: VmOperation,
-        danger: bool,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if danger && matches!(operation, VmOperation::Shutdown | VmOperation::Reboot) {
-            self.begin_reason_prompt(target, vmid, operation, window, cx);
-            return;
-        }
+        // "Stop" is graceful-then-verified-then-hard: a completed shutdown task
+        // does not guarantee the guest actually powered off, so `vm_stop`
+        // re-checks the live status and falls back to a hard stop.
+        let is_stop = matches!(operation, VmOperation::Shutdown);
         cx.spawn(async move |this, cx| {
-            match agent::vm_operation(cx, target, operation, Some(vmid), true, None).await {
-                Ok(_) => {}
-                Err(error) => log::error!("vm {operation:?} failed: {error:?}"),
-            }
-            this.update(cx, |panel, cx| panel.schedule_refresh(cx)).ok();
+            let result = if is_stop {
+                agent::vm_stop(cx, target, vmid).await
+            } else {
+                agent::vm_operation(cx, target, operation, Some(vmid), true, None).await
+            };
+            let error = result.err().map(|output| match output {
+                agent::VmToolOutput::Success { message } => message,
+                agent::VmToolOutput::Error { error } => error,
+            });
+            this.update(cx, |panel, cx| {
+                panel.last_error = error;
+                panel.schedule_refresh(cx);
+            })
+            .ok();
         })
         .detach();
     }
@@ -137,114 +135,31 @@ impl DevOpsPanel {
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
-            match agent::container_operation(target, operation, None, true).await {
-                Ok(_) => {}
-                Err(error) => log::error!("container {operation:?} failed: {error:?}"),
-            }
-            this.update(cx, |panel, cx| panel.schedule_refresh(cx)).ok();
+            let error = match agent::container_operation(target, operation, None, true).await {
+                Ok(_) => None,
+                Err(output) => Some(match output {
+                    agent::ContainerToolOutput::Success { message } => message,
+                    agent::ContainerToolOutput::Error { error } => error,
+                }),
+            };
+            this.update(cx, |panel, cx| {
+                panel.last_error = error;
+                panel.schedule_refresh(cx);
+            })
+            .ok();
         })
         .detach();
-    }
-
-    fn begin_reason_prompt(
-        &mut self,
-        target: String,
-        vmid: u32,
-        operation: VmOperation,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Reason (required)", window, cx);
-            editor
-        });
-        self.pending = Some(PendingAction {
-            editor,
-            target,
-            vmid,
-            operation,
-        });
-        cx.notify();
-        let focus_handle = self
-            .pending
-            .as_ref()
-            .map(|pending| pending.editor.focus_handle(cx));
-        if let Some(focus_handle) = focus_handle {
-            focus_handle.focus(window, cx);
-        }
-    }
-
-    fn confirm_pending(&mut self, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        let reason = pending.editor.read(cx).text(cx);
-        let reason = reason.trim().to_string();
-        if reason.is_empty() {
-            return;
-        }
-        let target = pending.target.clone();
-        let vmid = pending.vmid;
-        let operation = pending.operation;
-        cx.spawn(async move |this, cx| {
-            match agent::vm_operation(cx, target, operation, Some(vmid), true, Some(reason)).await {
-                Ok(_) => {}
-                Err(error) => log::error!("vm {operation:?} failed: {error:?}"),
-            }
-            this.update(cx, |panel, cx| panel.schedule_refresh(cx)).ok();
-        })
-        .detach();
-    }
-
-    fn cancel_pending(&mut self, cx: &mut Context<Self>) {
-        self.pending = None;
-        cx.notify();
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         match self.rows.get(ix) {
             Some(Row::SectionHeader(title)) => section_header(title).into_any_element(),
             Some(Row::NodeHeader(node)) => render_node_header(node).into_any_element(),
-            Some(Row::Vm {
-                status,
-                node_danger,
-            }) => render_vm_row(status, *node_danger, cx).into_any_element(),
+            Some(Row::Vm(status)) => render_vm_row(status, cx).into_any_element(),
             Some(Row::HostHeader(host)) => render_host_header(host).into_any_element(),
             Some(Row::Container(status)) => render_container_row(status, cx).into_any_element(),
             None => div().h_full().into_any_element(),
         }
-    }
-
-    fn render_reason_bar(&self, pending: &PendingAction, cx: &mut Context<Self>) -> Div {
-        h_flex()
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                Label::new("Reason (required)")
-                    .size(LabelSize::Small)
-                    .color(Color::Warning),
-            )
-            .child(div().flex_1().min_h_0().child(pending.editor.clone()))
-            .child(
-                Button::new("devops-reason-confirm", "Confirm").on_click(cx.listener(
-                    |this, _event, _window, cx| {
-                        this.confirm_pending(cx);
-                    },
-                )),
-            )
-            .child(
-                Button::new("devops-reason-cancel", "Cancel").on_click(cx.listener(
-                    |this, _event, _window, cx| {
-                        this.cancel_pending(cx);
-                    },
-                )),
-            )
     }
 }
 
@@ -264,10 +179,7 @@ fn build_rows(
     for node in vm_node_statuses {
         rows.push(Row::NodeHeader(node.clone()));
         for status in vm_statuses.iter().filter(|status| status.node == node.node) {
-            rows.push(Row::Vm {
-                status: status.clone(),
-                node_danger: node.danger,
-            });
+            rows.push(Row::Vm(status.clone()));
         }
     }
 
@@ -303,28 +215,34 @@ fn render_node_header(node: &VmNodeStatus) -> Div {
     } else {
         node.node.clone()
     };
-    let (summary, summary_color) = match &node.error {
+    let (resource, resource_color) = match &node.error {
         Some(_) => ("unreachable".to_string(), Color::Error),
         None => (node_resource_summary(node), Color::Muted),
     };
-    h_flex()
+    v_flex()
         .h_full()
         .px_2()
-        .justify_between()
-        .child(
-            Label::new(name)
-                .size(LabelSize::Small)
-                .weight(FontWeight::SEMIBOLD),
-        )
+        .py_1()
+        .gap_0p5()
         .child(
             h_flex()
+                .w_full()
+                .min_w_0()
+                .justify_between()
                 .gap_2()
                 .child(
-                    Label::new(summary)
+                    Label::new(name)
                         .size(LabelSize::Small)
-                        .color(summary_color),
+                        .weight(FontWeight::SEMIBOLD)
+                        .truncate(),
                 )
                 .child(ping_label(&node.ping)),
+        )
+        .child(
+            Label::new(resource)
+                .size(LabelSize::Small)
+                .color(resource_color)
+                .truncate(),
         )
 }
 
@@ -360,15 +278,9 @@ fn node_resource_summary(node: &VmNodeStatus) -> String {
     }
 }
 
-fn render_vm_row(status: &VmStatus, node_danger: bool, cx: &mut Context<DevOpsPanel>) -> Div {
-    let danger = status.danger || node_danger;
-    let (state_text, color) = match (&status.state, &status.error) {
-        (Some(state), _) if state == "running" => ("running".to_string(), Color::Success),
-        (Some(state), _) => (state.clone(), Color::Warning),
-        (None, Some(_)) => ("unreachable".to_string(), Color::Error),
-        (None, None) => ("unknown".to_string(), Color::Muted),
-    };
-    let name = if danger {
+fn render_vm_row(status: &VmStatus, cx: &mut Context<DevOpsPanel>) -> Div {
+    let (state_text, color) = vm_state(status);
+    let name = if status.danger {
         format!("{} ⚠", status.name)
     } else {
         status.name.clone()
@@ -381,21 +293,40 @@ fn render_vm_row(status: &VmStatus, node_danger: bool, cx: &mut Context<DevOpsPa
         .h_full()
         .pl_4()
         .pr_2()
+        .gap_2()
+        .min_w_0()
         .justify_between()
         .child(
-            h_flex().gap_2().child(Label::new(name)).child(
-                Label::new(detail)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            ),
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .child(Label::new(name).truncate())
+                .child(
+                    Label::new(detail)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                ),
         )
         .child(
             h_flex()
                 .gap_2()
                 .items_center()
                 .child(Label::new(state_text).color(color))
-                .child(vm_buttons(cx, &target, vmid, danger)),
+                .child(vm_buttons(cx, &target, vmid)),
         )
+}
+
+/// Maps a VM's live Proxmox state to a display label + colour. A `stopped` VM
+/// is rendered as `off` so a powered-off guest reads unambiguously.
+fn vm_state(status: &VmStatus) -> (String, Color) {
+    match (&status.state, &status.error) {
+        (Some(state), _) if state == "running" => ("running".to_string(), Color::Success),
+        (Some(state), _) if state == "stopped" => ("off".to_string(), Color::Muted),
+        (Some(state), _) => (state.clone(), Color::Warning),
+        (None, Some(_)) => ("unreachable".to_string(), Color::Error),
+        (None, None) => ("unknown".to_string(), Color::Muted),
+    }
 }
 
 fn vm_detail(status: &VmStatus) -> String {
@@ -419,7 +350,7 @@ fn vm_detail(status: &VmStatus) -> String {
     parts.join(" · ")
 }
 
-fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32, danger: bool) -> Div {
+fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32) -> Div {
     h_flex()
         .gap_1()
         .child(vm_button(
@@ -428,7 +359,6 @@ fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32, danger: bo
             target,
             vmid,
             VmOperation::Start,
-            danger,
             "Start",
         ))
         .child(vm_button(
@@ -437,7 +367,6 @@ fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32, danger: bo
             target,
             vmid,
             VmOperation::Shutdown,
-            danger,
             "Stop",
         ))
         .child(vm_button(
@@ -446,7 +375,6 @@ fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32, danger: bo
             target,
             vmid,
             VmOperation::Reboot,
-            danger,
             "Restart",
         ))
 }
@@ -457,14 +385,13 @@ fn vm_button(
     target: &str,
     vmid: u32,
     operation: VmOperation,
-    danger: bool,
     label: &'static str,
 ) -> Button {
     let target = target.to_string();
     Button::new(format!("{kind}-{target}-{vmid}"), label)
         .size(ButtonSize::Compact)
-        .on_click(cx.listener(move |this, _event, window, cx| {
-            this.run_vm_action(target.clone(), vmid, operation, danger, window, cx);
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.run_vm_action(target.clone(), vmid, operation, cx);
         }))
 }
 
@@ -472,7 +399,8 @@ fn render_host_header(host: &str) -> Div {
     h_flex().h_full().px_2().justify_between().child(
         Label::new(format!("host · {host}"))
             .size(LabelSize::Small)
-            .weight(FontWeight::SEMIBOLD),
+            .weight(FontWeight::SEMIBOLD)
+            .truncate(),
     )
 }
 
@@ -490,13 +418,20 @@ fn render_container_row(status: &ContainerStatus, cx: &mut Context<DevOpsPanel>)
         .h_full()
         .pl_4()
         .pr_2()
+        .gap_2()
+        .min_w_0()
         .justify_between()
         .child(
-            h_flex().gap_2().child(Label::new(name)).child(
-                Label::new(detail)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            ),
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .child(Label::new(name).truncate())
+                .child(
+                    Label::new(detail)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                ),
         )
         .child(
             h_flex()
@@ -618,11 +553,6 @@ fn format_bytes(bytes: u64) -> String {
 
 impl Render for DevOpsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let reason_bar = self
-            .pending
-            .as_ref()
-            .map(|pending| self.render_reason_bar(pending, cx));
-
         v_flex()
             .size_full()
             .child(
@@ -639,6 +569,16 @@ impl Render for DevOpsPanel {
                         )),
                     ),
             )
+            .when_some(self.last_error.clone(), |this, error| {
+                this.child(
+                    h_flex().px_2().pb_1().child(
+                        Label::new(error)
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                            .truncate(),
+                    ),
+                )
+            })
             .child(
                 div()
                     .id("devops-rows")
@@ -653,7 +593,6 @@ impl Render for DevOpsPanel {
                     )
                     .vertical_scrollbar_for(&self.list_state, window, cx),
             )
-            .when_some(reason_bar, |this, bar| this.child(bar))
     }
 }
 
