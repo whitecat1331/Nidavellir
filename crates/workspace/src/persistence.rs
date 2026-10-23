@@ -1130,6 +1130,17 @@ impl Domain for WorkspaceDb {
                 lower(hex(randomblob(6)))
             WHERE workspace_uuid IS NULL OR workspace_uuid = "";
         ),
+        // Path-based lookups: index the membership-by-path query (open-folder
+        // ask) and restore the legacy layout location index that was dropped as
+        // a unique index. Non-unique on purpose — a layout must survive
+        // membership drift, which is why the unique index was removed.
+        sql!(
+            CREATE INDEX IF NOT EXISTS idx_managed_workspace_projects_path
+            ON managed_workspace_projects(path);
+
+            CREATE INDEX IF NOT EXISTS ix_workspaces_location
+            ON workspaces(remote_connection_id, paths);
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -4426,6 +4437,76 @@ mod tests {
             manager.projects(workspace_id).unwrap().len(),
             1,
             "a remote member must never be pruned"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_membership_index_matches_legacy_scan(_cx: &mut gpui::TestAppContext) {
+        let db = WorkspaceDb::open_test_db("test_membership_index_matches_legacy_scan").await;
+        let manager = WorkspaceManager::new(db.clone());
+
+        let exact_ws = manager
+            .create(
+                "Exact".into(),
+                vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            )
+            .await
+            .unwrap();
+        let superset_ws = manager
+            .create(
+                "Superset".into(),
+                vec![
+                    PathBuf::from("/a"),
+                    PathBuf::from("/b"),
+                    PathBuf::from("/c"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let index = manager.membership_index().unwrap();
+
+        let exact_paths = PathList::new(&["/a", "/b"]);
+        assert_eq!(index.workspace_id_for_paths(&exact_paths), Some(exact_ws));
+        assert_eq!(
+            manager.workspace_id_for_paths(&exact_paths).unwrap(),
+            Some(exact_ws),
+            "the in-memory index must agree with the legacy exact scan"
+        );
+
+        // `/a` is a subset of both workspaces; the closest (extra = 1) wins.
+        let subset = PathList::new(&["/a"]);
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&subset),
+            Some(exact_ws)
+        );
+        assert_eq!(
+            manager.workspace_id_for_paths_relaxed(&subset).unwrap(),
+            Some(exact_ws),
+            "the in-memory index must agree with the legacy relaxed scan"
+        );
+
+        // A set equal to the larger workspace's membership resolves to it.
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&PathList::new(&["/a", "/b", "/c"])),
+            Some(superset_ws)
+        );
+
+        assert_eq!(
+            index.workspace_id_for_paths(&PathList::new::<&str>(&[])),
+            None
+        );
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&PathList::new::<&str>(&[])),
+            None
+        );
+        assert_eq!(
+            index.workspace_id_for_paths(&PathList::new(&["/nope"])),
+            None
+        );
+        assert_eq!(
+            index.workspace_id_for_paths_relaxed(&PathList::new(&["/nope"])),
+            None
         );
     }
 

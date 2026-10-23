@@ -1306,6 +1306,46 @@ impl MultiWorkspace {
         cx.notify();
     }
 
+    /// Maximum number of retained (pinned, non-active) workspaces held alive
+    /// in this window. Each keeps a live `Project`, so the set is bounded and
+    /// the lowest `activated_at` is evicted past the cap. Override with
+    /// `ZED_WORKSPACE_RETAIN_CAP`.
+    const DEFAULT_WORKSPACE_RETAIN_CAP: usize = 8;
+
+    fn workspace_retain_cap() -> usize {
+        std::env::var("ZED_WORKSPACE_RETAIN_CAP")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(Self::DEFAULT_WORKSPACE_RETAIN_CAP)
+    }
+
+    /// Evict the least-recently-activated retained workspaces past the cap.
+    /// The active workspace always carries the max stamp, so it is never
+    /// evicted and `detach_workspace`'s displayed-index guard cannot fire.
+    fn enforce_retention_cap(&mut self, cx: &mut Context<Self>) {
+        let cap = Self::workspace_retain_cap();
+        let displayed = self.displayed_index();
+        let mut evictable: Vec<(u64, Entity<Workspace>)> = self
+            .held
+            .iter()
+            .enumerate()
+            .filter(|(index, held)| *index != displayed && held.pinned)
+            .filter_map(|(_, held)| {
+                held.activated_at
+                    .map(|stamp| (stamp, held.workspace.clone()))
+            })
+            .collect();
+        if evictable.len() <= cap {
+            return;
+        }
+        evictable.sort_by_key(|(stamp, _)| *stamp);
+        let overflow = evictable.len() - cap;
+        for (_, workspace) in evictable.into_iter().take(overflow) {
+            self.detach_workspace(&workspace, cx);
+        }
+    }
+
     /// Ensures the workspace is in the multiworkspace and makes it the active one.
     pub fn activate(
         &mut self,
@@ -1360,6 +1400,7 @@ impl MultiWorkspace {
         });
 
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });
+        self.enforce_retention_cap(cx);
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
         cx.notify();

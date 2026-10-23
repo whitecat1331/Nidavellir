@@ -44,7 +44,8 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 pub use workspace_manager::{
-    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, WorkspaceManager,
+    AskCandidate, ManagedWorkspace, ManagedWorkspaceId, ManagedWorkspaceProject, MembershipIndex,
+    WorkspaceManager,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -11364,6 +11365,32 @@ pub fn open_managed_workspace_paths(
     let requesting_window = cx
         .active_window()
         .and_then(|window| window.downcast::<MultiWorkspace>());
+
+    // Activate an already-open workspace with this identity tag instead of
+    // rebuilding its project. The lookup is window-local: dual-open is allowed,
+    // so we never reach across windows or instances.
+    if let Some(window) = requesting_window.as_ref() {
+        let activated = window
+            .update(cx, |multi_workspace, window, cx| {
+                let existing = multi_workspace
+                    .workspaces()
+                    .find(|workspace| {
+                        workspace.read(cx).managed_workspace_id() == Some(workspace_id)
+                    })
+                    .cloned();
+                if let Some(existing) = existing {
+                    multi_workspace.activate(existing, None, window, cx);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if activated {
+            return;
+        }
+    }
+
     let options = OpenOptions {
         requesting_window,
         open_mode: OpenMode::Activate,
