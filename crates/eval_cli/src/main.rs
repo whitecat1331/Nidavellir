@@ -575,6 +575,11 @@ mod tests {
             Some("allow"),
             "eval must auto-allow the git tool (default.json gives it a per-tool confirm)"
         );
+        assert_eq!(
+            value["agent"]["sandbox_permissions"]["allow_unsandboxed"].as_bool(),
+            Some(true),
+            "eval must run the terminal unsandboxed (the sandboxed launcher rejects eval-cli)"
+        );
     }
 
     #[test]
@@ -631,6 +636,7 @@ fn synthesized_settings_json(
                     "language_models": {language_models_settings},
                     "agent": {{
                         "tool_permissions": {{"default": "allow", "tools": {{"git": {{"default": "allow"}}}}}},
+                        "sandbox_permissions": {{"allow_unsandboxed": true, "allow_all_hosts": true}},
                         "default_model": {{
                             "provider": "{provider_id}",
                             "model": "{model_id}",
