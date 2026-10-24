@@ -4,14 +4,12 @@ use std::time::{Duration, Instant};
 use agent::containers::{ContainerDriver, ContainerOperation};
 use agent::vms::VmOperation;
 use agent::{ContainerStatus, DevOpsConfig, PingStatuses, Reachability, VmNodeStatus, VmStatus};
+use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
-    ListState, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
+    ListState, Pixels, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
 };
-use ui::{
-    Button, ButtonSize, Checkbox, ContextMenu, DropdownMenu, IconName, Label, LabelSize,
-    WithScrollbar, prelude::*,
-};
+use ui::{Button, ButtonSize, Checkbox, IconName, Label, LabelSize, WithScrollbar, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -20,8 +18,14 @@ actions!(devops, [ToggleDevOpsPanel]);
 const DEVOPS_PANEL_KEY: &str = "DevOpsPanel";
 /// How often the scheduler wakes to check whether a signal is due.
 const SCHEDULER_TICK: Duration = Duration::from_millis(500);
-/// Interval presets offered by the three interval dropdowns, in seconds.
-const INTERVAL_PRESETS_SECS: &[u64] = &[1, 2, 5, 10, 15, 30, 60, 120, 300];
+/// Upper bound for a parsed poll interval (one year). Any longer interval could
+/// overflow the scheduler's `Instant + Duration` arithmetic; this is far beyond
+/// any sane poll cadence and just guards against a panic.
+const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+/// Fixed column widths so the dock reads as a stable grid.
+const NAME_COL_WIDTH: Pixels = px(140.);
+const STATE_COL_WIDTH: Pixels = px(84.);
+const PING_COL_WIDTH: Pixels = px(56.);
 
 /// A bottom-dock panel showing the health of every VM and container registered
 /// in the seeded vms.json / containers.json. It holds no infra of its own; the
@@ -38,6 +42,9 @@ pub struct DevOpsPanel {
     vm_reports: Vec<VmStatus>,
     container_reports: Vec<ContainerStatus>,
     active: bool,
+    ping_editor: Entity<Editor>,
+    proxmox_editor: Entity<Editor>,
+    container_editor: Entity<Editor>,
     _task: Task<()>,
 }
 
@@ -69,7 +76,7 @@ impl EventEmitter<PanelEvent> for DevOpsPanel {}
 impl DevOpsPanel {
     pub fn new(
         _workspace: &Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -77,6 +84,20 @@ impl DevOpsPanel {
                 log::error!("failed to load devops config, using defaults: {error}");
                 DevOpsConfig::default()
             });
+            let ping_editor =
+                new_interval_editor(IntervalKind::Ping, config.ping_interval_secs, window, cx);
+            let proxmox_editor = new_interval_editor(
+                IntervalKind::Proxmox,
+                config.proxmox_interval_secs,
+                window,
+                cx,
+            );
+            let container_editor = new_interval_editor(
+                IntervalKind::Container,
+                config.container_interval_secs,
+                window,
+                cx,
+            );
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
                 list_state: ListState::new(0, ListAlignment::Top, px(24.0)),
@@ -88,6 +109,9 @@ impl DevOpsPanel {
                 vm_reports: Vec::new(),
                 container_reports: Vec::new(),
                 active: false,
+                ping_editor,
+                proxmox_editor,
+                container_editor,
                 _task: Task::ready(()),
             };
             this.start_scheduler(cx);
@@ -115,6 +139,7 @@ impl DevOpsPanel {
             let mut next_ping = Instant::now();
             let mut next_proxmox = Instant::now();
             let mut next_container = Instant::now();
+            let mut initialized = false;
             loop {
                 let (running, ping_interval, proxmox_interval, container_interval) = match this
                     .read_with(cx, |panel, _cx| {
@@ -129,7 +154,30 @@ impl DevOpsPanel {
                     Err(_) => break,
                 };
                 let now = Instant::now();
-                if running {
+                if running && !initialized {
+                    let (pings, nodes, vms, containers) = futures::join!(
+                        agent::ping_statuses(cx),
+                        agent::vm_node_statuses(cx, http_client.clone()),
+                        agent::vm_statuses(cx, http_client.clone()),
+                        agent::container_statuses(),
+                    );
+                    if this
+                        .update(cx, |panel, cx| {
+                            panel.pings = pings;
+                            panel.node_reports = nodes;
+                            panel.vm_reports = vms;
+                            panel.container_reports = containers;
+                            panel.rebuild_rows(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    next_ping = Instant::now() + ping_interval;
+                    next_proxmox = Instant::now() + proxmox_interval;
+                    next_container = Instant::now() + container_interval;
+                    initialized = true;
+                } else if running {
                     if now >= next_ping {
                         let pings = agent::ping_statuses(cx).await;
                         if this
@@ -258,6 +306,33 @@ impl DevOpsPanel {
         cx.notify();
     }
 
+    fn current_interval_secs(&self, kind: IntervalKind) -> u64 {
+        match kind {
+            IntervalKind::Ping => self.config.ping_interval_secs,
+            IntervalKind::Proxmox => self.config.proxmox_interval_secs,
+            IntervalKind::Container => self.config.container_interval_secs,
+        }
+    }
+
+    /// Commits a free-form interval editor on blur. Invalid input reverts the
+    /// editor text to the previous interval without changing the config.
+    fn commit_interval(
+        &mut self,
+        kind: IntervalKind,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = editor.read(cx).text(cx);
+        match parse_interval(&text) {
+            Some(seconds) => self.set_interval(kind, seconds, cx),
+            None => {
+                let previous = format_interval(self.current_interval_secs(kind));
+                editor.update(cx, |editor, cx| editor.set_text(previous, window, cx));
+            }
+        }
+    }
+
     fn save_config(&self) {
         if let Err(error) = self.config.save(DevOpsConfig::default_path()) {
             log::error!("failed to save devops config: {error}");
@@ -282,49 +357,7 @@ impl DevOpsPanel {
         })
     }
 
-    fn interval_menu(
-        &self,
-        kind: IntervalKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> DropdownMenu {
-        let (id, label, current_secs) = match kind {
-            IntervalKind::Ping => (
-                "devops-ping-interval",
-                "ping",
-                self.config.ping_interval_secs,
-            ),
-            IntervalKind::Proxmox => (
-                "devops-proxmox-interval",
-                "proxmox",
-                self.config.proxmox_interval_secs,
-            ),
-            IntervalKind::Container => (
-                "devops-container-interval",
-                "docker",
-                self.config.container_interval_secs,
-            ),
-        };
-        let weak = cx.weak_entity();
-        DropdownMenu::new(
-            id,
-            format!("{label} {}", format_interval(current_secs)),
-            ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                let mut menu = menu;
-                for seconds in INTERVAL_PRESETS_SECS {
-                    let weak = weak.clone();
-                    let seconds = *seconds;
-                    menu = menu.entry(format_interval(seconds), None, move |_window, cx| {
-                        weak.update(cx, |this, cx| this.set_interval(kind, seconds, cx))
-                            .ok();
-                    });
-                }
-                menu
-            }),
-        )
-        .trigger_size(ButtonSize::Compact)
-    }
-
+    fn live_checkbox(&self, cx: &mut Context<Self>) -> Checkbox {
     fn run_vm_action(
         &mut self,
         target: String,
@@ -423,6 +456,47 @@ impl DevOpsPanel {
     }
 }
 
+/// Creates a single-line editor seeded with the current interval value, wired so
+/// that blurring it commits the (possibly invalid) typed duration.
+fn new_interval_editor(
+    kind: IntervalKind,
+    current_secs: u64,
+    window: &mut Window,
+    cx: &mut Context<DevOpsPanel>,
+) -> Entity<Editor> {
+    let editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_text(format_interval(current_secs), window, cx);
+        editor
+    });
+    cx.subscribe_in(
+        &editor,
+        window,
+        move |this, editor, event: &EditorEvent, window, cx| {
+            if matches!(event, EditorEvent::Blurred) {
+                this.commit_interval(kind, &editor, window, cx);
+            }
+        },
+    )
+    .detach();
+    editor
+}
+
+/// A fixed-width flex column cell so per-row stats and buttons align across the
+/// whole list.
+fn fixed_cell(width: Pixels, child: impl IntoElement) -> Div {
+    div().w(width).flex_shrink_0().child(child)
+}
+
+/// Renders one interval label plus its free-form single-line editor.
+fn interval_field(label: &'static str, editor: &Entity<Editor>) -> Div {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+        .child(div().w(px(64.)).child(editor.clone()))
+}
+
 /// Flattens the three status sweeps into the panel's row list, grouping VMs
 /// under their Proxmox node and containers under their SSH host.
 fn build_rows(
@@ -487,32 +561,29 @@ fn render_node_header(node: &VmNodeStatus, ping: Reachability) -> Stateful<Div> 
         Some(_) => ("unreachable".to_string(), Color::Error),
         None => (node_resource_summary(node), Color::Muted),
     };
-    v_flex()
+    h_flex()
         .id(format!("devops-node-{}", node.node))
         .h_full()
         .px_2()
         .py_1()
-        .gap_0p5()
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .justify_between()
-                .gap_2()
-                .child(
-                    Label::new(name)
-                        .size(LabelSize::Small)
-                        .weight(FontWeight::SEMIBOLD)
-                        .truncate(),
-                )
-                .child(ping_label(&ping)),
-        )
+        .gap_2()
+        .items_center()
+        .child(fixed_cell(
+            NAME_COL_WIDTH,
+            Label::new(name)
+                .size(LabelSize::Small)
+                .weight(FontWeight::SEMIBOLD)
+                .truncate(),
+        ))
         .child(
             Label::new(resource)
                 .size(LabelSize::Small)
                 .color(resource_color)
+                .flex_1()
                 .truncate(),
         )
+        .child(div().w(STATE_COL_WIDTH).flex_shrink_0())
+        .child(fixed_cell(PING_COL_WIDTH, ping_label(&ping)))
 }
 
 fn node_resource_summary(node: &VmNodeStatus) -> String {
@@ -568,28 +639,21 @@ fn render_vm_row(
         .pl_4()
         .pr_2()
         .gap_2()
-        .min_w_0()
-        .justify_between()
+        .items_center()
+        .child(fixed_cell(NAME_COL_WIDTH, Label::new(name).truncate()))
         .child(
-            h_flex()
-                .gap_2()
-                .min_w_0()
-                .child(Label::new(name).truncate())
-                .child(
-                    Label::new(detail)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                ),
+            Label::new(detail)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .flex_1()
+                .truncate(),
         )
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(Label::new(state_text).color(color))
-                .child(ping_label(&ping))
-                .child(vm_buttons(cx, &target, vmid)),
-        )
+        .child(fixed_cell(
+            STATE_COL_WIDTH,
+            Label::new(state_text).color(color),
+        ))
+        .child(fixed_cell(PING_COL_WIDTH, ping_label(&ping)))
+        .child(vm_buttons(cx, &target, vmid).flex_shrink_0())
 }
 
 /// Maps a VM's live Proxmox state to a display label + colour. A `stopped` VM
@@ -704,28 +768,21 @@ fn render_container_row(
         .pl_4()
         .pr_2()
         .gap_2()
-        .min_w_0()
-        .justify_between()
+        .items_center()
+        .child(fixed_cell(NAME_COL_WIDTH, Label::new(name).truncate()))
         .child(
-            h_flex()
-                .gap_2()
-                .min_w_0()
-                .child(Label::new(name).truncate())
-                .child(
-                    Label::new(detail)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                ),
+            Label::new(detail)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .flex_1()
+                .truncate(),
         )
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(Label::new(state_text).color(color))
-                .child(ping_label(&ping))
-                .child(container_buttons(cx, &target)),
-        )
+        .child(fixed_cell(
+            STATE_COL_WIDTH,
+            Label::new(state_text).color(color),
+        ))
+        .child(fixed_cell(PING_COL_WIDTH, ping_label(&ping)))
+        .child(container_buttons(cx, &target).flex_shrink_0())
 }
 
 fn container_detail(status: &ContainerStatus) -> String {
@@ -790,8 +847,34 @@ fn driver_label(driver: ContainerDriver) -> &'static str {
     }
 }
 
+fn parse_interval(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text.find(|character: char| !character.is_ascii_digit());
+    let (digits, unit) = match split {
+        Some(index) => (&text[..index], text[index..].trim()),
+        None => (text, ""),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    let multiplier = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return None,
+    };
+    let seconds = value.checked_mul(multiplier)?;
+    if seconds == 0 || seconds > MAX_INTERVAL_SECS {
+        return None;
+    }
+    Some(seconds)
+}
+
 fn format_interval(seconds: u64) -> String {
-    if seconds.is_multiple_of(60) {
+    if seconds.is_multiple_of(3600) {
+        format!("{}h", seconds / 3600)
+    } else if seconds.is_multiple_of(60) {
         format!("{}m", seconds / 60)
     } else {
         format!("{seconds}s")
@@ -859,9 +942,9 @@ impl Render for DevOpsPanel {
                             .gap_2()
                             .items_center()
                             .child(self.live_checkbox(cx))
-                            .child(self.interval_menu(IntervalKind::Ping, window, cx))
-                            .child(self.interval_menu(IntervalKind::Proxmox, window, cx))
-                            .child(self.interval_menu(IntervalKind::Container, window, cx)),
+                            .child(interval_field("ping", &self.ping_editor))
+                            .child(interval_field("proxmox", &self.proxmox_editor))
+                            .child(interval_field("docker", &self.container_editor)),
                     ),
             )
             .when_some(self.last_error.clone(), |this, error| {
