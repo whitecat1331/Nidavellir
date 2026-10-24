@@ -28,7 +28,14 @@ use crate::{
 /// - `state` — a JSON snapshot of the active thread, focused/agent message
 ///   editor text, and the active item.
 /// - `find` — list the registered, addressable UI selectors (optionally
-///   filtered by `selector`), with their ids, labels, visibility, and text.
+///   filtered by `selector`), with their ids, labels, visibility, and text,
+///   plus the matching accessibility-tree nodes (bounded by `limit`).
+/// - `snapshot` — walk the live accessibility tree and return a bounded,
+///   text-first view of the UI: role, label/value, a stable `#id` ref, and
+///   bounds for each node. `selector` filters, `limit` bounds the count,
+///   `x`/`y` resolve the deepest node under that point (`hit`), and `node`
+///   resolves a ref (`#id` or `role[name="…"]`) into `node` — an unresolved
+///   ref is an error, never a guess.
 /// - `click` — invoke a selector's handler directly by `selector` id (no
 ///   synthetic mouse event, no foreground dependency).
 /// - `assert` — check a selector's `expect_text` and/or `expect_visible`.

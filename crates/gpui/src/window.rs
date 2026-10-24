@@ -66,7 +66,7 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
-pub use a11y::A11ySubtreeBuilder;
+pub use a11y::{A11yNodeSnapshot, A11ySnapshot, A11ySubtreeBuilder};
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -3347,10 +3347,14 @@ impl Window {
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
+        let a11y_really_active_start = self.a11y.is_really_active();
         self.a11y.sync_active_flag();
-        let a11y_active_end_of_frame = self.a11y.is_active();
+        let a11y_really_active_end = self.a11y.is_really_active();
 
-        let should_send_a11y_update = a11y_active_start_of_frame && a11y_active_end_of_frame;
+        // A forced tree (dev tooling) is for in-process observation only: it is
+        // sent to the platform only when a real adapter is attached at both
+        // ends of the frame.
+        let should_send_a11y_update = a11y_really_active_start && a11y_really_active_end;
 
         if a11y_active_start_of_frame {
             // Harvest frame metadata for the debug dump while the live window
@@ -6593,6 +6597,70 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// Force the in-process accessibility tree to be built every frame, even
+    /// when no assistive technology is connected.
+    ///
+    /// Dev tooling (`window_control`) uses this to observe the UI. The tree is
+    /// never sent to the platform unless a real assistive technology is active.
+    pub fn set_a11y_forced(&mut self, forced: bool) {
+        self.a11y.set_forced_active(forced);
+        self.refresh();
+    }
+
+    /// A snapshot of the last frame's accessibility tree.
+    ///
+    /// Returns `None` when the tree was not built — no assistive technology is
+    /// attached and the tree is not forced (see [`Self::set_a11y_forced`]).
+    pub fn a11y_snapshot(&self) -> Option<A11ySnapshot> {
+        self.a11y.snapshot()
+    }
+
+    /// The deepest node in the last frame's tree whose bounds contain `point`,
+    /// falling back to the smallest area when depths tie.
+    pub fn a11y_hit_test(&self, point: Point<Pixels>) -> Option<accesskit::NodeId> {
+        let snapshot = self.a11y.snapshot()?;
+        let by_id: collections::FxHashMap<_, _> =
+            snapshot.nodes.iter().map(|node| (node.id, node)).collect();
+
+        let mut depth: collections::FxHashMap<accesskit::NodeId, usize> =
+            collections::FxHashMap::default();
+        depth.insert(snapshot.root, 0);
+        let mut frontier = vec![snapshot.root];
+        while let Some(node_id) = frontier.pop() {
+            let Some(node) = by_id.get(&node_id) else {
+                continue;
+            };
+            let child_depth = depth[&node_id] + 1;
+            for child in &node.children {
+                depth.insert(*child, child_depth);
+                frontier.push(*child);
+            }
+        }
+
+        let mut best: Option<(usize, f32, accesskit::NodeId)> = None;
+        for node in &snapshot.nodes {
+            let Some(bounds) = node.bounds else {
+                continue;
+            };
+            if !bounds.contains(&point) {
+                continue;
+            }
+            let node_depth = depth.get(&node.id).copied().unwrap_or(0);
+            let area = bounds.size.width.0 * bounds.size.height.0;
+            let is_better = match best {
+                None => true,
+                Some((best_depth, best_area, _)) => {
+                    node_depth > best_depth || (node_depth == best_depth && area < best_area)
+                }
+            };
+            if is_better {
+                best = Some((node_depth, area, node.id));
+            }
+        }
+
+        best.map(|(_, _, id)| id)
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.
@@ -6613,29 +6681,59 @@ impl Window {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+        let accesskit::ActionRequest {
+            action,
+            target_node,
+            data,
+            ..
+        } = request;
+        self.dispatch_a11y_action(target_node, action, data.as_ref(), cx);
+    }
+
+    /// Perform an accessibility action on `node_id`, as a screen reader would.
+    ///
+    /// This is the in-process entry point for dev tooling (`window_control`):
+    /// it runs any listener registered with [`Self::on_a11y_action`], then falls
+    /// back to the built-in handling — `Click` synthesizes mouse events at the
+    /// node's center, `Focus` focuses the node's focus handle.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn perform_a11y_action(
+        &mut self,
+        node_id: accesskit::NodeId,
+        action: accesskit::Action,
+        cx: &mut App,
+    ) {
+        self.dispatch_a11y_action(node_id, action, None, cx);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn dispatch_a11y_action(
+        &mut self,
+        target_node: accesskit::NodeId,
+        action: accesskit::Action,
+        data: Option<&accesskit::ActionData>,
+        cx: &mut App,
+    ) {
         // Take listeners out temporarily so the closures can borrow Window
         // mutably, then restore them afterward.
-        if let Some(mut listeners) = self.a11y.action_listeners.remove(&request.target_node) {
-            let extra_data = request.data.as_ref();
+        if let Some(mut listeners) = self.a11y.action_listeners.remove(&target_node) {
             let mut matched = false;
-            for (action, listener) in &mut listeners {
-                if *action == request.action {
-                    listener(extra_data, self, cx);
+            for (listener_action, listener) in &mut listeners {
+                if *listener_action == action {
+                    listener(data, self, cx);
                     matched = true;
                 }
             }
-            self.a11y
-                .action_listeners
-                .insert(request.target_node, listeners);
+            self.a11y.action_listeners.insert(target_node, listeners);
             if matched {
                 return;
             }
         }
 
         // Fall back to built-in action handling.
-        match request.action {
+        match action {
             accesskit::Action::Click => {
-                if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
+                if let Some(bounds) = self.a11y.node_bounds.get(&target_node).copied() {
                     let center = bounds.center();
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
                         button: MouseButton::Left,
@@ -6655,7 +6753,7 @@ impl Window {
                 }
             }
             accesskit::Action::Focus => {
-                if let Some(focus_id) = self.a11y.focus_ids.get(&request.target_node).copied()
+                if let Some(focus_id) = self.a11y.focus_ids.get(&target_node).copied()
                     && let Some(handle) = FocusHandle::for_id(focus_id, &cx.focus_handles)
                 {
                     self.focus(&handle, cx);
@@ -6665,11 +6763,7 @@ impl Window {
                 self.blur(cx);
             }
             _ => {
-                log::debug!(
-                    "Unhandled a11y action: {:?} on {:?}",
-                    request.action,
-                    request.target_node
-                );
+                log::debug!("Unhandled a11y action: {:?} on {:?}", action, target_node);
             }
         }
     }

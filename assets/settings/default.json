@@ -1217,10 +1217,13 @@
       "tools": {
         "window_control": {
           // Worktree adds auto-allow (the agent created the worktree); project
-          // adds fall through to `default: confirm` and prompt.
+          // adds fall through to `default: confirm` and prompt. Read-only
+          // observation (state/snapshot/find/assert) is auto-allowed so the
+          // agent can look before it acts without a prompt per look.
           "default": "confirm",
           "always_allow": [
             { "pattern": "^add_worktree_root\\s" },
+            { "pattern": "^(state|snapshot|find|assert)\\s" },
           ],
         },
         "git": {

@@ -103,7 +103,7 @@ use crate::*;
 pub(crate) mod debug;
 
 use crate::{App, Bounds, FocusId, Pixels, SharedString, Window};
-use accesskit::{Action, NodeId, TreeUpdate};
+use accesskit::{Action, NodeId, Role, TreeUpdate};
 use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
@@ -145,6 +145,10 @@ pub(crate) struct A11y {
     /// At the end of the frame, we re-call [`Self::sync_active_flag`] to
     /// determine whether we should actually send the finished [`TreeUpdate`].
     active_this_frame: bool,
+    /// Whether the tree is built even when no assistive technology is
+    /// connected, so in-process tooling can observe the UI. The tree is still
+    /// only sent to the platform when a real adapter is attached.
+    forced_active: bool,
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
@@ -173,6 +177,7 @@ impl A11y {
             force_disabled,
             active_flag,
             active_this_frame: false,
+            forced_active: false,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
@@ -210,7 +215,23 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        let platform_active = self.is_really_active();
+        self.active_this_frame = platform_active || (self.forced_active && !self.force_disabled);
+    }
+
+    /// Whether a real assistive technology is attached (and a11y is not
+    /// forcibly disabled). This is what decides whether the tree is sent to the
+    /// platform adapter; a forced tree exists only in-process.
+    pub(crate) fn is_really_active(&self) -> bool {
+        !self.force_disabled && self.active_flag.load(Ordering::SeqCst)
+    }
+
+    /// Build the tree every frame even when no assistive technology is
+    /// connected. Used by the dev-only `window_control` surface so it can
+    /// observe the UI without a screen reader.
+    pub(crate) fn set_forced_active(&mut self, forced: bool) {
+        self.forced_active = forced;
+        self.active_this_frame = self.is_really_active() || (forced && !self.force_disabled);
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -293,6 +314,91 @@ impl A11y {
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
     }
+
+    /// A read-only view of the last frame's tree, for in-process tooling.
+    pub(crate) fn snapshot(&self) -> Option<A11ySnapshot> {
+        let update = self.debug.last_update()?;
+        let scale_factor = self.debug.last_scale_factor().unwrap_or(1.0);
+        let scale_factor = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+
+        let nodes = update
+            .nodes
+            .iter()
+            .map(|(id, node)| {
+                let bounds = self.node_bounds.get(id).copied().or_else(|| {
+                    node.bounds().map(|rect| Bounds {
+                        origin: crate::point(
+                            crate::px((rect.x0 / scale_factor as f64) as f32),
+                            crate::px((rect.y0 / scale_factor as f64) as f32),
+                        ),
+                        size: crate::size(
+                            crate::px(((rect.x1 - rect.x0) / scale_factor as f64) as f32),
+                            crate::px(((rect.y1 - rect.y0) / scale_factor as f64) as f32),
+                        ),
+                    })
+                });
+
+                A11yNodeSnapshot {
+                    id: *id,
+                    role: node.role(),
+                    label: node.label().map(str::to_owned),
+                    value: node.value().map(str::to_owned),
+                    description: node.description().map(str::to_owned),
+                    bounds,
+                    children: node.children().to_vec(),
+                }
+            })
+            .collect();
+
+        Some(A11ySnapshot {
+            root: update
+                .tree
+                .as_ref()
+                .map(|tree| tree.root)
+                .unwrap_or(ROOT_NODE_ID),
+            focus: update.focus,
+            nodes,
+        })
+    }
+}
+
+/// A read-only snapshot of a window's last-frame accessibility tree.
+///
+/// Produced by [`crate::Window::a11y_snapshot`] for in-process tooling (the
+/// dev-only `window_control` surface). Nodes are in the order the builder
+/// produced them (children before parents); `bounds` are logical pixels.
+#[derive(Debug, Clone)]
+pub struct A11ySnapshot {
+    /// The root node of the tree (`NodeId(0)`).
+    pub root: NodeId,
+    /// The node reported as focused for this frame.
+    pub focus: NodeId,
+    /// Every node in the tree, children before parents.
+    pub nodes: Vec<A11yNodeSnapshot>,
+}
+
+/// One node of an [`A11ySnapshot`].
+#[derive(Debug, Clone)]
+pub struct A11yNodeSnapshot {
+    /// The AccessKit node id. Derived from the element's `ElementId`, so it is
+    /// stable across frames for the same element.
+    pub id: NodeId,
+    /// The accessibility role declared by the element.
+    pub role: Role,
+    /// The node's label, when one was set.
+    pub label: Option<String>,
+    /// The node's value (e.g. text input contents), when one was set.
+    pub value: Option<String>,
+    /// The node's description, when one was set.
+    pub description: Option<String>,
+    /// The node's bounds in logical pixels.
+    pub bounds: Option<Bounds<Pixels>>,
+    /// The ids of this node's children.
+    pub children: Vec<NodeId>,
 }
 
 /// Builder API for synthetic children. See the docs for
@@ -652,6 +758,43 @@ mod tests {
         let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
         a11y.begin_frame();
         a11y
+    }
+
+    #[test]
+    fn snapshot_reports_nodes_labels_and_bounds() {
+        let mut a11y = new_a11y();
+        let button = NodeId(1);
+        let mut node = accesskit::Node::new(Role::Button);
+        node.set_label("Open".to_string());
+        node.set_bounds(accesskit::Rect {
+            x0: 10.0,
+            y0: 20.0,
+            x1: 110.0,
+            y1: 60.0,
+        });
+        assert!(a11y.nodes.push(button, node));
+        a11y.node_bounds.insert(
+            button,
+            crate::Bounds {
+                origin: crate::point(crate::px(10.0), crate::px(20.0)),
+                size: crate::size(crate::px(100.0), crate::px(40.0)),
+            },
+        );
+        a11y.nodes.pop();
+        a11y.end_frame(Default::default());
+
+        let snapshot = a11y.snapshot().expect("snapshot after end_frame");
+        let button = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == NodeId(1))
+            .expect("button in snapshot");
+        assert_eq!(button.role, Role::Button);
+        assert_eq!(button.label.as_deref(), Some("Open"));
+        let bounds = button.bounds.expect("logical bounds");
+        assert_eq!(bounds.origin.x, crate::px(10.0));
+        assert_eq!(bounds.size.width, crate::px(100.0));
+        assert!(snapshot.nodes.iter().any(|node| node.id == snapshot.root));
     }
 
     #[test]
