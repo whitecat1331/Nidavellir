@@ -97,6 +97,10 @@ pub struct VmTarget {
     /// Registered VMs on this node, keyed by VMID (JSON object keys are strings).
     #[serde(default)]
     pub vms: BTreeMap<String, VmInfo>,
+    /// The node's own IPs (management + any other reachable address), when
+    /// known. Falls back to the API/SSH transport host when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
     /// Proxmox API transport (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ProxmoxApiConfig>,
@@ -366,6 +370,7 @@ mod tests {
                 .collect(),
             api: None,
             ssh: None,
+            ips: Vec::new(),
             danger,
         }
     }

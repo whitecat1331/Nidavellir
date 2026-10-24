@@ -178,6 +178,11 @@ fn node_probe_endpoint(target: &VmTarget) -> Option<(String, u16)> {
 /// their address lives in `api.base_url` / `ssh.host`, so this surfaces it for
 /// the panel without a schema change.
 pub fn node_ips(target: &VmTarget) -> Vec<String> {
+    if !target.ips.is_empty() {
+        return target.ips.clone();
+    }
+    // Fall back to the transport config for nodes not yet enriched with an
+    // explicit `ips` list.
     let mut ips = Vec::new();
     if let Some(api) = target.api.as_ref() {
         if let Ok(url) = url::Url::parse(&api.base_url) {
