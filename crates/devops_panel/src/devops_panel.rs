@@ -6,8 +6,8 @@ use agent::vms::{VmInfo, VmOperation, VmStore, VmTarget};
 use agent::{ContainerStatus, DevOpsConfig, PingStatuses, Reachability, VmNodeStatus, VmStatus};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
-    ListState, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
+    App, Context, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    ListAlignment, ListState, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
 };
 use ui::{Button, ButtonSize, Checkbox, IconName, Label, LabelSize, WithScrollbar, prelude::*};
 use workspace::Workspace;
@@ -22,6 +22,15 @@ const SCHEDULER_TICK: Duration = Duration::from_millis(500);
 /// overflow the scheduler's `Instant + Duration` arithmetic; this is far beyond
 /// any sane poll cadence and just guards against a panic.
 const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+/// Default left-tree / right-details split fraction.
+const DEFAULT_SPLIT_FRACTION: f32 = 0.3;
+const MIN_SPLIT_FRACTION: f32 = 0.2;
+const MAX_SPLIT_FRACTION: f32 = 0.8;
+const DIVIDER_HANDLE_WIDTH: f32 = 8.0;
+
+/// Drag marker for the tree/detail divider, mirroring the network panel's
+/// `DraggedPanelDivider`.
+struct DraggedPanelDivider;
 
 /// A bottom-dock panel showing the health of every VM and container registered
 /// in the seeded vms.json / containers.json. It holds no infra of its own; the
@@ -47,6 +56,7 @@ pub struct DevOpsPanel {
     container_store: ContainerStore,
     show_settings: bool,
     settings_draft: Option<SettingsDraft>,
+    split_fraction: f32,
     _task: Task<()>,
 }
 
@@ -186,6 +196,7 @@ impl DevOpsPanel {
                 container_store,
                 show_settings: false,
                 settings_draft: None,
+                split_fraction: DEFAULT_SPLIT_FRACTION,
                 _task: Task::ready(()),
             };
             this.start_scheduler(cx);
@@ -635,6 +646,46 @@ impl DevOpsPanel {
     fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
         self.selected = Some(selection);
         cx.notify();
+    }
+
+    /// A ~1px divider with a wider invisible grab handle. The handle starts the
+    /// drag; the split row's `on_drag_move` updates the split fraction.
+    fn render_divider(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("devops-divider")
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .w(px(1.))
+            .bg(cx.theme().colors().pane_group_border)
+            .child(
+                div()
+                    .id("devops-divider-handle")
+                    .absolute()
+                    .left(px(-DIVIDER_HANDLE_WIDTH / 2.0))
+                    .w(px(DIVIDER_HANDLE_WIDTH))
+                    .h_full()
+                    .cursor_col_resize()
+                    .block_mouse_except_scroll()
+                    .on_drag(DraggedPanelDivider, |_, _, _, cx| cx.new(|_| gpui::Empty)),
+            )
+            .into_any_element()
+    }
+
+    /// Converts a divider drag into a new split fraction, clamped so neither
+    /// pane collapses.
+    fn on_divider_drag(
+        &mut self,
+        event: &DragMoveEvent<DraggedPanelDivider>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = event.bounds;
+        if let Some(fraction) =
+            split_fraction_for_position(bounds.left(), bounds.right(), event.event.position.x)
+        {
+            self.split_fraction = fraction;
+            cx.notify();
+        }
     }
 
     // ── Settings manager ─────────────────────────────────────────────
@@ -1719,6 +1770,9 @@ fn node_details(node: &VmNodeStatus, ping: Reachability) -> Div {
         .gap_1()
         .child(Label::new(name).weight(FontWeight::SEMIBOLD))
         .child(detail_row("status", &resource))
+        .when(!node.ips.is_empty(), |this| {
+            this.child(detail_row("ip", &node.ips.join(", ")))
+        })
         .when_some(node.uptime, |this, uptime| {
             this.child(detail_row("uptime", &format_uptime(uptime)))
         })
@@ -1915,6 +1969,16 @@ fn format_ping(latency: &Duration) -> String {
     }
 }
 
+/// Maps a divider drag position to a split fraction, clamped so neither pane
+/// collapses. Returns `None` for a zero-width row.
+fn split_fraction_for_position(left: Pixels, right: Pixels, position_x: Pixels) -> Option<f32> {
+    let width = right - left;
+    if width <= px(0.) {
+        return None;
+    }
+    Some(((position_x - left) / width).clamp(MIN_SPLIT_FRACTION, MAX_SPLIT_FRACTION))
+}
+
 fn format_uptime(seconds: u64) -> String {
     let days = seconds / 86400;
     let hours = (seconds % 86400) / 3600;
@@ -1977,15 +2041,23 @@ impl Render for DevOpsPanel {
             .child(if self.show_settings {
                 self.render_settings(cx)
             } else {
+                let split_fraction = self.split_fraction;
                 h_flex()
+                    .id("devops-split")
                     .flex_1()
                     .min_h_0()
+                    .on_drag_move::<DraggedPanelDivider>(cx.listener(
+                        |this, event: &DragMoveEvent<DraggedPanelDivider>, _window, cx| {
+                            this.on_divider_drag(event, cx);
+                        },
+                    ))
                     .child(
                         div()
                             .id("devops-tree")
-                            .w(px(280.))
-                            .flex_shrink_0()
+                            .min_w_0()
+                            .flex_shrink_1()
                             .h_full()
+                            .flex_basis(DefiniteLength::Fraction(split_fraction))
                             .child(
                                 list(
                                     self.list_state.clone(),
@@ -1995,7 +2067,17 @@ impl Render for DevOpsPanel {
                             )
                             .vertical_scrollbar_for(&self.list_state, window, cx),
                     )
-                    .child(div().flex_1().min_w_0().h_full().child(self.render_details(cx)))
+                    .child(self.render_divider(cx))
+                    .child(
+                        div()
+                            .id("devops-details")
+                            .min_w_0()
+                            .flex_shrink_1()
+                            .h_full()
+                            .flex_basis(DefiniteLength::Fraction(1.0 - split_fraction))
+                            .overflow_hidden()
+                            .child(self.render_details(cx)),
+                    )
             })
     }
 }
