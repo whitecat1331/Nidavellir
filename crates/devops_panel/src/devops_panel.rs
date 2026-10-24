@@ -357,7 +357,6 @@ impl DevOpsPanel {
         })
     }
 
-    fn live_checkbox(&self, cx: &mut Context<Self>) -> Checkbox {
     fn run_vm_action(
         &mut self,
         target: String,
