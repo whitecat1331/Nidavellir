@@ -38,9 +38,9 @@ pub struct ContainerTarget {
     /// Systemd: the unit name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
-    /// LAN or Tailscale IP, when known (enriched registry, D6).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ip: Option<String>,
+    /// LAN / Tailscale / etc. IPs, when known (enriched registry, D6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
     /// Operating system, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
@@ -306,7 +306,7 @@ mod tests {
             file: None,
             env_file: None,
             service: None,
-            ip: None,
+            ips: Vec::new(),
             os: None,
             roles: Vec::new(),
             probe_port: None,
@@ -322,7 +322,7 @@ mod tests {
             file: None,
             env_file: None,
             service: Some(service.to_string()),
-            ip: None,
+            ips: Vec::new(),
             os: None,
             roles: Vec::new(),
             probe_port: None,

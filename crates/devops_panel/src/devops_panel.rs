@@ -667,8 +667,8 @@ fn vm_detail(status: &VmStatus) -> String {
     if !status.roles.is_empty() {
         parts.push(status.roles.join(", "));
     }
-    if let Some(ip) = &status.ip {
-        parts.push(ip.clone());
+    if !status.ips.is_empty() {
+        parts.push(status.ips.join(", "));
     }
     if let Some(os) = &status.os {
         parts.push(os.clone());
@@ -784,8 +784,8 @@ fn container_detail(status: &ContainerStatus) -> String {
     if !status.roles.is_empty() {
         parts.push(status.roles.join(", "));
     }
-    if let Some(ip) = &status.ip {
-        parts.push(ip.clone());
+    if !status.ips.is_empty() {
+        parts.push(status.ips.join(", "));
     }
     if let Some(os) = &status.os {
         parts.push(os.clone());

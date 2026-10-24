@@ -199,8 +199,8 @@ pub struct ContainerStatus {
     /// The SSH endpoint the target is reached on (often a Tailscale DNS name),
     /// used to group targets under their host in the panel.
     pub host: String,
-    /// LAN or Tailscale IP (enriched registry, D6).
-    pub ip: Option<String>,
+    /// LAN / Tailscale / etc. IPs (enriched registry, D6).
+    pub ips: Vec<String>,
     /// Operating system (enriched registry, D6).
     pub os: Option<String>,
     /// Human-readable role(s) (enriched registry, D6).
@@ -222,7 +222,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             return vec![ContainerStatus {
                 target: String::new(),
                 host: String::new(),
-                ip: None,
+                ips: Vec::new(),
                 os: None,
                 roles: Vec::new(),
                 driver: ContainerDriver::Compose,
@@ -245,7 +245,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
                     host: target.host.clone(),
-                    ip: target.ip.clone(),
+                    ips: target.ips.clone(),
                     os: target.os.clone(),
                     roles: target.roles.clone(),
                     driver: target.driver,
@@ -266,7 +266,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
                 statuses.push(ContainerStatus {
                     target: target_id.clone(),
                     host: target.host.clone(),
-                    ip: target.ip.clone(),
+                    ips: target.ips.clone(),
                     os: target.os.clone(),
                     roles: target.roles.clone(),
                     driver: target.driver,
@@ -284,7 +284,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
                 host: target.host.clone(),
-                ip: target.ip.clone(),
+                ips: target.ips.clone(),
                 os: target.os.clone(),
                 roles: target.roles.clone(),
                 driver: target.driver,
@@ -309,7 +309,7 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
             statuses.push(ContainerStatus {
                 target: target_id.clone(),
                 host: target.host.clone(),
-                ip: target.ip.clone(),
+                ips: target.ips.clone(),
                 os: target.os.clone(),
                 roles: target.roles.clone(),
                 driver: target.driver,

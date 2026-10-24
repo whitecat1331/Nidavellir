@@ -132,17 +132,8 @@ pub async fn ping_statuses(cx: &AsyncApp) -> PingStatuses {
             pings.nodes.insert(node.clone(), node_ping);
 
             for (vmid, info) in &target.vms {
-                let ping = match info.ip.as_deref() {
-                    Some(ip) if !ip.trim().is_empty() => {
-                        probe_tcp(
-                            cx.background_executor(),
-                            ip,
-                            info.probe_port.unwrap_or(HOST_PROBE_PORT),
-                        )
-                        .await
-                    }
-                    _ => Reachability::NotApplicable,
-                };
+                let port = info.probe_port.unwrap_or(HOST_PROBE_PORT);
+                let ping = best_reachability(cx, &info.ips, port).await;
                 pings.vms.insert((node.clone(), vmid.clone()), ping);
             }
         }
@@ -180,4 +171,28 @@ fn node_probe_endpoint(target: &VmTarget) -> Option<(String, u16)> {
         }
     }
     None
+}
+
+/// Probes every IP in `ips` and returns the best reachability: the lowest
+/// latency if any IP is reachable, `Timeout` if none answer, or
+/// `NotApplicable` when there are no IPs to probe.
+async fn best_reachability(cx: &AsyncApp, ips: &[String], port: u16) -> Reachability {
+    let mut best = None;
+    for ip in ips {
+        let ip = ip.trim();
+        if ip.is_empty() {
+            continue;
+        }
+        let probe = probe_tcp(cx.background_executor(), ip, port).await;
+        best = Some(match best {
+            Some(Reachability::Reachable(existing)) => match probe {
+                Reachability::Reachable(latency) => {
+                    Reachability::Reachable(existing.min(latency))
+                }
+                _ => Reachability::Reachable(existing),
+            },
+            _ => probe,
+        });
+    }
+    best.unwrap_or(Reachability::NotApplicable)
 }

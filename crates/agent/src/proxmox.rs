@@ -194,7 +194,7 @@ mod tests {
                 VmInfo {
                     name: "quetzalcoatlus".to_string(),
                     danger: true,
-                    ip: None,
+                    ips: Vec::new(),
                     os: None,
                     roles: Vec::new(),
                     probe_port: None,

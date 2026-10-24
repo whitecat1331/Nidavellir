@@ -70,9 +70,9 @@ pub struct VmInfo {
     /// Whether this VM is infra-critical (danger-tier for stop/reboot).
     #[serde(default)]
     pub danger: bool,
-    /// LAN or Tailscale IP, when known (enriched registry, D6).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ip: Option<String>,
+    /// LAN / Tailscale / etc. IPs, when known (enriched registry, D6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
     /// Operating system, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
@@ -348,7 +348,7 @@ mod tests {
                         VmInfo {
                             name: format!("vm-{id}"),
                             danger: *danger,
-                            ip: None,
+                            ips: Vec::new(),
                             os: None,
                             roles: Vec::new(),
                             probe_port: None,

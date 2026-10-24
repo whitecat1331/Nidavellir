@@ -145,8 +145,8 @@ pub struct VmStatus {
     pub name: String,
     /// Whether this VM is infra-critical.
     pub danger: bool,
-    /// LAN or Tailscale IP (enriched registry, D6).
-    pub ip: Option<String>,
+    /// LAN / Tailscale / etc. IPs (enriched registry, D6).
+    pub ips: Vec<String>,
     /// Operating system (enriched registry, D6).
     pub os: Option<String>,
     /// Human-readable role(s) (enriched registry, D6).
@@ -184,7 +184,7 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                 vmid: String::new(),
                 name: String::new(),
                 danger: false,
-                ip: None,
+                ips: Vec::new(),
                 os: None,
                 roles: Vec::new(),
                 memory_used: None,
@@ -208,7 +208,7 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                         vmid: vmid.clone(),
                         name: info.name.clone(),
                         danger: info.danger,
-                        ip: info.ip.clone(),
+                        ips: info.ips.clone(),
                         os: info.os.clone(),
                         roles: info.roles.clone(),
                         memory_used: None,
@@ -235,7 +235,7 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                         vmid: vmid.clone(),
                         name: info.name.clone(),
                         danger: info.danger,
-                        ip: info.ip.clone(),
+                        ips: info.ips.clone(),
                         os: info.os.clone(),
                         roles: info.roles.clone(),
                         memory_used: None,
@@ -256,7 +256,7 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
                 vmid: vmid.clone(),
                 name: info.name.clone(),
                 danger: info.danger,
-                ip: info.ip.clone(),
+                ips: info.ips.clone(),
                 os: info.os.clone(),
                 roles: info.roles.clone(),
                 memory_used: None,
