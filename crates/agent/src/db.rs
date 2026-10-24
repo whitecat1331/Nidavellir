@@ -853,8 +853,10 @@ impl ThreadsDatabase {
             version: DbThread::VERSION,
         })?;
 
-        let connection = connection.lock();
-
+        // Compress before taking the connection lock: the store shares one
+        // `Arc<Mutex<Connection>>` across every read and write, so holding it
+        // while zstd runs blocks concurrent `list_threads`/`load_thread` for the
+        // whole compress (seconds on a large thread).
         let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
         let data_type = DataType::Zstd;
         let data = compressed;
@@ -863,8 +865,9 @@ impl ThreadsDatabase {
         // This ensures the creation time reflects when the thread was conceptually
         // created, not when it was saved to the database.
         let created_at = updated_at.clone();
-
         let id_for_dedup = id.0.clone();
+
+        let connection = connection.lock();
 
         let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
             INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, data_type, data, created_at)
@@ -949,30 +952,43 @@ impl ThreadsDatabase {
         let connection = self.connection.clone();
 
         self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut select = connection
-                .select_bound::<Arc<str>, (DataType, Vec<u8>, Option<String>)>(indoc! {"
+            let raw = {
+                let connection = connection.lock();
+                let mut select = connection
+                    .select_bound::<Arc<str>, (DataType, Vec<u8>, Option<String>)>(indoc! {"
                     SELECT data_type, data, merged_into FROM threads WHERE id = ? LIMIT 1
                 "})?;
 
-            // Follow `merged_into` pointers to the canonical thread, so opening
-            // a thread that was reconciled into another opens the merged result.
-            // The loop is bounded to guard against a malformed pointer cycle;
-            // the merge only ever points losers at a canonical, so one hop is
-            // the norm.
-            let mut current_id = id.0;
-            for _ in 0..64 {
-                let rows = select(current_id.clone())?;
-                let Some((data_type, data, merged_into)) = rows.into_iter().next() else {
-                    return Ok(None);
-                };
-                match merged_into {
-                    Some(next) => current_id = Arc::from(next.as_str()),
-                    None => return Ok(Some(Self::deserialize_thread(data_type, data)?)),
+                // Follow `merged_into` pointers to the canonical thread, so opening
+                // a thread that was reconciled into another opens the merged result.
+                // The loop is bounded to guard against a malformed pointer cycle;
+                // the merge only ever points losers at a canonical, so one hop is
+                // the norm.
+                let mut current_id = id.0;
+                let mut found = None;
+                for _ in 0..64 {
+                    let rows = select(current_id.clone())?;
+                    let Some((data_type, data, merged_into)) = rows.into_iter().next() else {
+                        break;
+                    };
+                    match merged_into {
+                        Some(next) => current_id = Arc::from(next.as_str()),
+                        None => {
+                            found = Some((data_type, data));
+                            break;
+                        }
+                    }
                 }
-            }
+                found
+            };
 
-            Ok(None)
+            // Decompress and parse outside the lock, for the same reason the save
+            // path compresses before locking: a large blob must not block the
+            // shared connection for its whole deserialization.
+            let Some((data_type, data)) = raw else {
+                return Ok(None);
+            };
+            Ok(Some(Self::deserialize_thread(data_type, data)?))
         })
     }
 
@@ -2063,6 +2079,49 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_follows_merged_into_pointer(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let older_id = session_id("older");
+        let newer_id = session_id("newer");
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let mut older = make_thread("Canonical", timestamp);
+        older.messages.push(user_message("hello reconcile"));
+        let mut newer = make_thread(
+            "Duplicate",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 1).unwrap(),
+        );
+        newer.messages.push(user_message("hello reconcile"));
+
+        database
+            .save_thread(older_id.clone(), older, PathList::default(), None)
+            .await
+            .unwrap();
+        database
+            .save_thread(newer_id.clone(), newer, PathList::default(), None)
+            .await
+            .unwrap();
+
+        database.reconcile_threads().await.unwrap();
+
+        // `load_thread` must follow the loser's `merged_into` pointer and return
+        // the canonical thread's content (decompressed outside the connection
+        // lock), rather than `None` or the archived loser's own blob.
+        let from_duplicate = database.load_thread(newer_id.clone()).await.unwrap();
+        let from_canonical = database.load_thread(older_id.clone()).await.unwrap();
+        assert!(
+            from_duplicate.is_some(),
+            "merged duplicate should resolve to the canonical thread"
+        );
+        assert!(from_canonical.is_some());
+        assert_eq!(
+            from_duplicate.as_ref().unwrap().updated_at,
+            from_canonical.as_ref().unwrap().updated_at,
+            "opening the duplicate must return the canonical thread's content"
         );
     }
 
