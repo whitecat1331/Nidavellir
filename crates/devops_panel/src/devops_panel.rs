@@ -113,6 +113,10 @@ enum DraftKind {
         file: Entity<Editor>,
         service: Entity<Editor>,
     },
+    Node {
+        node: String,
+        danger: bool,
+    },
 }
 
 /// The owned, validated form values read from a [`SettingsDraft`] before the
@@ -131,6 +135,10 @@ enum DraftValues {
         dir: Option<String>,
         file: Option<String>,
         service: Option<String>,
+    },
+    Node {
+        node: String,
+        danger: bool,
     },
 }
 
@@ -801,6 +809,7 @@ impl DevOpsPanel {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            .child(self.edit_node_button(&node, cx))
             .child(self.add_vm_button(&node, cx))
     }
 
@@ -870,6 +879,15 @@ impl DevOpsPanel {
             .size(ButtonSize::Compact)
             .on_click(cx.listener(move |this, _event, window, cx| {
                 this.start_new_vm(node.clone(), window, cx);
+            }))
+    }
+
+    fn edit_node_button(&self, node: &str, cx: &mut Context<Self>) -> Button {
+        let node = node.to_string();
+        Button::new(format!("devops-edit-node-{node}"), "Edit")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.start_node_edit(node.clone(), window, cx);
             }))
     }
 
@@ -966,6 +984,12 @@ impl DevOpsPanel {
                     .child(form_field("os", &draft.os))
                     .child(form_field("roles", &draft.roles))
                     .child(form_field("port", &draft.probe_port));
+            }
+            DraftKind::Node { node, danger } => {
+                form = form
+                    .child(static_field("node", node))
+                    .child(form_field("ips", &draft.ips))
+                    .child(self.danger_checkbox(*danger, cx));
             }
         }
         form.child(self.form_buttons(cx))
@@ -1156,6 +1180,30 @@ impl DevOpsPanel {
         cx.notify();
     }
 
+    fn start_node_edit(&mut self, node: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vm_store.targets.get(&node);
+        let (ips, danger) = match target {
+            Some(target) => (
+                if target.ips.is_empty() {
+                    agent::node_ips(target).join(", ")
+                } else {
+                    target.ips.join(", ")
+                },
+                target.danger,
+            ),
+            None => (String::new(), false),
+        };
+        self.settings_draft = Some(SettingsDraft {
+            is_new: false,
+            kind: DraftKind::Node { node, danger },
+            ips: single_line_editor(&ips, window, cx),
+            os: single_line_editor("", window, cx),
+            roles: single_line_editor("", window, cx),
+            probe_port: single_line_editor("", window, cx),
+        });
+        cx.notify();
+    }
+
     fn start_container_edit(
         &mut self,
         id: String,
@@ -1272,6 +1320,10 @@ impl DevOpsPanel {
                 file: empty_to_none(&file.read(cx).text(cx)),
                 service: empty_to_none(&service.read(cx).text(cx)),
             },
+            DraftKind::Node { node, danger } => DraftValues::Node {
+                node: node.clone(),
+                danger: *danger,
+            },
         };
 
         match values {
@@ -1348,6 +1400,13 @@ impl DevOpsPanel {
                     },
                 };
                 self.container_store.targets.insert(id, target);
+            }
+            DraftValues::Node { node, danger } => {
+                let Some(target) = self.vm_store.targets.get_mut(&node) else {
+                    return self.fail_settings(&format!("node {node} not found"), cx);
+                };
+                target.ips = ips;
+                target.danger = danger;
             }
         }
 
