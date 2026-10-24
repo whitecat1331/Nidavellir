@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use agent::containers::{ContainerDriver, ContainerOperation};
@@ -7,7 +7,7 @@ use agent::{ContainerStatus, DevOpsConfig, PingStatuses, Reachability, VmNodeSta
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
-    ListState, Pixels, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
+    ListState, Render, Stateful, Task, WeakEntity, Window, actions, list, px,
 };
 use ui::{Button, ButtonSize, Checkbox, IconName, Label, LabelSize, WithScrollbar, prelude::*};
 use workspace::Workspace;
@@ -22,10 +22,6 @@ const SCHEDULER_TICK: Duration = Duration::from_millis(500);
 /// overflow the scheduler's `Instant + Duration` arithmetic; this is far beyond
 /// any sane poll cadence and just guards against a panic.
 const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
-/// Fixed column widths so the dock reads as a stable grid.
-const NAME_COL_WIDTH: Pixels = px(140.);
-const STATE_COL_WIDTH: Pixels = px(84.);
-const PING_COL_WIDTH: Pixels = px(56.);
 
 /// A bottom-dock panel showing the health of every VM and container registered
 /// in the seeded vms.json / containers.json. It holds no infra of its own; the
@@ -45,6 +41,8 @@ pub struct DevOpsPanel {
     ping_editor: Entity<Editor>,
     proxmox_editor: Entity<Editor>,
     container_editor: Entity<Editor>,
+    collapsed: BTreeSet<String>,
+    selected: Option<Selection>,
     _task: Task<()>,
 }
 
@@ -63,6 +61,15 @@ enum Row {
     Vm(VmStatus),
     HostHeader(String),
     Container(ContainerStatus),
+}
+
+/// A selectable machine in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    Node(String),
+    Vm { node: String, vmid: String },
+    Host(String),
+    Container(String),
 }
 
 impl Focusable for DevOpsPanel {
@@ -112,6 +119,8 @@ impl DevOpsPanel {
                 ping_editor,
                 proxmox_editor,
                 container_editor,
+                collapsed: BTreeSet::new(),
+                selected: None,
                 _task: Task::ready(()),
             };
             this.start_scheduler(cx);
@@ -253,6 +262,7 @@ impl DevOpsPanel {
             &self.node_reports,
             &self.vm_reports,
             &self.container_reports,
+            &self.collapsed,
         );
         self.list_state.reset(self.rows.len());
         cx.notify();
@@ -409,19 +419,116 @@ impl DevOpsPanel {
         match self.rows.get(ix) {
             Some(Row::SectionHeader(title)) => section_header(title).into_any_element(),
             Some(Row::NodeHeader(node)) => {
-                let ping = self.ping_for_node(&node.node);
-                render_node_header(node, ping).into_any_element()
+                let title = if node.danger {
+                    format!("{} ⚠", node.node)
+                } else {
+                    node.node.clone()
+                };
+                let expanded = !self.collapsed.contains(&node.node);
+                let selected = matches!(&self.selected, Some(Selection::Node(name)) if name == &node.node);
+                tree_group_row(
+                    &node.node,
+                    &title,
+                    expanded,
+                    selected,
+                    Some(self.ping_for_node(&node.node)),
+                    Selection::Node(node.node.clone()),
+                    cx,
+                )
+                .into_any_element()
             }
             Some(Row::Vm(status)) => {
-                let ping = self.ping_for_vm(&status.node, &status.vmid);
-                render_vm_row(status, ping, cx).into_any_element()
+                let title = if status.danger {
+                    format!("{} ⚠", status.name)
+                } else {
+                    status.name.clone()
+                };
+                let selected = matches!(
+                    &self.selected,
+                    Some(Selection::Vm { node, vmid }) if node == &status.node && vmid == &status.vmid
+                );
+                tree_item_row(
+                    &title,
+                    vm_state(status),
+                    self.ping_for_vm(&status.node, &status.vmid),
+                    selected,
+                    Selection::Vm {
+                        node: status.node.clone(),
+                        vmid: status.vmid.clone(),
+                    },
+                    cx,
+                )
+                .into_any_element()
             }
-            Some(Row::HostHeader(host)) => render_host_header(host).into_any_element(),
+            Some(Row::HostHeader(host)) => {
+                let expanded = !self.collapsed.contains(host);
+                let selected = matches!(&self.selected, Some(Selection::Host(name)) if name == host);
+                tree_group_row(
+                    host,
+                    &format!("host · {host}"),
+                    expanded,
+                    selected,
+                    None,
+                    Selection::Host(host.clone()),
+                    cx,
+                )
+                .into_any_element()
+            }
             Some(Row::Container(status)) => {
-                let ping = self.ping_for_host(&status.target);
-                render_container_row(status, ping, cx).into_any_element()
+                let title = format!("{} · {}", status.target, driver_label(status.driver));
+                let selected = matches!(
+                    &self.selected,
+                    Some(Selection::Container(target)) if target == &status.target
+                );
+                tree_item_row(
+                    &title,
+                    container_state(status),
+                    self.ping_for_host(&status.target),
+                    selected,
+                    Selection::Container(status.target.clone()),
+                    cx,
+                )
+                .into_any_element()
             }
             None => div().h_full().into_any_element(),
+        }
+    }
+
+    fn render_details(&self, cx: &mut Context<Self>) -> Div {
+        match &self.selected {
+            None => v_flex().px_2().py_1().child(
+                Label::new("Select a machine to see its details")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+            Some(Selection::Node(node_name)) => {
+                let node = self.node_reports.iter().find(|node| &node.node == node_name);
+                match node {
+                    Some(node) => node_details(node, self.ping_for_node(node_name)),
+                    None => empty_details(&format!("Node {node_name}")),
+                }
+            }
+            Some(Selection::Vm { node, vmid }) => {
+                let status = self
+                    .vm_reports
+                    .iter()
+                    .find(|status| &status.node == node && &status.vmid == vmid);
+                match status {
+                    Some(status) => vm_details(status, self.ping_for_vm(node, &status.vmid), cx),
+                    None => empty_details(&format!("VM {vmid}")),
+                }
+            }
+            Some(Selection::Host(host)) => host_details(host),
+            Some(Selection::Container(target)) => {
+                let status = self
+                    .container_reports
+                    .iter()
+                    .find(|status| &status.target == target);
+                match status {
+                    Some(status) => container_details(status, self.ping_for_host(target), cx),
+                    None => empty_details(&format!("Container {target}")),
+                }
+            }
         }
     }
 
@@ -447,6 +554,20 @@ impl DevOpsPanel {
             .get(target)
             .copied()
             .unwrap_or(Reachability::NotApplicable)
+    }
+
+    fn toggle_collapse(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.collapsed.contains(&id) {
+            self.collapsed.remove(&id);
+        } else {
+            self.collapsed.insert(id);
+        }
+        self.rebuild_rows(cx);
+    }
+
+    fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        self.selected = Some(selection);
+        cx.notify();
     }
 }
 
@@ -476,12 +597,6 @@ fn new_interval_editor(
     editor
 }
 
-/// A fixed-width flex column cell so per-row stats and buttons align across the
-/// whole list.
-fn fixed_cell(width: Pixels, child: impl IntoElement) -> Div {
-    div().w(width).flex_shrink_0().child(child)
-}
-
 /// Renders one interval label plus its free-form single-line editor.
 fn interval_field(label: &'static str, editor: &Entity<Editor>) -> Div {
     h_flex()
@@ -492,11 +607,13 @@ fn interval_field(label: &'static str, editor: &Entity<Editor>) -> Div {
 }
 
 /// Flattens the three status sweeps into the panel's row list, grouping VMs
-/// under their Proxmox node and containers under their SSH host.
+/// under their Proxmox node and containers under their SSH host. Children of a
+/// collapsed node/host are omitted so the tree can fold.
 fn build_rows(
     vm_node_statuses: &[VmNodeStatus],
     vm_statuses: &[VmStatus],
     container_statuses: &[ContainerStatus],
+    collapsed: &BTreeSet<String>,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
 
@@ -506,8 +623,10 @@ fn build_rows(
     )));
     for node in vm_node_statuses {
         rows.push(Row::NodeHeader(node.clone()));
-        for status in vm_statuses.iter().filter(|status| status.node == node.node) {
-            rows.push(Row::Vm(status.clone()));
+        if !collapsed.contains(&node.node) {
+            for status in vm_statuses.iter().filter(|status| status.node == node.node) {
+                rows.push(Row::Vm(status.clone()));
+            }
         }
     }
 
@@ -523,9 +642,11 @@ fn build_rows(
             .push(status.clone());
     }
     for (host, statuses) in by_host {
-        rows.push(Row::HostHeader(host));
-        for status in statuses {
-            rows.push(Row::Container(status));
+        rows.push(Row::HostHeader(host.clone()));
+        if !collapsed.contains(&host) {
+            for status in statuses {
+                rows.push(Row::Container(status));
+            }
         }
     }
 
@@ -545,39 +666,80 @@ fn section_header(title: &str) -> Stateful<Div> {
     )
 }
 
-fn render_node_header(node: &VmNodeStatus, ping: Reachability) -> Stateful<Div> {
-    let name = if node.danger {
-        format!("{} ⚠", node.node)
+/// A collapsible group header (Proxmox node / container host) in the tree.
+fn tree_group_row(
+    id: &str,
+    title: &str,
+    expanded: bool,
+    selected: bool,
+    ping: Option<Reachability>,
+    selection: Selection,
+    cx: &mut Context<DevOpsPanel>,
+) -> Stateful<Div> {
+    let chevron = if expanded { "▾" } else { "▸" };
+    let id = id.to_string();
+    let title_label = Label::new(title.to_string())
+        .size(LabelSize::Small)
+        .weight(FontWeight::SEMIBOLD)
+        .truncate();
+    let title_label = if selected {
+        title_label.color(Color::Accent)
     } else {
-        node.node.clone()
-    };
-    let (resource, resource_color) = match &node.error {
-        Some(_) => ("unreachable".to_string(), Color::Error),
-        None => (node_resource_summary(node), Color::Muted),
+        title_label
     };
     h_flex()
-        .id(format!("devops-node-{}", node.node))
         .h_full()
         .px_2()
         .py_1()
+        .gap_1()
+        .items_center()
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.toggle_collapse(id.clone(), cx);
+            this.select(selection.clone(), cx);
+        }))
+        .child(Label::new(chevron).size(LabelSize::Small).color(Color::Muted))
+        .child(title_label)
+        .child(div().flex_1())
+        .when_some(ping, |this, ping| this.child(ping_label(&ping)))
+}
+
+/// A selectable leaf (VM / container) in the tree.
+fn tree_item_row(
+    title: &str,
+    state: (String, Color),
+    ping: Reachability,
+    selected: bool,
+    selection: Selection,
+    cx: &mut Context<DevOpsPanel>,
+) -> Stateful<Div> {
+    let title_label = Label::new(title.to_string()).truncate();
+    let title_label = if selected {
+        title_label.color(Color::Accent)
+    } else {
+        title_label
+    };
+    h_flex()
+        .h_full()
+        .pl_4()
+        .pr_2()
+        .py_1()
         .gap_2()
         .items_center()
-        .child(fixed_cell(
-            NAME_COL_WIDTH,
-            Label::new(name)
-                .size(LabelSize::Small)
-                .weight(FontWeight::SEMIBOLD)
-                .truncate(),
-        ))
-        .child(
-            Label::new(resource)
-                .size(LabelSize::Small)
-                .color(resource_color)
-                .flex_1()
-                .truncate(),
-        )
-        .child(div().w(STATE_COL_WIDTH).flex_shrink_0())
-        .child(fixed_cell(PING_COL_WIDTH, ping_label(&ping)))
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.select(selection.clone(), cx);
+        }))
+        .child(title_label)
+        .child(div().flex_1())
+        .child(Label::new(state.0).size(LabelSize::Small).color(state.1))
+        .child(ping_label(&ping))
+}
+
+fn container_state(status: &ContainerStatus) -> (String, Color) {
+    match (&status.state, &status.error) {
+        (Some(_), _) => ("healthy".to_string(), Color::Success),
+        (None, Some(_)) => ("unreachable".to_string(), Color::Error),
+        (None, None) => ("unknown".to_string(), Color::Muted),
+    }
 }
 
 fn node_resource_summary(node: &VmNodeStatus) -> String {
@@ -612,43 +774,6 @@ fn node_resource_summary(node: &VmNodeStatus) -> String {
     }
 }
 
-fn render_vm_row(
-    status: &VmStatus,
-    ping: Reachability,
-    cx: &mut Context<DevOpsPanel>,
-) -> Stateful<Div> {
-    let (state_text, color) = vm_state(status);
-    let name = if status.danger {
-        format!("{} ⚠", status.name)
-    } else {
-        status.name.clone()
-    };
-    let target = status.node.clone();
-    let vmid = status.vmid.parse::<u32>().unwrap_or(0);
-    let detail = vm_detail(status);
-
-    h_flex()
-        .id(format!("devops-vm-{}-{}", status.node, status.vmid))
-        .h_full()
-        .pl_4()
-        .pr_2()
-        .gap_2()
-        .items_center()
-        .child(fixed_cell(NAME_COL_WIDTH, Label::new(name).truncate()))
-        .child(
-            Label::new(detail)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .flex_1()
-                .truncate(),
-        )
-        .child(fixed_cell(
-            STATE_COL_WIDTH,
-            Label::new(state_text).color(color),
-        ))
-        .child(fixed_cell(PING_COL_WIDTH, ping_label(&ping)))
-        .child(vm_buttons(cx, &target, vmid).flex_shrink_0())
-}
 
 /// Maps a VM's live Proxmox state to a display label + colour. A `stopped` VM
 /// is rendered as `off` so a powered-off guest reads unambiguously.
@@ -662,25 +787,32 @@ fn vm_state(status: &VmStatus) -> (String, Color) {
     }
 }
 
-fn vm_detail(status: &VmStatus) -> String {
-    let mut parts = vec![format!("vmid {}", status.vmid)];
-    if !status.roles.is_empty() {
-        parts.push(status.roles.join(", "));
+fn ping_text(ping: &Reachability) -> String {
+    match ping {
+        Reachability::Reachable(latency) => format_ping(latency),
+        Reachability::Timeout => "timeout".to_string(),
+        Reachability::NotApplicable => "n/a".to_string(),
     }
-    if !status.ips.is_empty() {
-        parts.push(status.ips.join(", "));
-    }
-    if let Some(os) = &status.os {
-        parts.push(os.clone());
-    }
-    if let (Some(used), Some(total)) = (status.memory_used, status.memory_total) {
-        parts.push(format!(
-            "mem {} / {}",
-            format_bytes(used),
-            format_bytes(total)
-        ));
-    }
-    parts.join(" · ")
+}
+
+fn empty_details(title: &str) -> Div {
+    v_flex().px_2().py_1().child(
+        Label::new(title.to_string())
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+    )
+}
+
+fn detail_row(label: &str, value: &str) -> Div {
+    h_flex()
+        .gap_2()
+        .child(
+            div()
+                .w(px(72.))
+                .flex_shrink_0()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+        )
+        .child(Label::new(value.to_string()).size(LabelSize::Small).truncate())
 }
 
 fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32) -> Div {
@@ -728,70 +860,116 @@ fn vm_button(
         }))
 }
 
-fn render_host_header(host: &str) -> Stateful<Div> {
-    h_flex()
-        .id(format!("devops-host-{}", host))
+
+fn node_details(node: &VmNodeStatus, ping: Reachability) -> Div {
+    let name = if node.danger {
+        format!("{} ⚠", node.node)
+    } else {
+        node.node.clone()
+    };
+    let resource = node_resource_summary(node);
+    v_flex()
         .h_full()
-        .px_2()
-        .justify_between()
+        .px_3()
+        .py_2()
+        .gap_1()
+        .child(Label::new(name).weight(FontWeight::SEMIBOLD))
+        .child(detail_row("status", &resource))
+        .when_some(node.uptime, |this, uptime| {
+            this.child(detail_row("uptime", &format_uptime(uptime)))
+        })
+        .child(detail_row("ping", &ping_text(&ping)))
+}
+
+fn vm_details(
+    status: &VmStatus,
+    ping: Reachability,
+    cx: &mut Context<DevOpsPanel>,
+) -> Div {
+    let vmid = status.vmid.parse::<u32>().unwrap_or(0);
+    let name = if status.danger {
+        format!("{} ⚠", status.name)
+    } else {
+        status.name.clone()
+    };
+    let state = vm_state(status).0;
+    v_flex()
+        .h_full()
+        .px_3()
+        .py_2()
+        .gap_1()
+        .child(Label::new(name).weight(FontWeight::SEMIBOLD))
+        .child(detail_row("vmid", &status.vmid))
+        .when(!status.roles.is_empty(), |this| {
+            this.child(detail_row("roles", &status.roles.join(", ")))
+        })
+        .when(!status.ips.is_empty(), |this| {
+            this.child(detail_row("ip", &status.ips.join(", ")))
+        })
+        .when_some(status.os.as_deref(), |this, os| {
+            this.child(detail_row("os", os))
+        })
+        .child(detail_row("state", &state))
+        .child(detail_row("ping", &ping_text(&ping)))
+        .when_some(
+            status.memory_used.zip(status.memory_total),
+            |this, (used, total)| {
+                this.child(detail_row(
+                    "mem",
+                    &format!("{} / {}", format_bytes(used), format_bytes(total)),
+                ))
+            },
+        )
+        .when_some(status.cpus, |this, cpus| {
+            this.child(detail_row("cpus", &cpus.to_string()))
+        })
+        .when_some(status.uptime, |this, uptime| {
+            this.child(detail_row("uptime", &format_uptime(uptime)))
+        })
+        .child(div().pt_1().child(vm_buttons(cx, &status.node, vmid)))
+}
+
+fn host_details(host: &str) -> Div {
+    v_flex()
+        .h_full()
+        .px_3()
+        .py_2()
+        .gap_1()
+        .child(Label::new(format!("host · {host}")).weight(FontWeight::SEMIBOLD))
         .child(
-            Label::new(format!("host · {host}"))
+            Label::new("A container host groups its compose/systemd targets.")
                 .size(LabelSize::Small)
-                .weight(FontWeight::SEMIBOLD)
-                .truncate(),
+                .color(Color::Muted),
         )
 }
 
-fn render_container_row(
+fn container_details(
     status: &ContainerStatus,
     ping: Reachability,
     cx: &mut Context<DevOpsPanel>,
-) -> Stateful<Div> {
-    let (state_text, color) = match (&status.state, &status.error) {
-        (Some(_), _) => ("healthy".to_string(), Color::Success),
-        (None, Some(_)) => ("unreachable".to_string(), Color::Error),
-        (None, None) => ("unknown".to_string(), Color::Muted),
-    };
+) -> Div {
     let name = format!("{} · {}", status.target, driver_label(status.driver));
-    let detail = container_detail(status);
-    let target = status.target.clone();
-
-    h_flex()
-        .id(format!("devops-container-{}", status.target))
+    let state = container_state(status).0;
+    v_flex()
         .h_full()
-        .pl_4()
-        .pr_2()
-        .gap_2()
-        .items_center()
-        .child(fixed_cell(NAME_COL_WIDTH, Label::new(name).truncate()))
-        .child(
-            Label::new(detail)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .flex_1()
-                .truncate(),
-        )
-        .child(fixed_cell(
-            STATE_COL_WIDTH,
-            Label::new(state_text).color(color),
-        ))
-        .child(fixed_cell(PING_COL_WIDTH, ping_label(&ping)))
-        .child(container_buttons(cx, &target).flex_shrink_0())
+        .px_3()
+        .py_2()
+        .gap_1()
+        .child(Label::new(name).weight(FontWeight::SEMIBOLD))
+        .when(!status.roles.is_empty(), |this| {
+            this.child(detail_row("roles", &status.roles.join(", ")))
+        })
+        .when(!status.ips.is_empty(), |this| {
+            this.child(detail_row("ip", &status.ips.join(", ")))
+        })
+        .when_some(status.os.as_deref(), |this, os| {
+            this.child(detail_row("os", os))
+        })
+        .child(detail_row("state", &state))
+        .child(detail_row("ping", &ping_text(&ping)))
+        .child(div().pt_1().child(container_buttons(cx, &status.target)))
 }
 
-fn container_detail(status: &ContainerStatus) -> String {
-    let mut parts = Vec::new();
-    if !status.roles.is_empty() {
-        parts.push(status.roles.join(", "));
-    }
-    if !status.ips.is_empty() {
-        parts.push(status.ips.join(", "));
-    }
-    if let Some(os) = &status.os {
-        parts.push(os.clone());
-    }
-    parts.join(" · ")
-}
 
 fn container_buttons(cx: &mut Context<DevOpsPanel>, target: &str) -> Div {
     h_flex()
@@ -952,18 +1130,25 @@ impl Render for DevOpsPanel {
                 )
             })
             .child(
-                div()
-                    .id("devops-rows")
+                h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(
-                        list(
-                            self.list_state.clone(),
-                            cx.processor(|this, ix, _window, cx| this.render_row(ix, cx)),
-                        )
-                        .size_full(),
+                        div()
+                            .id("devops-tree")
+                            .w(px(280.))
+                            .flex_shrink_0()
+                            .h_full()
+                            .child(
+                                list(
+                                    self.list_state.clone(),
+                                    cx.processor(|this, ix, _window, cx| this.render_row(ix, cx)),
+                                )
+                                .size_full(),
+                            )
+                            .vertical_scrollbar_for(&self.list_state, window, cx),
                     )
-                    .vertical_scrollbar_for(&self.list_state, window, cx),
+                    .child(div().flex_1().min_w_0().h_full().child(self.render_details(cx))),
             )
     }
 }
