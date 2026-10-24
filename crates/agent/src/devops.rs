@@ -173,6 +173,28 @@ fn node_probe_endpoint(target: &VmTarget) -> Option<(String, u16)> {
     None
 }
 
+/// Derives a node's management IP(s) from its transport config (Proxmox API
+/// host + SSH host), deduplicated. Nodes carry no separate `ips` registry field;
+/// their address lives in `api.base_url` / `ssh.host`, so this surfaces it for
+/// the panel without a schema change.
+pub fn node_ips(target: &VmTarget) -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Some(api) = target.api.as_ref() {
+        if let Ok(url) = url::Url::parse(&api.base_url) {
+            if let Some(host) = url.host_str() {
+                ips.push(host.to_string());
+            }
+        }
+    }
+    if let Some(ssh) = target.ssh.as_ref() {
+        let host = bare_host(&ssh.host);
+        if !host.is_empty() && !ips.iter().any(|ip| ip == host) {
+            ips.push(host.to_string());
+        }
+    }
+    ips
+}
+
 /// Probes every IP in `ips` and returns the best reachability: the lowest
 /// latency if any IP is reachable, `Timeout` if none answer, or
 /// `NotApplicable` when there are no IPs to probe.

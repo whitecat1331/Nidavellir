@@ -349,6 +349,8 @@ pub struct VmNodeStatus {
     pub node: String,
     /// Whether this node is infra-critical.
     pub danger: bool,
+    /// The node's management IP(s), derived from its API/SSH transport config.
+    pub ips: Vec<String>,
     /// Fraction of node CPU in use (0.0..=1.0) from `/nodes/{node}/status`.
     pub cpu: Option<f64>,
     /// Total node memory in bytes.
@@ -378,6 +380,7 @@ pub async fn vm_node_statuses(
             return vec![VmNodeStatus {
                 node: String::new(),
                 danger: false,
+                ips: Vec::new(),
                 cpu: None,
                 memory_total: None,
                 memory_used: None,
@@ -394,6 +397,7 @@ pub async fn vm_node_statuses(
         let mut status = VmNodeStatus {
             node: node.clone(),
             danger: target.danger,
+            ips: crate::devops::node_ips(target),
             cpu: None,
             memory_total: None,
             memory_used: None,
