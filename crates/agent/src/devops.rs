@@ -123,32 +123,64 @@ pub struct PingStatuses {
 pub async fn ping_statuses(cx: &AsyncApp) -> PingStatuses {
     let mut pings = PingStatuses::default();
 
-    if let Ok(store) = VmStore::load(VmStore::default_path()) {
+    let vm_store = VmStore::load(VmStore::default_path()).ok();
+    let container_store = ContainerStore::load(ContainerStore::default_path()).ok();
+
+    // Every target is probed concurrently; the three batches also run together,
+    // so a slow/unreachable target no longer serialises the whole sweep.
+    let mut node_futures = Vec::new();
+    let mut vm_futures = Vec::new();
+    if let Some(store) = &vm_store {
         for (node, target) in &store.targets {
-            let node_ping = match node_probe_endpoint(target) {
-                Some((host, port)) => probe_tcp(cx.background_executor(), &host, port).await,
-                None => Reachability::NotApplicable,
-            };
-            pings.nodes.insert(node.clone(), node_ping);
+            let node_name = node.clone();
+            let endpoint = node_probe_endpoint(target);
+            node_futures.push(async move {
+                let ping = match endpoint {
+                    Some((host, port)) => probe_tcp(cx.background_executor(), &host, port).await,
+                    None => Reachability::NotApplicable,
+                };
+                (node_name, ping)
+            });
 
             for (vmid, info) in &target.vms {
+                let node_name = node.clone();
+                let vmid = vmid.clone();
+                let ips = info.ips.clone();
                 let port = info.probe_port.unwrap_or(HOST_PROBE_PORT);
-                let ping = best_reachability(cx, &info.ips, port).await;
-                pings.vms.insert((node.clone(), vmid.clone()), ping);
+                vm_futures.push(async move {
+                    let ping = best_reachability(cx, &ips, port).await;
+                    ((node_name, vmid), ping)
+                });
             }
         }
     }
 
-    if let Ok(store) = ContainerStore::load(ContainerStore::default_path()) {
+    let mut host_futures = Vec::new();
+    if let Some(store) = &container_store {
         for (target_id, target) in &store.targets {
-            let ping = probe_tcp(
-                cx.background_executor(),
-                bare_host(&target.host),
-                target.probe_port.unwrap_or(HOST_PROBE_PORT),
-            )
-            .await;
-            pings.hosts.insert(target_id.clone(), ping);
+            let target_id = target_id.clone();
+            let host = bare_host(&target.host).to_string();
+            let port = target.probe_port.unwrap_or(HOST_PROBE_PORT);
+            host_futures.push(async move {
+                let ping = probe_tcp(cx.background_executor(), &host, port).await;
+                (target_id, ping)
+            });
         }
+    }
+
+    let (nodes, vms, hosts) = futures::join!(
+        futures::future::join_all(node_futures),
+        futures::future::join_all(vm_futures),
+        futures::future::join_all(host_futures),
+    );
+    for (key, ping) in nodes {
+        pings.nodes.insert(key, ping);
+    }
+    for (key, ping) in vms {
+        pings.vms.insert(key, ping);
+    }
+    for (key, ping) in hosts {
+        pings.hosts.insert(key, ping);
     }
 
     pings

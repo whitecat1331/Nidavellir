@@ -232,93 +232,87 @@ pub async fn container_statuses() -> Vec<ContainerStatus> {
         }
     };
 
-    let mut statuses = Vec::new();
-    for (target_id, target) in &store.targets {
-        let operation = match target.driver {
-            ContainerDriver::Compose => ContainerOperation::Ps,
-            ContainerDriver::Systemd => ContainerOperation::IsActive,
-        };
+    futures::future::join_all(store.targets.iter().map(|(target_id, target)| {
+        let target_id = target_id.clone();
+        let target = target.clone();
+        async move { container_status_for(&target_id, &target).await }
+    }))
+    .await
+}
 
-        let assembled = match assemble_command(target, operation, None, &[]) {
-            Ok(command) => command,
-            Err(error) => {
-                statuses.push(ContainerStatus {
-                    target: target_id.clone(),
-                    host: target.host.clone(),
-                    ips: target.ips.clone(),
-                    os: target.os.clone(),
-                    roles: target.roles.clone(),
-                    driver: target.driver,
-                    state: None,
-                    error: Some(error.to_string()),
-                });
-                continue;
-            }
-        };
+/// Probes one container target (compose `ps` / systemd `is-active`) over SSH.
+/// Run in parallel with the others so one slow/unreachable host doesn't stall
+/// the whole sweep.
+async fn container_status_for(target_id: &str, target: &ContainerTarget) -> ContainerStatus {
+    let operation = match target.driver {
+        ContainerDriver::Compose => ContainerOperation::Ps,
+        ContainerDriver::Systemd => ContainerOperation::IsActive,
+    };
 
-        let output = match util::command::new_command(&assembled.program)
-            .args(&assembled.args)
-            .output()
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                statuses.push(ContainerStatus {
-                    target: target_id.clone(),
-                    host: target.host.clone(),
-                    ips: target.ips.clone(),
-                    os: target.os.clone(),
-                    roles: target.roles.clone(),
-                    driver: target.driver,
-                    state: None,
-                    error: Some(format!("Failed to run `{}`: {error}", assembled.display())),
-                });
-                continue;
-            }
-        };
+    let assembled = match assemble_command(target, operation, None, &[]) {
+        Ok(command) => command,
+        Err(error) => return container_error(target_id, target, error.to_string()),
+    };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
-            let summary = stdout.trim().to_string();
-            statuses.push(ContainerStatus {
-                target: target_id.clone(),
-                host: target.host.clone(),
-                ips: target.ips.clone(),
-                os: target.os.clone(),
-                roles: target.roles.clone(),
-                driver: target.driver,
-                state: Some(if summary.is_empty() {
-                    "healthy".to_string()
-                } else {
-                    summary
-                }),
-                error: None,
-            });
-        } else {
-            let mut message = String::new();
-            if !stdout.trim().is_empty() {
-                message.push_str(stdout.trim());
-            }
-            if !stderr.trim().is_empty() {
-                if !message.is_empty() {
-                    message.push('\n');
-                }
-                message.push_str(stderr.trim());
-            }
-            statuses.push(ContainerStatus {
-                target: target_id.clone(),
-                host: target.host.clone(),
-                ips: target.ips.clone(),
-                os: target.os.clone(),
-                roles: target.roles.clone(),
-                driver: target.driver,
-                state: None,
-                error: Some(message),
-            });
+    let output = match util::command::new_command(&assembled.program)
+        .args(&assembled.args)
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return container_error(
+                target_id,
+                target,
+                format!("Failed to run `{}`: {error}", assembled.display()),
+            );
         }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        let summary = stdout.trim().to_string();
+        ContainerStatus {
+            target: target_id.to_string(),
+            host: target.host.clone(),
+            ips: target.ips.clone(),
+            os: target.os.clone(),
+            roles: target.roles.clone(),
+            driver: target.driver,
+            state: Some(if summary.is_empty() {
+                "healthy".to_string()
+            } else {
+                summary
+            }),
+            error: None,
+        }
+    } else {
+        let mut message = String::new();
+        if !stdout.trim().is_empty() {
+            message.push_str(stdout.trim());
+        }
+        if !stderr.trim().is_empty() {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(stderr.trim());
+        }
+        container_error(target_id, target, message)
     }
-    statuses
+}
+
+fn container_error(target_id: &str, target: &ContainerTarget, error: String) -> ContainerStatus {
+    ContainerStatus {
+        target: target_id.to_string(),
+        host: target.host.clone(),
+        ips: target.ips.clone(),
+        os: target.os.clone(),
+        roles: target.roles.clone(),
+        driver: target.driver,
+        state: None,
+        error: Some(error),
+    }
 }
 
 #[cfg(test)]

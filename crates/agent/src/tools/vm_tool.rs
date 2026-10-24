@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use crate::proxmox::{ProxmoxApiRequest, assemble_api_request, assemble_ssh_command};
 use crate::vms::{
-    GatingTier, VmOperation, VmStore, VmTarget, VmTransport, gating_tier, resolve_vmid,
+    GatingTier, VmInfo, VmOperation, VmStore, VmTarget, VmTransport, gating_tier, resolve_vmid,
     validate_input,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use futures::AsyncReadExt as _;
+use futures::FutureExt as _;
 use gpui::{App, AsyncApp, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method, StatusCode};
 use language_model::LanguageModelToolResultContent;
@@ -197,32 +198,14 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
         }
     };
 
-    let mut statuses = Vec::new();
+    let mut futures: Vec<futures::future::BoxFuture<'static, VmStatus>> = Vec::new();
     for (node, target) in &store.targets {
-        let api = match target.api.as_ref() {
-            Some(api) => api,
-            None => {
-                for (vmid, info) in &target.vms {
-                    statuses.push(VmStatus {
-                        node: node.clone(),
-                        vmid: vmid.clone(),
-                        name: info.name.clone(),
-                        danger: info.danger,
-                        ips: info.ips.clone(),
-                        os: info.os.clone(),
-                        roles: info.roles.clone(),
-                        memory_used: None,
-                        memory_total: None,
-                        cpus: None,
-                        uptime: None,
-                        state: None,
-                        error: Some(format!(
-                            "target \"{node}\" has no `api` transport configured"
-                        )),
-                    });
-                }
-                continue;
+        let Some(api) = target.api.as_ref() else {
+            let message = format!("target \"{node}\" has no `api` transport configured");
+            for (vmid, info) in &target.vms {
+                futures.push(error_vm_status(node, vmid, info, message.clone()));
             }
+            continue;
         };
 
         let http_client = match resolve_http_client(target, shared_http_client.clone()) {
@@ -230,114 +213,119 @@ pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>)
             Err(error) => {
                 let message = tool_error(error);
                 for (vmid, info) in &target.vms {
-                    statuses.push(VmStatus {
-                        node: node.clone(),
-                        vmid: vmid.clone(),
-                        name: info.name.clone(),
-                        danger: info.danger,
-                        ips: info.ips.clone(),
-                        os: info.os.clone(),
-                        roles: info.roles.clone(),
-                        memory_used: None,
-                        memory_total: None,
-                        cpus: None,
-                        uptime: None,
-                        state: None,
-                        error: Some(message.clone()),
-                    });
+                    futures.push(error_vm_status(node, vmid, info, message.clone()));
+                }
+                continue;
+            }
+        };
+
+        let secret = match read_secret(cx, &api.token_secret_url).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                let message = tool_error(error);
+                for (vmid, info) in &target.vms {
+                    futures.push(error_vm_status(node, vmid, info, message.clone()));
                 }
                 continue;
             }
         };
 
         for (vmid, info) in &target.vms {
-            let mut status = VmStatus {
-                node: node.clone(),
-                vmid: vmid.clone(),
-                name: info.name.clone(),
-                danger: info.danger,
-                ips: info.ips.clone(),
-                os: info.os.clone(),
-                roles: info.roles.clone(),
-                memory_used: None,
-                memory_total: None,
-                cpus: None,
-                uptime: None,
-                state: None,
-                error: None,
-            };
-
-            let vmid_number = match vmid.parse::<u32>() {
-                Ok(number) => number,
-                Err(error) => {
-                    status.error = Some(format!("invalid VMID: {error}"));
-                    statuses.push(status);
-                    continue;
+            let node = node.clone();
+            let vmid = vmid.clone();
+            let info = info.clone();
+            let target = target.clone();
+            let token_id = api.token_id.clone();
+            let base_url = api.base_url.clone();
+            let secret = secret.clone();
+            let http_client = http_client.clone();
+            futures.push(
+                async move {
+                    let mut status = base_vm_status(&node, &vmid, &info);
+                    let vmid_number = match vmid.parse::<u32>() {
+                        Ok(number) => number,
+                        Err(error) => {
+                            status.error = Some(format!("invalid VMID: {error}"));
+                            return status;
+                        }
+                    };
+                    let request = match assemble_api_request(
+                        &target,
+                        VmOperation::Status,
+                        Some(vmid_number),
+                        None,
+                        None,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            status.error = Some(error.to_string());
+                            return status;
+                        }
+                    };
+                    match call_api(&http_client, &request, &token_id, &secret, &base_url).await {
+                        Ok(value) => {
+                            let data = value.get("data");
+                            status.state = data
+                                .and_then(|data| data.get("status"))
+                                .and_then(|state| state.as_str())
+                                .map(str::to_string);
+                            status.memory_used = data
+                                .and_then(|data| data.get("mem"))
+                                .and_then(|mem| mem.as_u64());
+                            status.memory_total = data
+                                .and_then(|data| data.get("maxmem"))
+                                .and_then(|maxmem| maxmem.as_u64());
+                            status.cpus = data
+                                .and_then(|data| data.get("cpus"))
+                                .and_then(|cpus| cpus.as_u64());
+                            status.uptime = data
+                                .and_then(|data| data.get("uptime"))
+                                .and_then(|uptime| uptime.as_u64());
+                        }
+                        Err(error) => status.error = Some(tool_error(error)),
+                    }
+                    status
                 }
-            };
-
-            let request = match assemble_api_request(
-                target,
-                VmOperation::Status,
-                Some(vmid_number),
-                None,
-                None,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    status.error = Some(error.to_string());
-                    statuses.push(status);
-                    continue;
-                }
-            };
-
-            let secret = match read_secret(cx, &api.token_secret_url).await {
-                Ok(secret) => secret,
-                Err(error) => {
-                    status.error = Some(tool_error(error));
-                    statuses.push(status);
-                    continue;
-                }
-            };
-
-            let value = match call_api(
-                &http_client,
-                &request,
-                &api.token_id,
-                &secret,
-                &api.base_url,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    status.error = Some(tool_error(error));
-                    statuses.push(status);
-                    continue;
-                }
-            };
-
-            let data = value.get("data");
-            status.state = data
-                .and_then(|data| data.get("status"))
-                .and_then(|state| state.as_str())
-                .map(str::to_string);
-            status.memory_used = data
-                .and_then(|data| data.get("mem"))
-                .and_then(|mem| mem.as_u64());
-            status.memory_total = data
-                .and_then(|data| data.get("maxmem"))
-                .and_then(|maxmem| maxmem.as_u64());
-            status.cpus = data
-                .and_then(|data| data.get("cpus"))
-                .and_then(|cpus| cpus.as_u64());
-            status.uptime = data
-                .and_then(|data| data.get("uptime"))
-                .and_then(|uptime| uptime.as_u64());
-            statuses.push(status);
+                .boxed(),
+            );
         }
     }
-    statuses
+    futures::future::join_all(futures).await
+}
+
+fn base_vm_status(node: &str, vmid: &str, info: &VmInfo) -> VmStatus {
+    VmStatus {
+        node: node.to_string(),
+        vmid: vmid.to_string(),
+        name: info.name.clone(),
+        danger: info.danger,
+        ips: info.ips.clone(),
+        os: info.os.clone(),
+        roles: info.roles.clone(),
+        memory_used: None,
+        memory_total: None,
+        cpus: None,
+        uptime: None,
+        state: None,
+        error: None,
+    }
+}
+
+fn error_vm_status(
+    node: &str,
+    vmid: &str,
+    info: &VmInfo,
+    message: String,
+) -> futures::future::BoxFuture<'static, VmStatus> {
+    let node = node.to_string();
+    let vmid = vmid.to_string();
+    let info = info.clone();
+    async move {
+        let mut status = base_vm_status(&node, &vmid, &info);
+        status.error = Some(message);
+        status
+    }
+    .boxed()
 }
 
 /// One Proxmox node's read-only health, for non-agent consumers such as the
@@ -392,44 +380,18 @@ pub async fn vm_node_statuses(
         }
     };
 
-    let mut statuses = Vec::new();
+    let mut futures: Vec<futures::future::BoxFuture<'static, VmNodeStatus>> = Vec::new();
     for (node, target) in &store.targets {
-        let mut status = VmNodeStatus {
-            node: node.clone(),
-            danger: target.danger,
-            ips: crate::devops::node_ips(target),
-            cpu: None,
-            memory_total: None,
-            memory_used: None,
-            rootfs_total: None,
-            rootfs_used: None,
-            uptime: None,
-            error: None,
-        };
-
         let Some(api) = target.api.as_ref() else {
-            status.error = Some(format!(
-                "target \"{node}\" has no `api` transport configured"
-            ));
-            statuses.push(status);
+            let message = format!("target \"{node}\" has no `api` transport configured");
+            futures.push(error_node_status(node, target, message));
             continue;
         };
 
         let http_client = match resolve_http_client(target, shared_http_client.clone()) {
             Ok(client) => client,
             Err(error) => {
-                status.error = Some(tool_error(error));
-                statuses.push(status);
-                continue;
-            }
-        };
-
-        let request = match assemble_api_request(target, VmOperation::NodeStatus, None, None, None)
-        {
-            Ok(request) => request,
-            Err(error) => {
-                status.error = Some(error.to_string());
-                statuses.push(status);
+                futures.push(error_node_status(node, target, tool_error(error)));
                 continue;
             }
         };
@@ -437,55 +399,93 @@ pub async fn vm_node_statuses(
         let secret = match read_secret(cx, &api.token_secret_url).await {
             Ok(secret) => secret,
             Err(error) => {
-                status.error = Some(tool_error(error));
-                statuses.push(status);
+                futures.push(error_node_status(node, target, tool_error(error)));
                 continue;
             }
         };
 
-        let value = match call_api(
-            &http_client,
-            &request,
-            &api.token_id,
-            &secret,
-            &api.base_url,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                status.error = Some(tool_error(error));
-                statuses.push(status);
-                continue;
+        let node = node.clone();
+        let target = target.clone();
+        let token_id = api.token_id.clone();
+        let base_url = api.base_url.clone();
+        futures.push(
+            async move {
+                let mut status = base_node_status(&node, &target);
+                let request =
+                    match assemble_api_request(&target, VmOperation::NodeStatus, None, None, None) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            status.error = Some(error.to_string());
+                            return status;
+                        }
+                    };
+                let value =
+                    match call_api(&http_client, &request, &token_id, &secret, &base_url).await {
+                        Ok(value) => value,
+                        Err(error) => {
+                            status.error = Some(tool_error(error));
+                            return status;
+                        }
+                    };
+                let data = value.get("data");
+                status.cpu = data
+                    .and_then(|data| data.get("cpu"))
+                    .and_then(|cpu| cpu.as_f64());
+                status.memory_total = data
+                    .and_then(|data| data.get("memory"))
+                    .and_then(|memory| memory.get("total"))
+                    .and_then(|total| total.as_u64());
+                status.memory_used = data
+                    .and_then(|data| data.get("memory"))
+                    .and_then(|memory| memory.get("used"))
+                    .and_then(|used| used.as_u64());
+                status.rootfs_total = data
+                    .and_then(|data| data.get("rootfs"))
+                    .and_then(|rootfs| rootfs.get("total"))
+                    .and_then(|total| total.as_u64());
+                status.rootfs_used = data
+                    .and_then(|data| data.get("rootfs"))
+                    .and_then(|rootfs| rootfs.get("used"))
+                    .and_then(|used| used.as_u64());
+                status.uptime = data
+                    .and_then(|data| data.get("uptime"))
+                    .and_then(|uptime| uptime.as_u64());
+                status
             }
-        };
-
-        let data = value.get("data");
-        status.cpu = data
-            .and_then(|data| data.get("cpu"))
-            .and_then(|cpu| cpu.as_f64());
-        status.memory_total = data
-            .and_then(|data| data.get("memory"))
-            .and_then(|memory| memory.get("total"))
-            .and_then(|total| total.as_u64());
-        status.memory_used = data
-            .and_then(|data| data.get("memory"))
-            .and_then(|memory| memory.get("used"))
-            .and_then(|used| used.as_u64());
-        status.rootfs_total = data
-            .and_then(|data| data.get("rootfs"))
-            .and_then(|rootfs| rootfs.get("total"))
-            .and_then(|total| total.as_u64());
-        status.rootfs_used = data
-            .and_then(|data| data.get("rootfs"))
-            .and_then(|rootfs| rootfs.get("used"))
-            .and_then(|used| used.as_u64());
-        status.uptime = data
-            .and_then(|data| data.get("uptime"))
-            .and_then(|uptime| uptime.as_u64());
-        statuses.push(status);
+            .boxed(),
+        );
     }
-    statuses
+    futures::future::join_all(futures).await
+}
+
+fn base_node_status(node: &str, target: &VmTarget) -> VmNodeStatus {
+    VmNodeStatus {
+        node: node.to_string(),
+        danger: target.danger,
+        ips: crate::devops::node_ips(target),
+        cpu: None,
+        memory_total: None,
+        memory_used: None,
+        rootfs_total: None,
+        rootfs_used: None,
+        uptime: None,
+        error: None,
+    }
+}
+
+fn error_node_status(
+    node: &str,
+    target: &VmTarget,
+    message: String,
+) -> futures::future::BoxFuture<'static, VmNodeStatus> {
+    let node = node.to_string();
+    let target = target.clone();
+    async move {
+        let mut status = base_node_status(&node, &target);
+        status.error = Some(message);
+        status
+    }
+    .boxed()
 }
 
 /// Performs a VM operation against the configured targets on disk.
