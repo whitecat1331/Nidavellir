@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::containers::{ContainerDriver, ContainerOperation, ContainerStore, assemble_command};
+use crate::containers::{
+    ContainerDriver, ContainerOperation, ContainerStore, ContainerTarget, assemble_command,
+};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, AppContext as _, SharedString, Task};
