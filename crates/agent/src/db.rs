@@ -779,6 +779,15 @@ impl ThreadsDatabase {
             s().ok();
         }
 
+        // `list_threads` orders by `updated_at DESC, created_at DESC`; without an
+        // index SQLite full-scans the blob-heavy `threads` table and temp-sorts it
+        // on every sidebar refresh / thread activation (ISSUE-0063).
+        connection.exec(indoc! {"
+                CREATE INDEX IF NOT EXISTS idx_threads_updated_at
+                    ON threads(updated_at DESC, created_at DESC)
+            "})?()
+        .map_err(|e| e.context("Failed to create threads updated_at index"))?;
+
         // Phase C: review comments anchored to agent edit hunks. Kept in their
         // own table (not inside the thread blob) so comment edits stay off the
         // transcript-save path and the reconcile pass can re-point them when it
