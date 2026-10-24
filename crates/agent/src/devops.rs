@@ -46,7 +46,7 @@ pub struct DevOpsConfig {
 }
 
 fn default_live() -> bool {
-    true
+    false
 }
 
 fn default_normal_interval() -> u64 {
@@ -64,7 +64,7 @@ fn default_live_report_interval() -> u64 {
 impl Default for DevOpsConfig {
     fn default() -> Self {
         Self {
-            live: true,
+            live: false,
             ping_interval_secs: 60,
             proxmox_interval_secs: 60,
             container_interval_secs: 60,

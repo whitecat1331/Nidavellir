@@ -131,8 +131,9 @@ impl DevOpsPanel {
     }
 
     /// Starts the single scheduler loop that runs the ping and report sweeps on
-    /// their own cadences. When the panel is not live (unchecked or closed) the
-    /// loop idles without making any network calls.
+    /// their own cadences. Polling always runs — `live` only switches the rate
+    /// (live vs configured) — so the data stays fresh whether or not the pane is
+    /// open.
     fn start_scheduler(&mut self, cx: &mut Context<Self>) {
         let http_client = cx.http_client();
         self._task = cx.spawn(async move |this, cx| {
@@ -141,10 +142,9 @@ impl DevOpsPanel {
             let mut next_container = Instant::now();
             let mut initialized = false;
             loop {
-                let (running, ping_interval, proxmox_interval, container_interval) = match this
+                let (ping_interval, proxmox_interval, container_interval) = match this
                     .read_with(cx, |panel, _cx| {
                         (
-                            panel.live(),
                             panel.ping_interval(),
                             panel.proxmox_interval(),
                             panel.container_interval(),
@@ -154,7 +154,7 @@ impl DevOpsPanel {
                     Err(_) => break,
                 };
                 let now = Instant::now();
-                if running && !initialized {
+                if !initialized {
                     let (pings, nodes, vms, containers) = futures::join!(
                         agent::ping_statuses(cx),
                         agent::vm_node_statuses(cx, http_client.clone()),
@@ -177,7 +177,7 @@ impl DevOpsPanel {
                     next_proxmox = Instant::now() + proxmox_interval;
                     next_container = Instant::now() + container_interval;
                     initialized = true;
-                } else if running {
+                } else {
                     if now >= next_ping {
                         let pings = agent::ping_statuses(cx).await;
                         if this
@@ -256,11 +256,6 @@ impl DevOpsPanel {
         );
         self.list_state.reset(self.rows.len());
         cx.notify();
-    }
-
-    /// Whether polling should run: the live checkbox is on and the dock is open.
-    fn live(&self) -> bool {
-        self.config.live && self.active
     }
 
     fn ping_interval(&self) -> Duration {
@@ -997,6 +992,9 @@ impl Panel for DevOpsPanel {
             return;
         }
         self.active = active;
+        if active {
+            self.refresh_now(cx);
+        }
         cx.notify();
     }
 
