@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use agent::containers::{ContainerDriver, ContainerOperation};
-use agent::vms::VmOperation;
+use agent::containers::{ContainerDriver, ContainerOperation, ContainerStore, ContainerTarget};
+use agent::vms::{VmInfo, VmOperation, VmStore, VmTarget};
 use agent::{ContainerStatus, DevOpsConfig, PingStatuses, Reachability, VmNodeStatus, VmStatus};
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -43,6 +43,10 @@ pub struct DevOpsPanel {
     container_editor: Entity<Editor>,
     collapsed: BTreeSet<String>,
     selected: Option<Selection>,
+    vm_store: VmStore,
+    container_store: ContainerStore,
+    show_settings: bool,
+    settings_draft: Option<SettingsDraft>,
     _task: Task<()>,
 }
 
@@ -72,6 +76,54 @@ enum Selection {
     Container(String),
 }
 
+/// An in-progress machine edit form in the settings manager.
+struct SettingsDraft {
+    is_new: bool,
+    kind: DraftKind,
+    ips: Entity<Editor>,
+    os: Entity<Editor>,
+    roles: Entity<Editor>,
+    probe_port: Entity<Editor>,
+}
+
+enum DraftKind {
+    Vm {
+        node: String,
+        vmid: String,
+        vmid_editor: Entity<Editor>,
+        name: Entity<Editor>,
+        danger: bool,
+    },
+    Container {
+        id: String,
+        id_editor: Entity<Editor>,
+        host: Entity<Editor>,
+        driver: ContainerDriver,
+        dir: Entity<Editor>,
+        file: Entity<Editor>,
+        service: Entity<Editor>,
+    },
+}
+
+/// The owned, validated form values read from a [`SettingsDraft`] before the
+/// panel mutates its stores.
+enum DraftValues {
+    Vm {
+        node: String,
+        vmid: String,
+        name: String,
+        danger: bool,
+    },
+    Container {
+        id: String,
+        host: String,
+        driver: ContainerDriver,
+        dir: Option<String>,
+        file: Option<String>,
+        service: Option<String>,
+    },
+}
+
 impl Focusable for DevOpsPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -91,6 +143,15 @@ impl DevOpsPanel {
                 log::error!("failed to load devops config, using defaults: {error}");
                 DevOpsConfig::default()
             });
+            let vm_store = VmStore::load(VmStore::default_path()).unwrap_or_else(|error| {
+                log::error!("failed to load vm store, using empty: {error}");
+                VmStore::default()
+            });
+            let container_store =
+                ContainerStore::load(ContainerStore::default_path()).unwrap_or_else(|error| {
+                    log::error!("failed to load container store, using empty: {error}");
+                    ContainerStore::default()
+                });
             let ping_editor =
                 new_interval_editor(IntervalKind::Ping, config.ping_interval_secs, window, cx);
             let proxmox_editor = new_interval_editor(
@@ -121,6 +182,10 @@ impl DevOpsPanel {
                 container_editor,
                 collapsed: BTreeSet::new(),
                 selected: None,
+                vm_store,
+                container_store,
+                show_settings: false,
+                settings_draft: None,
                 _task: Task::ready(()),
             };
             this.start_scheduler(cx);
@@ -571,6 +636,705 @@ impl DevOpsPanel {
         self.selected = Some(selection);
         cx.notify();
     }
+
+    // ── Settings manager ─────────────────────────────────────────────
+
+    fn settings_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("devops-settings", "Settings")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.show_settings = !this.show_settings;
+                this.settings_draft = None;
+                cx.notify();
+            }))
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .size_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(Label::new("Machine settings").weight(FontWeight::SEMIBOLD))
+                    .child(
+                        Button::new("devops-settings-close", "Close")
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.show_settings = false;
+                                this.settings_draft = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.settings_list(cx))
+                    .when_some(self.settings_draft.as_ref(), |this, _| {
+                        this.child(self.settings_form(cx))
+                    }),
+            )
+    }
+
+    fn settings_list(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .gap_1()
+            .child(
+                Label::new("Virtual machines")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .children(self.settings_vm_rows(cx))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        Label::new("Containers")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(self.add_container_button(cx)),
+            )
+            .children(self.settings_container_rows(cx))
+    }
+
+    fn add_container_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("devops-add-container", "Add container")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.start_new_container(window, cx);
+            }))
+    }
+
+    fn settings_vm_rows(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut rows = Vec::new();
+        for (node, target) in &self.vm_store.targets {
+            rows.push(self.settings_node_row(node, target, cx));
+            for (vmid, info) in &target.vms {
+                rows.push(self.settings_vm_row(node, vmid, info, cx));
+            }
+        }
+        rows
+    }
+
+    fn settings_container_rows(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        self.container_store
+            .targets
+            .iter()
+            .map(|(id, target)| self.settings_container_row(id, target, cx))
+            .collect()
+    }
+
+    fn settings_node_row(&self, node: &str, target: &VmTarget, cx: &mut Context<Self>) -> Div {
+        let node = node.to_string();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .px_1()
+            .child(
+                Label::new(format!("node · {node}"))
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::SEMIBOLD),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new(format!("{} vm(s)", target.vms.len()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(self.add_vm_button(&node, cx))
+    }
+
+    fn settings_vm_row(
+        &self,
+        node: &str,
+        vmid: &str,
+        info: &VmInfo,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let node = node.to_string();
+        let vmid = vmid.to_string();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .pl_4()
+            .pr_1()
+            .child(Label::new(info.name.clone()).size(LabelSize::Small).truncate())
+            .child(
+                Label::new(format!("vmid {vmid}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new(info.ips.join(", "))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(self.edit_vm_button(&node, &vmid, cx))
+            .child(self.remove_vm_button(&node, &vmid, cx))
+    }
+
+    fn settings_container_row(
+        &self,
+        id: &str,
+        target: &ContainerTarget,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let id = id.to_string();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .pl_4()
+            .pr_1()
+            .child(Label::new(id.clone()).size(LabelSize::Small).truncate())
+            .child(
+                Label::new(driver_label(target.driver))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new(target.ips.join(", "))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(self.edit_container_button(&id, cx))
+            .child(self.remove_container_button(&id, cx))
+    }
+
+    fn add_vm_button(&self, node: &str, cx: &mut Context<Self>) -> Button {
+        let node = node.to_string();
+        Button::new(format!("devops-add-vm-{node}"), "Add VM")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.start_new_vm(node.clone(), window, cx);
+            }))
+    }
+
+    fn edit_vm_button(&self, node: &str, vmid: &str, cx: &mut Context<Self>) -> Button {
+        let node = node.to_string();
+        let vmid = vmid.to_string();
+        Button::new(format!("devops-edit-vm-{node}-{vmid}"), "Edit")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.start_vm_edit(node.clone(), vmid.clone(), window, cx);
+            }))
+    }
+
+    fn remove_vm_button(&self, node: &str, vmid: &str, cx: &mut Context<Self>) -> Button {
+        let node = node.to_string();
+        let vmid = vmid.to_string();
+        Button::new(format!("devops-remove-vm-{node}-{vmid}"), "Remove")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.remove_vm(node.clone(), vmid.clone(), cx);
+            }))
+    }
+
+    fn edit_container_button(&self, id: &str, cx: &mut Context<Self>) -> Button {
+        let id = id.to_string();
+        Button::new(format!("devops-edit-container-{id}"), "Edit")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.start_container_edit(id.clone(), window, cx);
+            }))
+    }
+
+    fn remove_container_button(&self, id: &str, cx: &mut Context<Self>) -> Button {
+        let id = id.to_string();
+        Button::new(format!("devops-remove-container-{id}"), "Remove")
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.remove_container(id.clone(), cx);
+            }))
+    }
+
+    fn settings_form(&self, cx: &mut Context<Self>) -> Div {
+        let Some(draft) = self.settings_draft.as_ref() else {
+            return div();
+        };
+        let mut form = v_flex().gap_1().pt_1();
+        match &draft.kind {
+            DraftKind::Vm {
+                node,
+                vmid,
+                vmid_editor,
+                name,
+                danger,
+            } => {
+                form = form
+                    .child(if draft.is_new {
+                        self.vm_node_field(node, cx)
+                    } else {
+                        static_field("node", node)
+                    })
+                    .child(if draft.is_new {
+                        form_field("vmid", vmid_editor)
+                    } else {
+                        static_field("vmid", vmid)
+                    })
+                    .child(form_field("name", name))
+                    .child(form_field("ips", &draft.ips))
+                    .child(form_field("os", &draft.os))
+                    .child(form_field("roles", &draft.roles))
+                    .child(form_field("port", &draft.probe_port))
+                    .child(self.danger_checkbox(*danger, cx));
+            }
+            DraftKind::Container {
+                id,
+                id_editor,
+                host,
+                driver,
+                dir,
+                file,
+                service,
+            } => {
+                form = form
+                    .child(if draft.is_new {
+                        form_field("id", id_editor)
+                    } else {
+                        static_field("id", id)
+                    })
+                    .child(form_field("host", host))
+                    .child(self.driver_field(*driver, cx))
+                    .child(form_field("dir", dir))
+                    .child(form_field("file", file))
+                    .child(form_field("service", service))
+                    .child(form_field("ips", &draft.ips))
+                    .child(form_field("os", &draft.os))
+                    .child(form_field("roles", &draft.roles))
+                    .child(form_field("port", &draft.probe_port));
+            }
+        }
+        form.child(self.form_buttons(cx))
+    }
+
+    fn vm_node_field(&self, selected: &str, cx: &mut Context<Self>) -> Div {
+        let mut field = h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .w(px(72.))
+                    .flex_shrink_0()
+                    .child(Label::new("node").size(LabelSize::Small).color(Color::Muted)),
+            );
+        for node in self.vm_store.targets.keys() {
+            let label = if node.as_str() == selected {
+                format!("● {node}")
+            } else {
+                format!("○ {node}")
+            };
+            let chosen = node.clone();
+            field = field.child(
+                Button::new(format!("devops-node-{node}"), label)
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.select_draft_node(chosen.clone(), cx);
+                    })),
+            );
+        }
+        field
+    }
+
+    fn select_draft_node(&mut self, node: String, cx: &mut Context<Self>) {
+        if let Some(draft) = self.settings_draft.as_mut() {
+            if let DraftKind::Vm { node: current, .. } = &mut draft.kind {
+                *current = node;
+            }
+        }
+        cx.notify();
+    }
+
+    fn driver_field(&self, current: ContainerDriver, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .w(px(72.))
+                    .flex_shrink_0()
+                    .child(Label::new("driver").size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(self.driver_button(current, ContainerDriver::Compose, "compose", cx))
+            .child(self.driver_button(current, ContainerDriver::Systemd, "systemd", cx))
+    }
+
+    fn driver_button(
+        &self,
+        current: ContainerDriver,
+        value: ContainerDriver,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let text = if current == value {
+            format!("● {label}")
+        } else {
+            format!("○ {label}")
+        };
+        Button::new(format!("devops-driver-{label}"), text)
+            .size(ButtonSize::Compact)
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if let Some(draft) = this.settings_draft.as_mut() {
+                    if let DraftKind::Container { driver, .. } = &mut draft.kind {
+                        *driver = value;
+                    }
+                }
+                cx.notify();
+            }))
+    }
+
+    fn danger_checkbox(&self, danger: bool, cx: &mut Context<Self>) -> Checkbox {
+        let weak = cx.weak_entity();
+        Checkbox::new(
+            "devops-vm-danger",
+            if danger {
+                ToggleState::Selected
+            } else {
+                ToggleState::Unselected
+            },
+        )
+        .label("danger (infra-critical)")
+        .label_size(LabelSize::Small)
+        .on_click(move |state, _window, cx| {
+            let danger = *state == ToggleState::Selected;
+            weak.update(cx, |this, cx| {
+                if let Some(draft) = this.settings_draft.as_mut() {
+                    if let DraftKind::Vm { danger: field, .. } = &mut draft.kind {
+                        *field = danger;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+    }
+
+    fn form_buttons(&self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .gap_1()
+            .pt_1()
+            .child(
+                Button::new("devops-save", "Save")
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.save_draft(cx))),
+            )
+            .child(
+                Button::new("devops-cancel", "Cancel")
+                    .size(ButtonSize::Compact)
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.settings_draft = None;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn start_vm_edit(
+        &mut self,
+        node: String,
+        vmid: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let info = self
+            .vm_store
+            .targets
+            .get(&node)
+            .and_then(|target| target.vms.get(&vmid));
+        let (name, ips, os, roles, probe_port, danger) = match info {
+            Some(info) => (
+                info.name.clone(),
+                info.ips.join(", "),
+                info.os.clone().unwrap_or_default(),
+                info.roles.join(", "),
+                info.probe_port.map(|p| p.to_string()).unwrap_or_default(),
+                info.danger,
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+            ),
+        };
+        self.settings_draft = Some(SettingsDraft {
+            is_new: false,
+            kind: DraftKind::Vm {
+                node,
+                vmid,
+                vmid_editor: single_line_editor("", window, cx),
+                name: single_line_editor(&name, window, cx),
+                danger,
+            },
+            ips: single_line_editor(&ips, window, cx),
+            os: single_line_editor(&os, window, cx),
+            roles: single_line_editor(&roles, window, cx),
+            probe_port: single_line_editor(&probe_port, window, cx),
+        });
+        cx.notify();
+    }
+
+    fn start_new_vm(&mut self, node: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_draft = Some(SettingsDraft {
+            is_new: true,
+            kind: DraftKind::Vm {
+                node,
+                vmid: String::new(),
+                vmid_editor: single_line_editor("", window, cx),
+                name: single_line_editor("", window, cx),
+                danger: false,
+            },
+            ips: single_line_editor("", window, cx),
+            os: single_line_editor("", window, cx),
+            roles: single_line_editor("", window, cx),
+            probe_port: single_line_editor("", window, cx),
+        });
+        cx.notify();
+    }
+
+    fn start_container_edit(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.container_store.targets.get(&id);
+        let (host, driver, dir, file, service, ips, os, roles, probe_port) = match target {
+            Some(target) => (
+                target.host.clone(),
+                target.driver,
+                target.dir.clone().unwrap_or_default(),
+                target.file.clone().unwrap_or_default(),
+                target.service.clone().unwrap_or_default(),
+                target.ips.join(", "),
+                target.os.clone().unwrap_or_default(),
+                target.roles.join(", "),
+                target.probe_port.map(|p| p.to_string()).unwrap_or_default(),
+            ),
+            None => (
+                String::new(),
+                ContainerDriver::Compose,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        };
+        self.settings_draft = Some(SettingsDraft {
+            is_new: false,
+            kind: DraftKind::Container {
+                id,
+                id_editor: single_line_editor("", window, cx),
+                host: single_line_editor(&host, window, cx),
+                driver,
+                dir: single_line_editor(&dir, window, cx),
+                file: single_line_editor(&file, window, cx),
+                service: single_line_editor(&service, window, cx),
+            },
+            ips: single_line_editor(&ips, window, cx),
+            os: single_line_editor(&os, window, cx),
+            roles: single_line_editor(&roles, window, cx),
+            probe_port: single_line_editor(&probe_port, window, cx),
+        });
+        cx.notify();
+    }
+
+    fn start_new_container(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_draft = Some(SettingsDraft {
+            is_new: true,
+            kind: DraftKind::Container {
+                id: String::new(),
+                id_editor: single_line_editor("", window, cx),
+                host: single_line_editor("", window, cx),
+                driver: ContainerDriver::Compose,
+                dir: single_line_editor("", window, cx),
+                file: single_line_editor("", window, cx),
+                service: single_line_editor("", window, cx),
+            },
+            ips: single_line_editor("", window, cx),
+            os: single_line_editor("", window, cx),
+            roles: single_line_editor("", window, cx),
+            probe_port: single_line_editor("", window, cx),
+        });
+        cx.notify();
+    }
+
+    fn save_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.settings_draft.as_ref() else {
+            return;
+        };
+        let is_new = draft.is_new;
+        let ips = split_list(&draft.ips.read(cx).text(cx));
+        let os = empty_to_none(&draft.os.read(cx).text(cx));
+        let roles = split_list(&draft.roles.read(cx).text(cx));
+        let probe_port = parse_optional_port(&draft.probe_port.read(cx).text(cx));
+        let values = match &draft.kind {
+            DraftKind::Vm {
+                node,
+                vmid,
+                vmid_editor,
+                name,
+                danger,
+            } => DraftValues::Vm {
+                node: node.clone(),
+                vmid: if is_new {
+                    vmid_editor.read(cx).text(cx).trim().to_string()
+                } else {
+                    vmid.clone()
+                },
+                name: name.read(cx).text(cx).trim().to_string(),
+                danger: *danger,
+            },
+            DraftKind::Container {
+                id,
+                id_editor,
+                host,
+                driver,
+                dir,
+                file,
+                service,
+            } => DraftValues::Container {
+                id: if is_new {
+                    id_editor.read(cx).text(cx).trim().to_string()
+                } else {
+                    id.clone()
+                },
+                host: host.read(cx).text(cx).trim().to_string(),
+                driver: *driver,
+                dir: empty_to_none(&dir.read(cx).text(cx)),
+                file: empty_to_none(&file.read(cx).text(cx)),
+                service: empty_to_none(&service.read(cx).text(cx)),
+            },
+        };
+
+        match values {
+            DraftValues::Vm {
+                node,
+                vmid,
+                name,
+                danger,
+            } => {
+                if vmid.is_empty() {
+                    return self.fail_settings("vmid must not be empty", cx);
+                }
+                let Some(target) = self.vm_store.targets.get_mut(&node) else {
+                    return self.fail_settings(&format!("node {node} not found"), cx);
+                };
+                if is_new && target.vms.contains_key(&vmid) {
+                    return self.fail_settings(&format!("vmid {vmid} already exists on {node}"), cx);
+                }
+                target.vms.insert(
+                    vmid,
+                    VmInfo {
+                        name,
+                        danger,
+                        ips,
+                        os,
+                        roles,
+                        probe_port,
+                    },
+                );
+            }
+            DraftValues::Container {
+                id,
+                host,
+                driver,
+                dir,
+                file,
+                service,
+            } => {
+                if id.is_empty() {
+                    return self.fail_settings("id must not be empty", cx);
+                }
+                if host.is_empty() {
+                    return self.fail_settings("host must not be empty", cx);
+                }
+                if is_new && self.container_store.targets.contains_key(&id) {
+                    return self.fail_settings(&format!("container {id} already exists"), cx);
+                }
+                let existing = self.container_store.targets.remove(&id);
+                let target = match existing {
+                    Some(mut target) => {
+                        target.host = host;
+                        target.driver = driver;
+                        target.dir = dir;
+                        target.file = file;
+                        target.service = service;
+                        target.ips = ips;
+                        target.os = os;
+                        target.roles = roles;
+                        target.probe_port = probe_port;
+                        target
+                    }
+                    None => ContainerTarget {
+                        host,
+                        identity_file: None,
+                        driver,
+                        dir,
+                        file,
+                        env_file: None,
+                        service,
+                        ips,
+                        os,
+                        roles,
+                        probe_port,
+                    },
+                };
+                self.container_store.targets.insert(id, target);
+            }
+        }
+
+        if let Err(error) = self.vm_store.save(VmStore::default_path()) {
+            log::error!("failed to save vm store: {error}");
+        }
+        if let Err(error) = self.container_store.save(ContainerStore::default_path()) {
+            log::error!("failed to save container store: {error}");
+        }
+        self.settings_draft = None;
+        self.last_error = None;
+        self.refresh_now(cx);
+        cx.notify();
+    }
+
+    fn fail_settings(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.last_error = Some(message.to_string());
+        cx.notify();
+    }
+
+    fn remove_vm(&mut self, node: String, vmid: String, cx: &mut Context<Self>) {
+        if let Some(target) = self.vm_store.targets.get_mut(&node) {
+            target.vms.remove(&vmid);
+        }
+        if let Err(error) = self.vm_store.save(VmStore::default_path()) {
+            log::error!("failed to save vm store: {error}");
+        }
+        self.refresh_now(cx);
+        cx.notify();
+    }
+
+    fn remove_container(&mut self, id: String, cx: &mut Context<Self>) {
+        self.container_store.targets.remove(&id);
+        if let Err(error) = self.container_store.save(ContainerStore::default_path()) {
+            log::error!("failed to save container store: {error}");
+        }
+        self.refresh_now(cx);
+        cx.notify();
+    }
 }
 
 /// Creates a single-line editor seeded with the current interval value, wired so
@@ -606,6 +1370,78 @@ fn interval_field(label: &'static str, editor: &Entity<Editor>) -> Div {
         .items_center()
         .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
         .child(div().w(px(64.)).child(editor.clone()))
+}
+
+/// Creates a single-line editor pre-filled with `text`, used by the settings
+/// manager's machine-edit form.
+fn single_line_editor(
+    text: &str,
+    window: &mut Window,
+    cx: &mut Context<DevOpsPanel>,
+) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_text(text.to_string(), window, cx);
+        editor
+    })
+}
+
+/// A labelled free-form editor field in the settings form.
+fn form_field(label: &'static str, editor: &Entity<Editor>) -> Div {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .w(px(72.))
+                .flex_shrink_0()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+        )
+        .child(div().flex_1().child(editor.clone()))
+}
+
+/// A read-only labelled field (for identity fields that are fixed on edit).
+fn static_field(label: &'static str, value: &str) -> Div {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .w(px(72.))
+                .flex_shrink_0()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+        )
+        .child(Label::new(value.to_string()).size(LabelSize::Small).truncate())
+}
+
+/// Splits a comma-separated list into a deduplicated, trimmed list of values.
+fn split_list(text: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    text.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .filter(|item| seen.insert(item.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Maps an empty string to `None` and otherwise returns the trimmed string.
+fn empty_to_none(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parses an optional probe port; an empty string means `None`.
+fn parse_optional_port(text: &str) -> Option<u16> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u16>().ok()
 }
 
 /// Flattens the three status sweeps into the panel's row list, grouping VMs
@@ -1123,7 +1959,8 @@ impl Render for DevOpsPanel {
                             .child(self.live_checkbox(cx))
                             .child(interval_field("ping", &self.ping_editor))
                             .child(interval_field("proxmox", &self.proxmox_editor))
-                            .child(interval_field("docker", &self.container_editor)),
+                            .child(interval_field("docker", &self.container_editor))
+                            .child(self.settings_button(cx)),
                     ),
             )
             .when_some(self.last_error.clone(), |this, error| {
@@ -1136,7 +1973,9 @@ impl Render for DevOpsPanel {
                     ),
                 )
             })
-            .child(
+            .child(if self.show_settings {
+                self.render_settings(cx)
+            } else {
                 h_flex()
                     .flex_1()
                     .min_h_0()
@@ -1155,8 +1994,8 @@ impl Render for DevOpsPanel {
                             )
                             .vertical_scrollbar_for(&self.list_state, window, cx),
                     )
-                    .child(div().flex_1().min_w_0().h_full().child(self.render_details(cx))),
-            )
+                    .child(div().flex_1().min_w_0().h_full().child(self.render_details(cx)))
+            })
     }
 }
 
