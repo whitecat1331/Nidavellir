@@ -672,6 +672,7 @@ impl DevOpsPanel {
             )
             .child(
                 div()
+                    .id("devops-settings-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
