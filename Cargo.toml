@@ -52,7 +52,7 @@ members = [
     "crates/debug_adapter_extension",
     "crates/debugger_tools",
     "crates/debugger_ui",
-    "crates/infra_panel",
+    "crates/devops_panel",
     "crates/deepseek",
     "crates/dev_container",
     "crates/diagnostics",
@@ -331,7 +331,7 @@ db = { path = "crates/db" }
 debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
-infra_panel = { path = "crates/infra_panel" }
+devops_panel = { path = "crates/devops_panel" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }

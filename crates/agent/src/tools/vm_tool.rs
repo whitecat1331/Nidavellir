@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use crate::proxmox::{ProxmoxApiRequest, assemble_api_request, assemble_ssh_command};
 use crate::vms::{
-    GatingTier, VmOperation, VmStore, VmTarget, VmTransport, gating_tier, resolve_vmid,
+    GatingTier, VmInfo, VmOperation, VmStore, VmTarget, VmTransport, gating_tier, resolve_vmid,
     validate_input,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use futures::AsyncReadExt as _;
+use futures::FutureExt as _;
 use gpui::{App, AsyncApp, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method, StatusCode};
 use language_model::LanguageModelToolResultContent;
@@ -145,6 +146,20 @@ pub struct VmStatus {
     pub name: String,
     /// Whether this VM is infra-critical.
     pub danger: bool,
+    /// LAN / Tailscale / etc. IPs (enriched registry, D6).
+    pub ips: Vec<String>,
+    /// Operating system (enriched registry, D6).
+    pub os: Option<String>,
+    /// Human-readable role(s) (enriched registry, D6).
+    pub roles: Vec<String>,
+    /// Live memory usage in bytes (`data.mem`).
+    pub memory_used: Option<u64>,
+    /// Live memory maximum in bytes (`data.maxmem`).
+    pub memory_total: Option<u64>,
+    /// Live CPU count (`data.cpus`).
+    pub cpus: Option<u64>,
+    /// Live uptime in seconds (`data.uptime`).
+    pub uptime: Option<u64>,
     /// Proxmox `status` field (`running`, `stopped`, …) when reachable.
     pub state: Option<String>,
     /// The failure reason when the status could not be read.
@@ -161,10 +176,7 @@ fn tool_error(error: VmToolOutput) -> String {
 /// Queries `status/current` for every VM registered in `vms.json`, best-effort:
 /// each VM is queried independently and an unreachable node/VM yields a row
 /// with `state: None` + `error` rather than aborting the sweep.
-pub async fn vm_statuses(
-    cx: &AsyncApp,
-    shared_http_client: Arc<dyn HttpClient>,
-) -> Vec<VmStatus> {
+pub async fn vm_statuses(cx: &AsyncApp, shared_http_client: Arc<dyn HttpClient>) -> Vec<VmStatus> {
     let store = match VmStore::load(VmStore::default_path()) {
         Ok(store) => store,
         Err(error) => {
@@ -173,29 +185,27 @@ pub async fn vm_statuses(
                 vmid: String::new(),
                 name: String::new(),
                 danger: false,
+                ips: Vec::new(),
+                os: None,
+                roles: Vec::new(),
+                memory_used: None,
+                memory_total: None,
+                cpus: None,
+                uptime: None,
                 state: None,
                 error: Some(format!("Failed to load vm config: {error}")),
             }];
         }
     };
 
-    let mut statuses = Vec::new();
+    let mut futures: Vec<futures::future::BoxFuture<'static, VmStatus>> = Vec::new();
     for (node, target) in &store.targets {
-        let api = match target.api.as_ref() {
-            Some(api) => api,
-            None => {
-                for (vmid, info) in &target.vms {
-                    statuses.push(VmStatus {
-                        node: node.clone(),
-                        vmid: vmid.clone(),
-                        name: info.name.clone(),
-                        danger: info.danger,
-                        state: None,
-                        error: Some(format!("target \"{node}\" has no `api` transport configured")),
-                    });
-                }
-                continue;
+        let Some(api) = target.api.as_ref() else {
+            let message = format!("target \"{node}\" has no `api` transport configured");
+            for (vmid, info) in &target.vms {
+                futures.push(error_vm_status(node, vmid, info, message.clone()));
             }
+            continue;
         };
 
         let http_client = match resolve_http_client(target, shared_http_client.clone()) {
@@ -203,82 +213,279 @@ pub async fn vm_statuses(
             Err(error) => {
                 let message = tool_error(error);
                 for (vmid, info) in &target.vms {
-                    statuses.push(VmStatus {
-                        node: node.clone(),
-                        vmid: vmid.clone(),
-                        name: info.name.clone(),
-                        danger: info.danger,
-                        state: None,
-                        error: Some(message.clone()),
-                    });
+                    futures.push(error_vm_status(node, vmid, info, message.clone()));
+                }
+                continue;
+            }
+        };
+
+        let secret = match read_secret(cx, &api.token_secret_url).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                let message = tool_error(error);
+                for (vmid, info) in &target.vms {
+                    futures.push(error_vm_status(node, vmid, info, message.clone()));
                 }
                 continue;
             }
         };
 
         for (vmid, info) in &target.vms {
-            let mut status = VmStatus {
-                node: node.clone(),
-                vmid: vmid.clone(),
-                name: info.name.clone(),
-                danger: info.danger,
-                state: None,
-                error: None,
-            };
-
-            let vmid_number = match vmid.parse::<u32>() {
-                Ok(number) => number,
-                Err(error) => {
-                    status.error = Some(format!("invalid VMID: {error}"));
-                    statuses.push(status);
-                    continue;
-                }
-            };
-
-            let request = match assemble_api_request(
-                target,
-                VmOperation::Status,
-                Some(vmid_number),
-                None,
-                None,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    status.error = Some(error.to_string());
-                    statuses.push(status);
-                    continue;
-                }
-            };
-
-            let secret = match read_secret(cx, &api.token_secret_url).await {
-                Ok(secret) => secret,
-                Err(error) => {
-                    status.error = Some(tool_error(error));
-                    statuses.push(status);
-                    continue;
-                }
-            };
-
-            let value =
-                match call_api(&http_client, &request, &api.token_id, &secret, &api.base_url).await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        status.error = Some(tool_error(error));
-                        statuses.push(status);
-                        continue;
+            let node = node.clone();
+            let vmid = vmid.clone();
+            let info = info.clone();
+            let target = target.clone();
+            let token_id = api.token_id.clone();
+            let base_url = api.base_url.clone();
+            let secret = secret.clone();
+            let http_client = http_client.clone();
+            futures.push(
+                async move {
+                    let mut status = base_vm_status(&node, &vmid, &info);
+                    let vmid_number = match vmid.parse::<u32>() {
+                        Ok(number) => number,
+                        Err(error) => {
+                            status.error = Some(format!("invalid VMID: {error}"));
+                            return status;
+                        }
+                    };
+                    let request = match assemble_api_request(
+                        &target,
+                        VmOperation::Status,
+                        Some(vmid_number),
+                        None,
+                        None,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            status.error = Some(error.to_string());
+                            return status;
+                        }
+                    };
+                    match call_api(&http_client, &request, &token_id, &secret, &base_url).await {
+                        Ok(value) => {
+                            let data = value.get("data");
+                            status.state = data
+                                .and_then(|data| data.get("status"))
+                                .and_then(|state| state.as_str())
+                                .map(str::to_string);
+                            status.memory_used = data
+                                .and_then(|data| data.get("mem"))
+                                .and_then(|mem| mem.as_u64());
+                            status.memory_total = data
+                                .and_then(|data| data.get("maxmem"))
+                                .and_then(|maxmem| maxmem.as_u64());
+                            status.cpus = data
+                                .and_then(|data| data.get("cpus"))
+                                .and_then(|cpus| cpus.as_u64());
+                            status.uptime = data
+                                .and_then(|data| data.get("uptime"))
+                                .and_then(|uptime| uptime.as_u64());
+                        }
+                        Err(error) => status.error = Some(tool_error(error)),
                     }
-                };
-
-            status.state = value
-                .get("data")
-                .and_then(|data| data.get("status"))
-                .and_then(|state| state.as_str())
-                .map(str::to_string);
-            statuses.push(status);
+                    status
+                }
+                .boxed(),
+            );
         }
     }
-    statuses
+    futures::future::join_all(futures).await
+}
+
+fn base_vm_status(node: &str, vmid: &str, info: &VmInfo) -> VmStatus {
+    VmStatus {
+        node: node.to_string(),
+        vmid: vmid.to_string(),
+        name: info.name.clone(),
+        danger: info.danger,
+        ips: info.ips.clone(),
+        os: info.os.clone(),
+        roles: info.roles.clone(),
+        memory_used: None,
+        memory_total: None,
+        cpus: None,
+        uptime: None,
+        state: None,
+        error: None,
+    }
+}
+
+fn error_vm_status(
+    node: &str,
+    vmid: &str,
+    info: &VmInfo,
+    message: String,
+) -> futures::future::BoxFuture<'static, VmStatus> {
+    let node = node.to_string();
+    let vmid = vmid.to_string();
+    let info = info.clone();
+    async move {
+        let mut status = base_vm_status(&node, &vmid, &info);
+        status.error = Some(message);
+        status
+    }
+    .boxed()
+}
+
+/// One Proxmox node's read-only health, for non-agent consumers such as the
+/// infra dashboard panel. Holds no infra of its own — the targets come from the
+/// seeded `vms.json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VmNodeStatus {
+    /// `vms.json` target id (the Proxmox node).
+    pub node: String,
+    /// Whether this node is infra-critical.
+    pub danger: bool,
+    /// The node's management IP(s), derived from its API/SSH transport config.
+    pub ips: Vec<String>,
+    /// Fraction of node CPU in use (0.0..=1.0) from `/nodes/{node}/status`.
+    pub cpu: Option<f64>,
+    /// Total node memory in bytes.
+    pub memory_total: Option<u64>,
+    /// Used node memory in bytes.
+    pub memory_used: Option<u64>,
+    /// Total root filesystem size in bytes.
+    pub rootfs_total: Option<u64>,
+    /// Used root filesystem space in bytes.
+    pub rootfs_used: Option<u64>,
+    /// Live node uptime in seconds.
+    pub uptime: Option<u64>,
+    /// The failure reason when the status could not be read.
+    pub error: Option<String>,
+}
+
+/// Queries `/nodes/{node}/status` for every node registered in `vms.json`,
+/// best-effort: each node is queried independently and an unreachable node
+/// yields a row with `error` rather than aborting the sweep.
+pub async fn vm_node_statuses(
+    cx: &AsyncApp,
+    shared_http_client: Arc<dyn HttpClient>,
+) -> Vec<VmNodeStatus> {
+    let store = match VmStore::load(VmStore::default_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return vec![VmNodeStatus {
+                node: String::new(),
+                danger: false,
+                ips: Vec::new(),
+                cpu: None,
+                memory_total: None,
+                memory_used: None,
+                rootfs_total: None,
+                rootfs_used: None,
+                uptime: None,
+                error: Some(format!("Failed to load vm config: {error}")),
+            }];
+        }
+    };
+
+    let mut futures: Vec<futures::future::BoxFuture<'static, VmNodeStatus>> = Vec::new();
+    for (node, target) in &store.targets {
+        let Some(api) = target.api.as_ref() else {
+            let message = format!("target \"{node}\" has no `api` transport configured");
+            futures.push(error_node_status(node, target, message));
+            continue;
+        };
+
+        let http_client = match resolve_http_client(target, shared_http_client.clone()) {
+            Ok(client) => client,
+            Err(error) => {
+                futures.push(error_node_status(node, target, tool_error(error)));
+                continue;
+            }
+        };
+
+        let secret = match read_secret(cx, &api.token_secret_url).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                futures.push(error_node_status(node, target, tool_error(error)));
+                continue;
+            }
+        };
+
+        let node = node.clone();
+        let target = target.clone();
+        let token_id = api.token_id.clone();
+        let base_url = api.base_url.clone();
+        futures.push(
+            async move {
+                let mut status = base_node_status(&node, &target);
+                let request =
+                    match assemble_api_request(&target, VmOperation::NodeStatus, None, None, None) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            status.error = Some(error.to_string());
+                            return status;
+                        }
+                    };
+                let value =
+                    match call_api(&http_client, &request, &token_id, &secret, &base_url).await {
+                        Ok(value) => value,
+                        Err(error) => {
+                            status.error = Some(tool_error(error));
+                            return status;
+                        }
+                    };
+                let data = value.get("data");
+                status.cpu = data
+                    .and_then(|data| data.get("cpu"))
+                    .and_then(|cpu| cpu.as_f64());
+                status.memory_total = data
+                    .and_then(|data| data.get("memory"))
+                    .and_then(|memory| memory.get("total"))
+                    .and_then(|total| total.as_u64());
+                status.memory_used = data
+                    .and_then(|data| data.get("memory"))
+                    .and_then(|memory| memory.get("used"))
+                    .and_then(|used| used.as_u64());
+                status.rootfs_total = data
+                    .and_then(|data| data.get("rootfs"))
+                    .and_then(|rootfs| rootfs.get("total"))
+                    .and_then(|total| total.as_u64());
+                status.rootfs_used = data
+                    .and_then(|data| data.get("rootfs"))
+                    .and_then(|rootfs| rootfs.get("used"))
+                    .and_then(|used| used.as_u64());
+                status.uptime = data
+                    .and_then(|data| data.get("uptime"))
+                    .and_then(|uptime| uptime.as_u64());
+                status
+            }
+            .boxed(),
+        );
+    }
+    futures::future::join_all(futures).await
+}
+
+fn base_node_status(node: &str, target: &VmTarget) -> VmNodeStatus {
+    VmNodeStatus {
+        node: node.to_string(),
+        danger: target.danger,
+        ips: crate::devops::node_ips(target),
+        cpu: None,
+        memory_total: None,
+        memory_used: None,
+        rootfs_total: None,
+        rootfs_used: None,
+        uptime: None,
+        error: None,
+    }
+}
+
+fn error_node_status(
+    node: &str,
+    target: &VmTarget,
+    message: String,
+) -> futures::future::BoxFuture<'static, VmNodeStatus> {
+    let node = node.to_string();
+    let target = target.clone();
+    async move {
+        let mut status = base_node_status(&node, &target);
+        status.error = Some(message);
+        status
+    }
+    .boxed()
 }
 
 /// Performs a VM operation against the configured targets on disk.
@@ -349,6 +556,70 @@ async fn run_operation(
             .await
         }
     }
+}
+
+/// Public, panel-facing mutation entry point that reuses the private
+/// `run_operation` (gating/validation/transport/token).
+pub async fn vm_operation(
+    cx: &AsyncApp,
+    target: String,
+    operation: VmOperation,
+    vmid: Option<u32>,
+    confirm: bool,
+    reason: Option<String>,
+) -> Result<VmToolOutput, VmToolOutput> {
+    let shared_http_client = cx.update(|cx| cx.http_client());
+    run_operation(
+        VmToolInput {
+            target,
+            operation,
+            transport: None,
+            vmid,
+            snapname: None,
+            migrate_target: None,
+            args: Vec::new(),
+            confirm,
+            reason,
+        },
+        shared_http_client,
+        cx,
+    )
+    .await
+}
+
+/// Powers a VM off: graceful shutdown first, then a hard stop if the guest
+/// ignores ACPI. A `shutdown` task can report success while the VM is still
+/// `running` (`poll_task` does not inspect `exitstatus`), so re-check the live
+/// status before declaring success and fall back to a hard stop.
+pub async fn vm_stop(
+    cx: &AsyncApp,
+    target: String,
+    vmid: u32,
+) -> Result<VmToolOutput, VmToolOutput> {
+    vm_operation(
+        cx,
+        target.clone(),
+        VmOperation::Shutdown,
+        Some(vmid),
+        true,
+        None,
+    )
+    .await?;
+
+    let http_client = cx.update(|cx| cx.http_client());
+    let statuses = vm_statuses(cx, http_client).await;
+    let still_running = statuses.iter().any(|status| {
+        status.node == target
+            && status.vmid == vmid.to_string()
+            && status.state.as_deref() == Some("running")
+    });
+
+    if still_running {
+        return vm_operation(cx, target, VmOperation::Stop, Some(vmid), true, None).await;
+    }
+    Ok(VmToolOutput::Success {
+        message: format!("VM {vmid} stopped"),
+    })
 }
 
 /// Resolves the HTTP client for the API transport: the shared client by

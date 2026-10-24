@@ -70,6 +70,18 @@ pub struct VmInfo {
     /// Whether this VM is infra-critical (danger-tier for stop/reboot).
     #[serde(default)]
     pub danger: bool,
+    /// LAN / Tailscale / etc. IPs, when known (enriched registry, D6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
+    /// Operating system, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Human-readable role(s), e.g. `["build"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    /// Override for the reachability probe port (default 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_port: Option<u16>,
 }
 
 /// One reachable ops target: a hypervisor node plus the VMs it hosts.
@@ -85,6 +97,10 @@ pub struct VmTarget {
     /// Registered VMs on this node, keyed by VMID (JSON object keys are strings).
     #[serde(default)]
     pub vms: BTreeMap<String, VmInfo>,
+    /// The node's own IPs (management + any other reachable address), when
+    /// known. Falls back to the API/SSH transport host when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
     /// Proxmox API transport (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ProxmoxApiConfig>,
@@ -126,6 +142,14 @@ impl VmStore {
     /// The target registered under `id`, if any.
     pub fn target(&self, id: &str) -> Option<&VmTarget> {
         self.targets.get(id)
+    }
+
+    /// Persists the store to `path` (used by the in-app settings manager).
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = path.as_ref();
+        let contents = serde_json::to_string_pretty(self).context("serializing vm store")?;
+        std::fs::write(path, contents)
+            .with_context(|| format!("writing vm store {}", path.display()))
     }
 }
 
@@ -336,12 +360,17 @@ mod tests {
                         VmInfo {
                             name: format!("vm-{id}"),
                             danger: *danger,
+                            ips: Vec::new(),
+                            os: None,
+                            roles: Vec::new(),
+                            probe_port: None,
                         },
                     )
                 })
                 .collect(),
             api: None,
             ssh: None,
+            ips: Vec::new(),
             danger,
         }
     }
