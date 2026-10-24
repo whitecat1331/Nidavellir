@@ -139,6 +139,14 @@ impl VmStore {
     pub fn target(&self, id: &str) -> Option<&VmTarget> {
         self.targets.get(id)
     }
+
+    /// Persists the store to `path` (used by the in-app settings manager).
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = path.as_ref();
+        let contents = serde_json::to_string_pretty(self).context("serializing vm store")?;
+        std::fs::write(path, contents)
+            .with_context(|| format!("writing vm store {}", path.display()))
+    }
 }
 
 /// A hypervisor ops operation.
