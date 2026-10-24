@@ -1,12 +1,14 @@
 pub mod automations;
 pub mod containers;
 mod db;
+mod devops;
 mod legacy_thread;
 mod memory;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod proxmox;
+mod reachability;
 mod sandboxing;
 mod templates;
 #[cfg(test)]
@@ -20,11 +22,13 @@ mod window_control;
 
 use context_server::ContextServerId;
 pub use db::*;
+pub use devops::*;
 use itertools::Itertools;
 pub use memory::*;
 pub use native_agent_server::NativeAgentServer;
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
+pub use reachability::*;
 pub use sandboxing::{
     ThreadSandbox, sandbox_worktree_writable_paths, settings_sandbox_policy,
     settings_thread_sandbox,

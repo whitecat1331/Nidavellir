@@ -194,6 +194,10 @@ mod tests {
                 VmInfo {
                     name: "quetzalcoatlus".to_string(),
                     danger: true,
+                    ips: Vec::new(),
+                    os: None,
+                    roles: Vec::new(),
+                    probe_port: None,
                 },
             )]
             .into_iter()
@@ -211,6 +215,7 @@ mod tests {
                 host: "root@10.0.0.24".to_string(),
                 identity_file: None,
             }),
+            ips: Vec::new(),
             danger: false,
         }
     }

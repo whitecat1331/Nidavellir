@@ -169,13 +169,74 @@ pub const COMPLETION_BUDGET_SAFETY_MARGIN: u64 = 16_384;
 /// than being sent with a nonsensical zero.
 pub const MIN_COMPLETION_BUDGET: u64 = 1_024;
 
+/// Tokens charged for each image part. DeepSeek bills vision input per image
+/// (resolution-banded), not by the base64 payload's byte count, so counting the
+/// payload as text would massively over-estimate the input (an ~800 KB
+/// screenshot ≈ 200K phantom tokens). A flat allowance keeps the estimate
+/// conservative without letting screenshots inflate it past the window.
+pub const IMAGE_TOKEN_ALLOWANCE: u64 = 1_600;
+
 impl Request {
-    /// Rough estimate of the request's input-token count from its serialized
-    /// byte size, using the "1 token ≈ 4 bytes" heuristic. The estimate feeds
-    /// the completion-budget clamp; it may under-count token-dense content,
-    /// which the safety margin absorbs.
+    /// Estimate of the request's input-token count using the "1 token ≈ 4
+    /// bytes" heuristic over the *text* it actually sends, plus a fixed
+    /// allowance per image. It feeds the completion-budget clamp and must not
+    /// count base64 image payloads as text — doing so floors the budget on
+    /// image-heavy threads (live 2026-10-23: eight screenshots added ~1.4M
+    /// phantom tokens and silently truncated every turn).
     pub fn estimated_input_tokens(&self) -> u64 {
-        (serde_json::to_string(self).unwrap_or_default().len() / 4) as u64
+        let mut text_bytes = 0usize;
+        let mut image_count = 0u64;
+
+        for message in &self.messages {
+            match message {
+                RequestMessage::System { content } => text_bytes += content.len(),
+                RequestMessage::User { content } => match content {
+                    MessageContent::Plain(text) => text_bytes += text.len(),
+                    MessageContent::Multipart(parts) => {
+                        for part in parts {
+                            match part {
+                                MessagePart::Text { text } => text_bytes += text.len(),
+                                MessagePart::Image { .. } => image_count += 1,
+                            }
+                        }
+                    }
+                },
+                RequestMessage::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    if let Some(content) = content {
+                        text_bytes += content.len();
+                    }
+                    if let Some(reasoning) = reasoning_content {
+                        text_bytes += reasoning.len();
+                    }
+                    for tool_call in tool_calls {
+                        text_bytes += tool_call.id.len();
+                        match &tool_call.content {
+                            ToolCallContent::Function { function } => {
+                                text_bytes += function.name.len();
+                                text_bytes += function.arguments.len();
+                            }
+                        }
+                    }
+                }
+                RequestMessage::Tool {
+                    content,
+                    tool_call_id,
+                } => {
+                    text_bytes += content.len();
+                    text_bytes += tool_call_id.len();
+                }
+            }
+        }
+
+        // Tool definitions are text payloads that consume context; count them
+        // the same way as messages.
+        text_bytes += serde_json::to_string(&self.tools).unwrap_or_default().len();
+
+        (text_bytes / 4) as u64 + image_count * IMAGE_TOKEN_ALLOWANCE
     }
 }
 
