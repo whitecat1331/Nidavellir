@@ -448,6 +448,7 @@ impl DevOpsPanel {
                     Some(Selection::Vm { node, vmid }) if node == &status.node && vmid == &status.vmid
                 );
                 tree_item_row(
+                    &format!("devops-vm-{}-{}", status.node, status.vmid),
                     &title,
                     vm_state(status),
                     self.ping_for_vm(&status.node, &status.vmid),
@@ -481,6 +482,7 @@ impl DevOpsPanel {
                     Some(Selection::Container(target)) if target == &status.target
                 );
                 tree_item_row(
+                    &format!("devops-container-{}", status.target),
                     &title,
                     container_state(status),
                     self.ping_for_host(&status.target),
@@ -688,11 +690,13 @@ fn tree_group_row(
         title_label
     };
     h_flex()
+        .id(id.clone())
         .h_full()
         .px_2()
         .py_1()
         .gap_1()
         .items_center()
+        .cursor_pointer()
         .on_click(cx.listener(move |this, _event, _window, cx| {
             this.toggle_collapse(id.clone(), cx);
             this.select(selection.clone(), cx);
@@ -705,6 +709,7 @@ fn tree_group_row(
 
 /// A selectable leaf (VM / container) in the tree.
 fn tree_item_row(
+    id: &str,
     title: &str,
     state: (String, Color),
     ping: Reachability,
@@ -719,12 +724,14 @@ fn tree_item_row(
         title_label
     };
     h_flex()
+        .id(id.to_string())
         .h_full()
         .pl_4()
         .pr_2()
         .py_1()
         .gap_2()
         .items_center()
+        .cursor_pointer()
         .on_click(cx.listener(move |this, _event, _window, cx| {
             this.select(selection.clone(), cx);
         }))
