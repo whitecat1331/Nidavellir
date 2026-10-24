@@ -2039,7 +2039,7 @@ impl Render for DevOpsPanel {
                 )
             })
             .child(if self.show_settings {
-                self.render_settings(cx)
+                self.render_settings(cx).into_any_element()
             } else {
                 let split_fraction = self.split_fraction;
                 h_flex()
@@ -2078,6 +2078,7 @@ impl Render for DevOpsPanel {
                             .overflow_hidden()
                             .child(self.render_details(cx)),
                     )
+                    .into_any_element()
             })
     }
 }
