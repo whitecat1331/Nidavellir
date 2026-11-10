@@ -1232,12 +1232,24 @@ impl NativeAgent {
                 })
                 .collect::<Vec<_>>();
 
+            let project_skills_fs = fs.clone();
             cx.spawn(async move |cx| {
                 let mut project_skills_results = Vec::new();
                 for (worktree, worktree_id, worktree_root_name, scan_complete) in trusted_worktrees
                 {
                     if let Some(scan_complete) = scan_complete {
                         scan_complete.await;
+                    }
+                    // A worktree whose root no longer exists (pruned while
+                    // still registered) cannot contribute skills, and reading
+                    // its skill files would surface one load error per skill
+                    // on every refresh. Roots can reappear, so the skip is
+                    // per-refresh, not permanent.
+                    let root_path =
+                        worktree.update(cx, |worktree, _cx| worktree.abs_path().to_path_buf());
+                    match project_skills_fs.metadata(&root_path).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => continue,
                     }
                     if let Err(error) = expand_project_skills_directories(&worktree, cx).await {
                         project_skills_results.push(vec![Err(SkillLoadError {
@@ -7173,6 +7185,158 @@ mod internal_tests {
                 "catalog must reflect the in-memory buffer after a refresh"
             );
         });
+    }
+
+    /// A worktree whose root was deleted from disk (pruned while still
+    /// registered) must contribute neither skills nor per-skill load errors
+    /// on refresh; surviving worktrees keep their skills, and a reappeared
+    /// root is picked up again on the next refresh.
+    #[gpui::test]
+    async fn test_deleted_worktree_root_produces_no_skill_load_errors(cx: &mut TestAppContext) {
+        use collections::{HashMap, HashSet};
+        use project::trusted_worktrees::{self, PathTrust, TrustedWorktrees};
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project-a",
+            json!({
+                ".agents": {
+                    "skills": {
+                        "kept": {
+                            "SKILL.md": "---\nname: kept\ndescription: Survives\n---\n\nbody"
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            "/project-b",
+            json!({
+                ".agents": {
+                    "skills": {
+                        "pruned": {
+                            "SKILL.md": "---\nname: pruned\ndescription: Gone with the worktree\n---\n\nbody"
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        cx.update(|cx| {
+            trusted_worktrees::init(HashMap::default(), cx);
+        });
+
+        let project = Project::test_with_worktree_trust(
+            fs.clone(),
+            [Path::new("/project-a"), Path::new("/project-b")],
+            cx,
+        )
+        .await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+        let connection = NativeAgentConnection(agent.clone());
+        let _acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection).new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/project-a"), Path::new("/project-b")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let worktree_ids = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).id())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(worktree_ids.len(), 2);
+        cx.update(|cx| {
+            let trusted_worktrees = TrustedWorktrees::try_get_global(cx)
+                .expect("trusted worktrees global initialized by test_with_worktree_trust");
+            trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+                trusted_worktrees.trust(
+                    &project.read(cx).worktree_store(),
+                    HashSet::from_iter(worktree_ids.iter().copied().map(PathTrust::Worktree)),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let project_id = project.entity_id();
+        let load_names = || {
+            agent.read_with(cx, |agent, _cx| {
+                let state = agent.projects.get(&project_id).unwrap();
+                let mut names: Vec<String> = user_skills(&state.skills)
+                    .iter()
+                    .map(|s| s.name.to_string())
+                    .collect();
+                names.sort();
+                names
+            })
+        };
+        let assert_no_load_issues = || {
+            agent.read_with(cx, |agent, _cx| {
+                let state = agent.projects.get(&project_id).unwrap();
+                assert!(
+                    state.skill_loading_issues.is_empty(),
+                    "no load issues expected, got {:?}",
+                    state.skill_loading_issues
+                );
+            });
+        };
+
+        assert_eq!(load_names(), vec!["kept", "pruned"]);
+        assert_no_load_issues();
+
+        // Prune the second worktree from disk and trigger a refresh from the
+        // surviving worktree. The deleted root must contribute neither skills
+        // nor load errors.
+        fs.remove_dir(
+            Path::new("/project-b"),
+            fs::RemoveOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("pruning the worktree root must succeed");
+        fs.insert_file("/project-a/.agents/marker.txt", b"hello".to_vec())
+            .await;
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        assert_eq!(load_names(), vec!["kept"]);
+        assert_no_load_issues();
+
+        // A reappeared root is picked up again on the next refresh.
+        fs.insert_tree(
+            "/project-b",
+            json!({
+                ".agents": {
+                    "skills": {
+                        "pruned": {
+                            "SKILL.md": "---\nname: pruned\ndescription: Back\n---\n\nbody"
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+        fs.insert_file("/project-a/.agents/marker2.txt", b"hello".to_vec())
+            .await;
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        assert_eq!(load_names(), vec!["kept", "pruned"]);
     }
 
     #[gpui::test]
