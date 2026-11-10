@@ -626,6 +626,17 @@ pub struct DbReviewComment {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One entry in the `secret-tool` audit log: a named secret was used by a
+/// tool call at a time. Names only — the value is never stored here.
+#[derive(Debug, Clone)]
+pub struct SecretAuditEvent {
+    pub id: String,
+    pub secret_name: String,
+    pub operation: String,
+    pub tool_call_id: String,
+    pub at: DateTime<Utc>,
+}
+
 pub(crate) fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
@@ -797,11 +808,35 @@ impl ThreadsDatabase {
             "})?()
         .map_err(|e| e.context("Failed to create review_comments table"))?;
 
-        connection.exec(indoc! {"
+        connection
+            .exec(indoc! {"
                 CREATE INDEX IF NOT EXISTS review_comments_thread_id
                     ON review_comments(thread_id)
-            "})?()
-        .map_err(|e| e.context("Failed to create review_comments index"))?;
+            "})?
+            .map_err(|e| e.context("Failed to create review_comments index"))?;
+
+        // Phase C: `secret-tool` audit log. Kept in its own side table (like
+        // review_comments) so the panel can list recent uses by name without
+        // ever touching the thread blob. Names and operation only — secret
+        // values never reach SQLite.
+        connection
+            .exec(indoc! {"
+                CREATE TABLE IF NOT EXISTS secret_audit_log (
+                    id TEXT PRIMARY KEY,
+                    secret_name TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    at TEXT NOT NULL
+                )
+            "})?
+            .map_err(|e| e.context("Failed to create secret_audit_log table"))?;
+
+        connection
+            .exec(indoc! {"
+                CREATE INDEX IF NOT EXISTS secret_audit_log_name
+                    ON secret_audit_log(secret_name)
+            "})?
+            .map_err(|e| e.context("Failed to create secret_audit_log index"))?;
 
         let db = Self {
             executor,
@@ -818,7 +853,7 @@ impl ThreadsDatabase {
     fn save_thread_sync(
         connection: &Arc<Mutex<Connection>>,
         id: acp::SessionId,
-        thread: DbThread,
+        mut thread: DbThread,
         folder_paths: &PathList,
         workspace_id: Option<String>,
     ) -> Result<usize> {
@@ -848,6 +883,10 @@ impl ThreadsDatabase {
                     Some(serialized_folder_paths.order),
                 )
             };
+        // Defense-in-depth: scrub any known secret value again right before
+        // compression, in case it was learned *after* an earlier message was
+        // already inserted (D3 save-time boundary).
+        crate::redact_messages(&mut thread.messages);
         let json_data = serde_json::to_string(&SerializedThread {
             thread,
             version: DbThread::VERSION,
@@ -1270,6 +1309,77 @@ impl ThreadsDatabase {
         })
     }
 
+    /// Append one `secret-tool` audit event. Names only — never a value.
+    pub fn insert_secret_audit_event(&self, event: SecretAuditEvent) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut insert =
+                connection.exec_bound::<(String, String, String, String, String)>(indoc! {"
+                INSERT INTO secret_audit_log (id, secret_name, operation, tool_call_id, at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+            "})?;
+
+            insert((
+                event.id,
+                event.secret_name,
+                event.operation,
+                event.tool_call_id,
+                event.at.to_rfc3339(),
+            ))?;
+
+            Ok(())
+        })
+    }
+
+    /// The most recent `secret-tool` audit events, newest first, capped at
+    /// `limit`. Names and operations only.
+    pub fn recent_secret_audit_events(&self, limit: usize) -> Task<Result<Vec<SecretAuditEvent>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection
+                .select_bound::<(), (String, String, String, String, String)>(&format!(
+                    "SELECT id, secret_name, operation, tool_call_id, at \
+                     FROM secret_audit_log \
+                     ORDER BY at DESC, id DESC \
+                     LIMIT {limit}"
+                ))?;
+
+            let mut events = Vec::new();
+            for (id, secret_name, operation, tool_call_id, at) in select(())? {
+                events.push(SecretAuditEvent {
+                    id,
+                    secret_name,
+                    operation,
+                    tool_call_id,
+                    at: DateTime::parse_from_rfc3339(&at)?.with_timezone(&Utc),
+                });
+            }
+            Ok(events)
+        })
+    }
+
+    /// The distinct secret names ever recorded in the audit log, sorted.
+    pub fn secret_names(&self) -> Task<Result<Vec<String>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select_bound::<(), (String,)>(indoc! {"
+                SELECT DISTINCT secret_name FROM secret_audit_log ORDER BY secret_name ASC
+            "})?;
+
+            let mut names = Vec::new();
+            for (name,) in select(())? {
+                names.push(name);
+            }
+            Ok(names)
+        })
+    }
+
     /// Reconcile diverged threads in the shared threads database.
     ///
     /// Threads that share a non-null `dedup_key` (same workspace identity and
@@ -1402,6 +1512,20 @@ fn serialize_thread_blob(thread: &DbThread) -> Result<Vec<u8>> {
         version: DbThread::VERSION,
     })?;
     Ok(zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?)
+}
+
+/// Load the most recent `secret-tool` audit events, newest first, for the
+/// secret panel. Names and operations only — values never reach SQLite.
+pub fn load_recent_secret_audit_events(
+    cx: &mut App,
+    limit: usize,
+) -> Task<Result<Vec<SecretAuditEvent>>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    let executor = cx.background_executor().clone();
+    executor.spawn(async move {
+        let database = database_future.await.map_err(|err| anyhow!(err))?;
+        database.recent_secret_audit_events(limit).await
+    })
 }
 
 /// Reconcile diverged threads in the shared threads database.

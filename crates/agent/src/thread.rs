@@ -4,7 +4,7 @@ use crate::{
     DbThread, DebuggerTool, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
     FindReferencesTool, GetCodeActionsTool, GitTool, GoToDefinitionTool, GraphTool, GrepTool,
     ListAgentsAndModelsTool, ListDirectoryTool, MemoryStore, MemoryTool, MovePathTool, NetworkTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SecretTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ThreadSearchTool,
     ToolPermissionDecision, VmTool, WaitForReportTool, WebSearchTool, WindowControlTool,
     WriteFileTool, decide_permission_from_settings,
@@ -2103,6 +2103,10 @@ impl Thread {
     }
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
+        // Load the authenticated providers' in-memory keys into the redactor
+        // before serializing, so the save-time scrub can catch keys that don't
+        // match a pattern (D6 resident-provider-keys half).
+        crate::note_provider_keys(cx);
         let initial_project_snapshot = self.initial_project_snapshot.clone();
         let mut thread = DbThread {
             title: self.title().unwrap_or_default(),
@@ -2419,6 +2423,8 @@ impl Thread {
         self.add_tool(ContainerTool);
 
         self.add_tool(VmTool);
+
+        self.add_tool(SecretTool::new(environment.clone()));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -4419,8 +4425,12 @@ impl Thread {
                     tool_use_id,
                     tool_name,
                     is_error,
-                    content: output.llm_output,
-                    output: Some(output.raw_output),
+                    // Scrub known secret values out of the tool result before
+                    // it becomes the model's next message (the D3 primary
+                    // boundary). Patterns cover provider keys; the in-memory
+                    // LRU covers values the `secret-tool` has used this session.
+                    content: crate::redact_tool_result_content(output.llm_output),
+                    output: Some(crate::redact_json_value(output.raw_output)),
                 },
             )
         })
@@ -7199,6 +7209,12 @@ pub struct ToolCallEventStream {
 }
 
 impl ToolCallEventStream {
+    /// The ACP-facing id for this tool call, used to key audit records (e.g.
+    /// the `secret-tool` audit log). Distinct from the raw provider-issued id.
+    pub fn tool_call_id(&self) -> &acp::ToolCallId {
+        &self.tool_call_id
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test() -> (Self, ToolCallEventStreamReceiver) {
         let (stream, receiver, _cancellation_tx) = Self::test_with_cancellation();
