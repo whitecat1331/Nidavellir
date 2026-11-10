@@ -14,8 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::App;
 use language_model::{
-    LanguageModelProvider as _, LanguageModelRegistry, LanguageModelToolResultContent,
-    LanguageModelToolUse,
+    LanguageModelRegistry, LanguageModelToolResultContent, LanguageModelToolUse,
 };
 use regex::Regex;
 

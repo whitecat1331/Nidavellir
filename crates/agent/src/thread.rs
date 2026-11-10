@@ -7209,12 +7209,6 @@ pub struct ToolCallEventStream {
 }
 
 impl ToolCallEventStream {
-    /// The ACP-facing id for this tool call, used to key audit records (e.g.
-    /// the `secret-tool` audit log). Distinct from the raw provider-issued id.
-    pub fn tool_call_id(&self) -> &acp::ToolCallId {
-        &self.tool_call_id
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn test() -> (Self, ToolCallEventStreamReceiver) {
         let (stream, receiver, _cancellation_tx) = Self::test_with_cancellation();

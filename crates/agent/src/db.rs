@@ -812,7 +812,7 @@ impl ThreadsDatabase {
             .exec(indoc! {"
                 CREATE INDEX IF NOT EXISTS review_comments_thread_id
                     ON review_comments(thread_id)
-            "})?
+            "})?()
             .map_err(|e| e.context("Failed to create review_comments index"))?;
 
         // Phase C: `secret-tool` audit log. Kept in its own side table (like
@@ -828,14 +828,14 @@ impl ThreadsDatabase {
                     tool_call_id TEXT NOT NULL,
                     at TEXT NOT NULL
                 )
-            "})?
+            "})?()
             .map_err(|e| e.context("Failed to create secret_audit_log table"))?;
 
         connection
             .exec(indoc! {"
                 CREATE INDEX IF NOT EXISTS secret_audit_log_name
                     ON secret_audit_log(secret_name)
-            "})?
+            "})?()
             .map_err(|e| e.context("Failed to create secret_audit_log index"))?;
 
         let db = Self {
@@ -1359,24 +1359,6 @@ impl ThreadsDatabase {
                 });
             }
             Ok(events)
-        })
-    }
-
-    /// The distinct secret names ever recorded in the audit log, sorted.
-    pub fn secret_names(&self) -> Task<Result<Vec<String>>> {
-        let connection = self.connection.clone();
-
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut select = connection.select_bound::<(), (String,)>(indoc! {"
-                SELECT DISTINCT secret_name FROM secret_audit_log ORDER BY secret_name ASC
-            "})?;
-
-            let mut names = Vec::new();
-            for (name,) in select(())? {
-                names.push(name);
-            }
-            Ok(names)
         })
     }
 

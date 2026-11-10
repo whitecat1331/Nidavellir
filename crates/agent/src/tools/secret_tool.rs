@@ -251,18 +251,22 @@ fn validate_name(name: &str) -> Result<(), SecretToolOutput> {
 
 async fn list(cx: &mut AsyncApp) -> Result<SecretToolOutput, SecretToolOutput> {
     let database = connect_db(cx).await?;
-    let names = database
-        .secret_names()
+    let events = database
+        .recent_secret_audit_events(10000)
         .await
         .map_err(|error| SecretToolOutput::Error {
             error: format!("Failed to list stored secrets: {error}"),
         })?;
 
-    // Drop names whose keyring entries were removed outside this tool.
-    let mut present = Vec::new();
-    for name in names {
-        if secret_exists(&name).await {
-            present.push(name);
+    // The audit log is the name registry; derive the distinct names and drop
+    // any whose keyring entries were removed outside this tool.
+    let mut present: Vec<String> = Vec::new();
+    for event in events {
+        if present.contains(&event.secret_name) {
+            continue;
+        }
+        if secret_exists(&event.secret_name).await {
+            present.push(event.secret_name);
         }
     }
     present.sort();
@@ -334,7 +338,7 @@ async fn run_masked_prompt(
         .map_err(|error| SecretToolOutput::Error {
             error: format!("Failed to wait for the secret prompt: {error}"),
         })?;
-    let timeout = cx.background_executor().timer(STORE_PROMPT_TIMEOUT).fuse();
+    let mut timeout = cx.background_executor().timer(STORE_PROMPT_TIMEOUT).fuse();
 
     futures::select! {
         _ = wait_for_exit.clone().fuse() => {}
@@ -448,7 +452,7 @@ async fn record_event(
         secret_name: name.to_string(),
         operation: operation.to_string(),
         tool_call_id: event_stream.tool_call_id().0.to_string(),
-        at: Utc::now().to_rfc3339(),
+        at: Utc::now(),
     };
     database
         .insert_secret_audit_event(event)
