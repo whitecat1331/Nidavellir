@@ -72,6 +72,7 @@ use recent_projects::open_remote_project;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
+use secret_panel::SecretPanel;
 use settings::{
     BaseKeymap, DEFAULT_KEYMAP_PATH, DefaultOpenBehavior, InvalidSettingsError, KeybindSource,
     KeymapFile, KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings,
@@ -786,6 +787,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let network_panel = NetworkPanel::load(workspace_handle.clone(), cx);
         let devops_panel = DevOpsPanel::load(workspace_handle.clone(), cx);
+        let secret_panel = SecretPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -811,6 +813,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(network_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(devops_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(secret_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 

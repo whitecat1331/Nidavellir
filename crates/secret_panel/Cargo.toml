@@ -1,0 +1,22 @@
+[package]
+name = "secret_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/secret_panel.rs"
+doctest = false
+
+[dependencies]
+agent.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+ui.workspace = true
+workspace.workspace = true
