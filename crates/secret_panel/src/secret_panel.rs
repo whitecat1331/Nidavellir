@@ -112,7 +112,7 @@ impl Render for SecretPanel {
                     .py_1()
                     .child(Label::new("Secrets"))
                     .child(
-                        ui::Button::new("secret-refresh", "Refresh")
+                        Button::new("secret-refresh", "Refresh")
                             .size(ButtonSize::Compact)
                             .on_click(refresh),
                     ),
