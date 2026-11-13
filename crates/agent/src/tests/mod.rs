@@ -234,6 +234,7 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _cwd: Option<std::path::PathBuf>,
         output_byte_limit: Option<u64>,
         _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        _interactive: bool,
         _cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn crate::TerminalHandle>>> {
         self.terminal_creations.fetch_add(1, Ordering::SeqCst);
@@ -306,6 +307,7 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         _cwd: Option<std::path::PathBuf>,
         _output_byte_limit: Option<u64>,
         _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        _interactive: bool,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn crate::TerminalHandle>>> {
         let handle = Rc::new(cx.update(|cx| FakeTerminalHandle::new_never_exits(cx)));

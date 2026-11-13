@@ -71,6 +71,29 @@ impl std::fmt::Display for MaxOutputTokensError {
 
 impl std::error::Error for MaxOutputTokensError {}
 
+/// Builds the `(program, args)` pair that runs `command` in `shell`, honoring
+/// whether the terminal should be interactive. Interactive terminals keep a
+/// live stdin (no `/dev/null` redirect and no non-interactive flag) so a child
+/// like `secretsh store` can prompt a human for input; non-interactive ones
+/// match the terminal tool's capture semantics.
+fn build_terminal_shell_command(
+    shell: &Shell,
+    is_windows: bool,
+    interactive: bool,
+    command: &str,
+    args: &[String],
+) -> (String, Vec<String>) {
+    let builder = ShellBuilder::new(shell, is_windows);
+    if interactive {
+        builder.build(Some(command.to_owned()), args)
+    } else {
+        builder
+            .non_interactive()
+            .redirect_stdin_to_dev_null()
+            .build(Some(command.to_owned()), args)
+    }
+}
+
 /// Legacy ACP metadata key used before tool calls had a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
 
@@ -7005,6 +7028,7 @@ impl AcpThread {
         cwd: Option<PathBuf>,
         output_byte_limit: Option<u64>,
         sandbox_wrap: Option<SandboxWrap>,
+        interactive: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let env = match &cwd {
@@ -7050,13 +7074,13 @@ impl AcpThread {
                 #[cfg(target_os = "windows")]
                 let (task_command, task_args, task_env, sandbox, spawn_cwd) =
                     if sandbox_wrap.is_some() {
-                        let (task_command, task_args) = task::ShellBuilder::new(
+                        let (task_command, task_args) = build_terminal_shell_command(
                             &Shell::Program("/bin/sh".to_string()),
                             false,
-                        )
-                        .non_interactive()
-                        .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                            interactive,
+                            &command,
+                            &args,
+                        );
                         let wrap = cx.background_spawn(prepare_sandbox_wrap(
                             task_command,
                             task_args,
@@ -7080,21 +7104,25 @@ impl AcpThread {
                         // on Windows that deliberately changes the shell: the
                         // sandboxed path runs under WSL's Linux bash, but this
                         // fallback uses the host's `shell` against the native cwd.
-                        let builder = ShellBuilder::new(&Shell::Program(shell), is_windows)
-                            .non_interactive();
-                        let (task_command, task_args) = builder
-                            .redirect_stdin_to_dev_null()
-                            .build(Some(command.clone()), &args);
+                        let (task_command, task_args) = build_terminal_shell_command(
+                            &Shell::Program(shell),
+                            is_windows,
+                            interactive,
+                            &command,
+                            &args,
+                        );
                         (task_command, task_args, env, None, cwd.clone())
                     };
 
                 #[cfg(not(target_os = "windows"))]
                 let (task_command, task_args, task_env, sandbox, spawn_cwd) = {
-                    let builder = ShellBuilder::new(&Shell::Program(shell), is_windows)
-                        .non_interactive();
-                    let (task_command, task_args) = builder
-                        .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                    let (task_command, task_args) = build_terminal_shell_command(
+                        &Shell::Program(shell),
+                        is_windows,
+                        interactive,
+                        &command,
+                        &args,
+                    );
                     let (task_command, task_args, task_env, sandbox) = cx
                         .background_spawn(prepare_sandbox_wrap(
                             task_command,

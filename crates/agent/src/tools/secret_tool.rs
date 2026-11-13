@@ -326,6 +326,7 @@ async fn run_masked_prompt(
             None,
             None,
             None,
+            true,
             cx,
         )
         .await

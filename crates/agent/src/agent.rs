@@ -3723,6 +3723,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         cwd: Option<PathBuf>,
         output_byte_limit: Option<u64>,
         sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        interactive: bool,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>> {
         // On Seatbelt-style sandboxes (macOS) there's no tmpfs overlay, so to
@@ -3794,6 +3795,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                 cwd,
                 output_byte_limit,
                 sandbox_wrap,
+                interactive,
                 cx,
             )
         });
