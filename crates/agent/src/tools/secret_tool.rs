@@ -310,12 +310,14 @@ async fn authorize_run(
         })
 }
 
-/// Spawn `secretsh store <name>` in a visible terminal so the human can type
-/// the value with echo disabled. The value never enters this process.
+/// Spawn `secretsh store <name>` in a terminal and attach that terminal to
+/// this tool call as a `ToolCallContent::Terminal`, so the conversation renders
+/// it inline (and auto-expands it) for the human to type into. The value never
+/// enters this process.
 async fn run_masked_prompt(
     name: &str,
     environment: Rc<dyn ThreadEnvironment>,
-    _event_stream: &ToolCallEventStream,
+    event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<(), SecretToolOutput> {
     let extra_env: Vec<acp::EnvVariable> = Vec::new();
@@ -333,6 +335,17 @@ async fn run_masked_prompt(
         .map_err(|error| SecretToolOutput::Error {
             error: format!("Failed to start the secret prompt: {error:#}"),
         })?;
+
+    // Reference the terminal from the tool call so the conversation renders it
+    // inline (and, with `expand_terminal_card`, auto-expands it). Without this
+    // the terminal is headless and the masked prompt is invisible.
+    let terminal_id = terminal.id(cx).map_err(|error| SecretToolOutput::Error {
+        error: format!("Failed to reference the secret prompt terminal: {error}"),
+    })?;
+    event_stream.update_fields(
+        acp::ToolCallUpdateFields::new()
+            .content(vec![acp::ToolCallContent::Terminal(acp::Terminal::new(terminal_id))]),
+    );
 
     let wait_for_exit = terminal
         .wait_for_exit(cx)
