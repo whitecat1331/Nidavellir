@@ -515,6 +515,10 @@ pub struct NativeAgent {
     /// Handler installed by the UI (dev builds only) for the `window_control`
     /// tool: drives the window by command instead of by pixel.
     window_control_host: Option<Rc<dyn WindowControlHost>>,
+    /// Handler installed by the UI for a visible secret-entry terminal
+    /// (`secret-tool store`/`rotate`). Only the UI can surface a terminal a
+    /// human can type into; the agent's own terminals are headless.
+    secret_prompt_host: Option<Rc<dyn SecretPromptHost>>,
     fs: Arc<dyn Fs>,
     _subscriptions: Vec<Subscription>,
     /// Tracks the lifecycle of global skills directory observation. We
@@ -690,6 +694,7 @@ impl NativeAgent {
                 sibling_thread_host: None,
                 debugger_host: None,
                 window_control_host: None,
+                secret_prompt_host: None,
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),
@@ -838,6 +843,14 @@ impl NativeAgent {
 
     pub fn window_control_host(&self) -> Option<Rc<dyn WindowControlHost>> {
         self.window_control_host.clone()
+    }
+
+    pub fn set_secret_prompt_host(&mut self, host: Rc<dyn SecretPromptHost>) {
+        self.secret_prompt_host = Some(host);
+    }
+
+    pub fn secret_prompt_host(&self) -> Option<Rc<dyn SecretPromptHost>> {
+        self.secret_prompt_host.clone()
     }
 
     fn new_session(
@@ -3925,6 +3938,25 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             Err(err) => return Task::ready(Err(err)),
         };
         host.window_control(request, cx)
+    }
+
+    fn show_secret_prompt(
+        &self,
+        name: String,
+        operation: String,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<i32>>> {
+        let host = match self.agent.read_with(cx, |agent, _| agent.secret_prompt_host()) {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                return Task::ready(Err(anyhow!(
+                    "No secret-prompt host is registered. This usually means the \
+                     agent panel hasn't been initialized in this workspace."
+                )));
+            }
+            Err(err) => return Task::ready(Err(err)),
+        };
+        host.show_secret_prompt(name, operation, cx)
     }
 }
 

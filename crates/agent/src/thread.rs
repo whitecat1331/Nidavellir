@@ -816,6 +816,21 @@ pub trait SubagentHandle {
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
 }
 
+/// Brings up a visible, focused terminal that runs `secretsh <operation> <name>`
+/// so a human can type the secret, and resolves to the terminal's exit code.
+///
+/// Installed on the `NativeAgent` by the UI (mirroring `WindowControlHost`),
+/// because only the UI can surface a visible terminal — the agent's own
+/// `create_terminal` is headless and would leave the masked prompt invisible.
+pub trait SecretPromptHost {
+    fn show_secret_prompt(
+        &self,
+        name: String,
+        operation: String,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<i32>>>;
+}
+
 pub trait ThreadEnvironment {
     fn create_terminal(
         &self,
@@ -901,6 +916,20 @@ pub trait ThreadEnvironment {
         let _ = cx;
         Task::ready(Err(anyhow::anyhow!(
             "Driving the window is not supported in this environment"
+        )))
+    }
+
+    /// Brings up a visible, focused terminal running `secretsh <operation>
+    /// <name>` so a human can type the secret, resolving to the terminal's exit
+    /// code. Default: unsupported (no visible terminal in this environment).
+    fn show_secret_prompt(
+        &self,
+        _name: String,
+        _operation: String,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Option<i32>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "Showing a secret prompt is not supported in this environment"
         )))
     }
 }
