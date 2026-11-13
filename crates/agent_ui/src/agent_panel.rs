@@ -86,7 +86,6 @@ use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use task::SpawnInTerminal;
 use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
@@ -2186,66 +2185,6 @@ impl AgentPanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
-    }
-
-    /// Open a visible, focused terminal running `secretsh <operation> <name>` so
-    /// a human can type the secret, and resolve to the terminal's exit code.
-    ///
-    /// `create_terminal_task` runs the command directly (no shell) with the
-    /// terminal's pty as its controlling tty, so `secretsh`'s `rpassword` prompt
-    /// has a real `/dev/tty` to read from.
-    fn spawn_secret_prompt(
-        &mut self,
-        name: String,
-        operation: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<Option<i32>>> {
-        let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_task(
-                SpawnInTerminal {
-                    command: Some("secretsh".to_string()),
-                    args: vec![operation.clone(), name.clone()],
-                    ..Default::default()
-                },
-                cx,
-            )
-        });
-        let workspace = self.workspace.clone();
-        let workspace_id = self.workspace_id;
-        let project = self.project.downgrade();
-        let terminal_id = TerminalId::new();
-        cx.spawn_in(window, async move |this, cx| {
-            let terminal = terminal_task.await?;
-            let terminal_for_exit = terminal.clone();
-            this.update_in(cx, |this, window, cx| {
-                let terminal_view = cx.new(|cx| {
-                    let mut view =
-                        TerminalView::new(terminal, workspace, workspace_id, project, window, cx);
-                    view.set_show_workspace_actions(false, cx);
-                    view
-                });
-                this.insert_terminal(
-                    terminal_id,
-                    terminal_view,
-                    None,
-                    Some(format!("secretsh {operation}").into()),
-                    Some("Enter secret".into()),
-                    None,
-                    true,
-                    true,
-                    AgentThreadSource::AgentPanel,
-                    window,
-                    cx,
-                );
-            })?;
-
-            let exit_task = this.update_in(cx, |_this, _window, cx| {
-                terminal_for_exit.read(cx).wait_for_completed_task(cx)
-            })?;
-            let exit_status = exit_task.await;
-            Ok(exit_status.and_then(|status| status.code()))
-        })
     }
 
     fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
@@ -5327,14 +5266,9 @@ impl AgentPanel {
                 window.window_handle(),
             )) as Rc<dyn agent::WindowControlHost>
         });
-        let secret_prompt_host = Rc::new(AgentPanelSecretPromptHost::new(
-            cx.weak_entity(),
-            window.window_handle(),
-        )) as Rc<dyn agent::SecretPromptHost>;
         native_connection.0.update(cx, |native_agent, _cx| {
             native_agent.set_debugger_host(debugger_host);
             native_agent.set_sibling_thread_host(sibling_thread_host);
-            native_agent.set_secret_prompt_host(secret_prompt_host);
             if let Some(window_control_host) = window_control_host {
                 native_agent.set_window_control_host(window_control_host);
             }
@@ -5918,48 +5852,6 @@ impl agent::WindowControlHost for AgentPanelWindowControlHost {
             window.update(cx, |_root, window, cx| {
                 window_control_dispatch(&panel, request, window, cx)
             })?
-        })
-    }
-}
-
-/// Opens a visible, focused `AgentPanel` terminal that runs
-/// `secretsh <operation> <name>` for `secret-tool store`/`rotate`.
-///
-/// The tool cannot surface a terminal itself: the agent's `create_terminal` is
-/// headless, so its `rpassword` prompt (which reads `/dev/tty`) has nowhere to
-/// appear. This host mirrors `WindowControlHost` — the UI owns the only code
-/// path that can create a terminal a human can type into.
-pub(crate) struct AgentPanelSecretPromptHost {
-    panel: WeakEntity<AgentPanel>,
-    window: gpui::AnyWindowHandle,
-}
-
-impl AgentPanelSecretPromptHost {
-    pub(crate) fn new(panel: WeakEntity<AgentPanel>, window: gpui::AnyWindowHandle) -> Self {
-        Self { panel, window }
-    }
-}
-
-impl agent::SecretPromptHost for AgentPanelSecretPromptHost {
-    fn show_secret_prompt(
-        &self,
-        name: String,
-        operation: String,
-        cx: &mut gpui::AsyncApp,
-    ) -> Task<Result<Option<i32>>> {
-        let panel = self.panel.clone();
-        let window = self.window;
-        cx.spawn(async move |cx| {
-            let panel = panel
-                .upgrade()
-                .ok_or_else(|| anyhow!("Agent panel is no longer available"))?;
-            window
-                .update(cx, |_root, window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.spawn_secret_prompt(name, operation, window, cx)
-                    })
-                })?
-                .await
         })
     }
 }

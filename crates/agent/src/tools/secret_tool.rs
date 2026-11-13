@@ -11,8 +11,10 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
+use futures::FutureExt as _;
 use gpui::{App, AsyncApp, SharedString, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,10 @@ use crate::thread::{ThreadEnvironment, ToolPermissionContext};
 use crate::{AgentTool, SecretAuditEvent, ThreadsDatabase, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use language_model::LanguageModelToolResultContent;
+use util::ResultExt as _;
+
+/// How long to wait for the human to type the secret into the masked prompt.
+const STORE_PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// One `secret-tool` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -157,7 +163,7 @@ async fn run_operation(
                     ),
                 });
             }
-            run_masked_prompt(&name, "store", environment, &event_stream, cx).await?;
+            run_masked_prompt(&name, environment, &event_stream, cx).await?;
             record_event(cx, &name, "store", &event_stream).await?;
             Ok(SecretToolOutput::Success {
                 message: format!("stored {name:?}"),
@@ -171,7 +177,7 @@ async fn run_operation(
                     error: format!("No secret named {name:?} is stored; use `store` first."),
                 });
             }
-            run_masked_prompt(&name, "rotate", environment, &event_stream, cx).await?;
+            run_masked_prompt(&name, environment, &event_stream, cx).await?;
             record_event(cx, &name, "rotate", &event_stream).await?;
             Ok(SecretToolOutput::Success {
                 message: format!("rotated {name:?}"),
@@ -304,36 +310,59 @@ async fn authorize_run(
         })
 }
 
-/// Open a visible, focused terminal running `secretsh <operation> <name>` so a
-/// human can type the value with echo disabled, and report whether it succeeded.
-///
-/// The terminal must be *visible*: `rpassword` reads `/dev/tty`, so a headless
-/// terminal (the agent's own `create_terminal`) would leave the prompt
-/// unanswerable. The value never enters this process — it goes from the pty
-/// straight into `secretsh` and the keychain.
+/// Spawn `secretsh store <name>` in a visible terminal so the human can type
+/// the value with echo disabled. The value never enters this process.
 async fn run_masked_prompt(
     name: &str,
-    operation: &str,
     environment: Rc<dyn ThreadEnvironment>,
     _event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<(), SecretToolOutput> {
-    let exit_code = environment
-        .show_secret_prompt(name.to_string(), operation.to_string(), cx)
+    let extra_env: Vec<acp::EnvVariable> = Vec::new();
+    let terminal = environment
+        .create_terminal(
+            format!("secretsh store {name}"),
+            extra_env,
+            None,
+            None,
+            None,
+            true,
+            cx,
+        )
         .await
         .map_err(|error| SecretToolOutput::Error {
             error: format!("Failed to start the secret prompt: {error:#}"),
         })?;
 
-    if exit_code == Some(0) {
+    let wait_for_exit = terminal
+        .wait_for_exit(cx)
+        .map_err(|error| SecretToolOutput::Error {
+            error: format!("Failed to wait for the secret prompt: {error}"),
+        })?;
+    let mut timeout = cx.background_executor().timer(STORE_PROMPT_TIMEOUT).fuse();
+
+    futures::select! {
+        _ = wait_for_exit.clone().fuse() => {}
+        _ = timeout => {
+            terminal.kill(cx).log_err();
+            return Err(SecretToolOutput::Error {
+                error: "Timed out waiting for the secret to be entered.".into(),
+            });
+        }
+    }
+
+    let output = terminal
+        .current_output(cx)
+        .map_err(|error| SecretToolOutput::Error {
+            error: format!("Failed to read the secret prompt result: {error}"),
+        })?;
+    if output.exit_status.and_then(|status| status.exit_code) == Some(0) {
         Ok(())
     } else {
         Err(SecretToolOutput::Error {
             error: format!(
-                "Secret entry failed (the prompt exited with status {}).",
-                exit_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
+                "Secret entry failed: {}",
+                output.output.trim().lines().last().unwrap_or_default()
             ),
         })
     }
