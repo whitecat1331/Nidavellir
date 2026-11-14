@@ -10854,6 +10854,81 @@ async fn test_collapse_on_open(cx: &mut gpui::TestAppContext) {
     }
 }
 
+#[gpui::test]
+async fn test_collapse_on_open_keeps_auto_reveal(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root1"),
+        json!({
+            "dir_1": {
+                "file_1.txt": "// File contents",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/root1").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    cx.update(|_, cx| {
+        let settings = *ProjectPanelSettings::get_global(cx);
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                collapse_on_open: true,
+                auto_reveal_entries: true,
+                ..settings
+            },
+            cx,
+        );
+    });
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    assert_eq!(visible_entries_as_strings(&panel, 0..10, cx), &[
+        "> root1"
+    ]);
+
+    let file_entry = find_project_entry(&panel, "root1/dir_1/file_1.txt", cx)
+        .expect("file entry should exist");
+
+    // While the previous session is being restored, revealing the restored
+    // active entry must not expand the tree.
+    workspace.update(cx, |workspace, _| workspace.set_restoring_session_items(true));
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::ActiveEntryChanged(Some(file_entry)))
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["> root1"],
+        "auto-reveal must not expand a collapsed tree while restoring the session"
+    );
+
+    // Once the session restore is done, tracking resumes.
+    workspace.update(cx, |workspace, _| workspace.set_restoring_session_items(false));
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::ActiveEntryChanged(Some(file_entry)))
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &[
+            "v root1",
+            "    v dir_1",
+            "          file_1.txt  <== selected  <== marked",
+        ],
+        "auto-reveal should expand the active file's parent directories after restore"
+    );
+}
+
 /// Test that missing sort_mode field defaults to DirectoriesFirst
 #[gpui::test]
 async fn test_sort_mode_default_fallback(cx: &mut gpui::TestAppContext) {

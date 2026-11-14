@@ -714,7 +714,12 @@ impl ProjectPanel {
                 window,
                 |this, project, event, window, cx| match event {
                     project::Event::ActiveEntryChanged(Some(entry_id)) => {
-                        if ProjectPanelSettings::get_global(cx).auto_reveal_entries {
+                        let settings = ProjectPanelSettings::get_global(cx);
+                        let restoring_session_items = settings.collapse_on_open
+                            && this.workspace.upgrade().is_some_and(|workspace| {
+                                workspace.read(cx).is_restoring_session_items()
+                            });
+                        if settings.auto_reveal_entries && !restoring_session_items {
                             this.reveal_entry(project.clone(), *entry_id, true, window, cx)
                                 .ok();
                         }
