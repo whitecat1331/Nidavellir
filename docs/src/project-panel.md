@@ -28,6 +28,14 @@ Set [`preview_tabs.enable_preview_from_project_panel`](./reference/all-settings.
 to `false` to open permanent tabs with a single click or {#action project_panel::Open}
 ({#kb project_panel::Open}).
 
+### Collapsing on Open
+
+By default, opening a workspace expands each worktree root in the project panel.
+Set `project_panel.collapse_on_open` to `true` to start with every directory
+collapsed, including the worktree roots. Auto-reveal (see below) still expands
+the active file's parent directories once the workspace has finished restoring,
+so following the agent keeps working.
+
 ### Auto-reveal
 
 By default, switching to a file in the editor will automatically highlight it in the

@@ -5304,7 +5304,7 @@ fn window_and_layout_page() -> SettingsPage {
 }
 
 fn panels_page() -> SettingsPage {
-    fn project_panel_section() -> [SettingsPageItem; 30] {
+    fn project_panel_section() -> [SettingsPageItem; 31] {
         [
             SettingsPageItem::SectionHeader("Project Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5591,6 +5591,29 @@ fn panels_page() -> SettingsPage {
                             .project_panel
                             .get_or_insert_default()
                             .auto_reveal_entries = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Collapse On Open",
+                description: "Whether the project panel starts with all directories collapsed (including worktree roots) when a workspace is opened. Auto-reveal still expands the active file's parent directories after the workspace has restored.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("project_panel.collapse_on_open"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project_panel
+                            .as_ref()?
+                            .collapse_on_open
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project_panel
+                            .get_or_insert_default()
+                            .collapse_on_open = value;
                     },
                 }),
                 metadata: None,
