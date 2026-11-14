@@ -10804,7 +10804,12 @@ async fn test_collapse_on_open(cx: &mut gpui::TestAppContext) {
         toggle_expand_dir(&panel, "root1", cx);
         assert_eq!(
             visible_entries_as_strings(&panel, 0..10, cx),
-            &["v root1", "    > dir_1", "      file_2.txt", "> root2"],
+            &[
+                "v root1  <== selected",
+                "    > dir_1",
+                "      file_2.txt",
+                "> root2",
+            ],
             "a root collapsed on open should still expand when clicked"
         );
     }
