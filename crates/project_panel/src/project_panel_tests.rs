@@ -10744,6 +10744,111 @@ fn visible_entries_as_strings(
     result
 }
 
+#[gpui::test]
+async fn test_collapse_on_open(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root1"),
+        json!({
+            "dir_1": {
+                "file_1.txt": "// File contents",
+            },
+            "file_2.txt": "// File contents",
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/root2"),
+        json!({
+            "dir_2": {
+                "file_3.txt": "// File contents",
+            },
+        }),
+    )
+    .await;
+
+    // With collapse_on_open the worktree roots themselves start collapsed.
+    {
+        let project = Project::test(
+            fs.clone(),
+            [path!("/root1").as_ref(), path!("/root2").as_ref()],
+            cx,
+        )
+        .await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.update(|_, cx| {
+            let settings = *ProjectPanelSettings::get_global(cx);
+            ProjectPanelSettings::override_global(
+                ProjectPanelSettings {
+                    collapse_on_open: true,
+                    ..settings
+                },
+                cx,
+            );
+        });
+        let panel = workspace.update_in(cx, ProjectPanel::new);
+        cx.run_until_parked();
+        assert_eq!(
+            visible_entries_as_strings(&panel, 0..10, cx),
+            &["> root1", "> root2"],
+            "collapse_on_open should leave every worktree root collapsed"
+        );
+
+        toggle_expand_dir(&panel, "root1", cx);
+        assert_eq!(
+            visible_entries_as_strings(&panel, 0..10, cx),
+            &["v root1", "    > dir_1", "      file_2.txt", "> root2"],
+            "a root collapsed on open should still expand when clicked"
+        );
+    }
+
+    // Without the setting the roots start expanded, as before.
+    {
+        let project = Project::test(
+            fs.clone(),
+            [path!("/root1").as_ref(), path!("/root2").as_ref()],
+            cx,
+        )
+        .await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.update(|_, cx| {
+            let settings = *ProjectPanelSettings::get_global(cx);
+            ProjectPanelSettings::override_global(
+                ProjectPanelSettings {
+                    collapse_on_open: false,
+                    ..settings
+                },
+                cx,
+            );
+        });
+        let panel = workspace.update_in(cx, ProjectPanel::new);
+        cx.run_until_parked();
+        assert_eq!(
+            visible_entries_as_strings(&panel, 0..10, cx),
+            &[
+                "v root1",
+                "    > dir_1",
+                "      file_2.txt",
+                "v root2",
+                "    > dir_2",
+            ],
+            "without collapse_on_open the worktree roots start expanded"
+        );
+    }
+}
+
 /// Test that missing sort_mode field defaults to DirectoriesFirst
 #[gpui::test]
 async fn test_sort_mode_default_fallback(cx: &mut gpui::TestAppContext) {

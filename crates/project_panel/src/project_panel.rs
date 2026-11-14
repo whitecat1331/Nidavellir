@@ -4472,6 +4472,7 @@ impl ProjectPanel {
         let now = Instant::now();
         let settings = ProjectPanelSettings::get_global(cx);
         let auto_collapse_dirs = settings.auto_fold_dirs;
+        let collapse_on_open = settings.collapse_on_open;
         let hide_gitignore = settings.hide_gitignore;
         let sort_mode = settings.sort_mode;
         let sort_order = settings.sort_order;
@@ -4691,8 +4692,11 @@ impl ProjectPanel {
                                     hash_map::Entry::Occupied(e) => e.into_mut(),
                                     hash_map::Entry::Vacant(e) => {
                                         // The first time a worktree's root entry becomes available,
-                                        // mark that root entry as expanded.
-                                        if let Some(entry) = worktree_snapshot.root_entry() {
+                                        // mark that root entry as expanded, unless the panel is
+                                        // configured to start collapsed.
+                                        if !collapse_on_open
+                                            && let Some(entry) = worktree_snapshot.root_entry()
+                                        {
                                             e.insert(vec![entry.id]).as_slice()
                                         } else {
                                             &[]
