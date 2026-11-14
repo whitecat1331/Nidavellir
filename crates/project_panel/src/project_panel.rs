@@ -714,7 +714,12 @@ impl ProjectPanel {
                 window,
                 |this, project, event, window, cx| match event {
                     project::Event::ActiveEntryChanged(Some(entry_id)) => {
-                        if ProjectPanelSettings::get_global(cx).auto_reveal_entries {
+                        let settings = ProjectPanelSettings::get_global(cx);
+                        let restoring_session_items = settings.collapse_on_open
+                            && this.workspace.upgrade().is_some_and(|workspace| {
+                                workspace.read(cx).is_restoring_session_items()
+                            });
+                        if settings.auto_reveal_entries && !restoring_session_items {
                             this.reveal_entry(project.clone(), *entry_id, true, window, cx)
                                 .ok();
                         }
@@ -4472,6 +4477,7 @@ impl ProjectPanel {
         let now = Instant::now();
         let settings = ProjectPanelSettings::get_global(cx);
         let auto_collapse_dirs = settings.auto_fold_dirs;
+        let collapse_on_open = settings.collapse_on_open;
         let hide_gitignore = settings.hide_gitignore;
         let sort_mode = settings.sort_mode;
         let sort_order = settings.sort_order;
@@ -4691,9 +4697,14 @@ impl ProjectPanel {
                                     hash_map::Entry::Occupied(e) => e.into_mut(),
                                     hash_map::Entry::Vacant(e) => {
                                         // The first time a worktree's root entry becomes available,
-                                        // mark that root entry as expanded.
+                                        // mark that root entry as expanded, unless the panel is
+                                        // configured to start collapsed.
                                         if let Some(entry) = worktree_snapshot.root_entry() {
-                                            e.insert(vec![entry.id]).as_slice()
+                                            if collapse_on_open {
+                                                e.insert(Vec::new()).as_slice()
+                                            } else {
+                                                e.insert(vec![entry.id]).as_slice()
+                                            }
                                         } else {
                                             &[]
                                         }
