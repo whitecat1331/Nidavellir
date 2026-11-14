@@ -1656,6 +1656,10 @@ pub struct Workspace {
     /// The stable id-keyed identity of the workspace this window displays,
     /// set when the workspace is opened through the WorkspaceManager.
     managed_workspace_id: Option<ManagedWorkspaceId>,
+    /// True while `open_items` is restoring the previous session's panes and
+    /// items. Read by the project panel so `collapse_on_open` can keep folder
+    /// reveal suppressed until the restored active item has been selected.
+    restoring_session_items: bool,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
     _subscriptions: Vec<Subscription>,
@@ -2163,6 +2167,7 @@ impl Workspace {
             active_call,
             database_id: workspace_id,
             managed_workspace_id: None,
+            restoring_session_items: false,
             app_state,
             _observe_current_user,
             _apply_leader_updates,
@@ -6684,6 +6689,15 @@ impl Workspace {
         self.follower_states.contains_key(&id.into())
     }
 
+    pub fn is_restoring_session_items(&self) -> bool {
+        self.restoring_session_items
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_restoring_session_items(&mut self, restoring: bool) {
+        self.restoring_session_items = restoring;
+    }
+
     pub(crate) fn active_item_path_changed(
         &mut self,
         focus_changed: bool,
@@ -9373,7 +9387,14 @@ fn open_items(
         let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
 
         if let Some(restored_items) = restored_items {
-            let restored_items = restored_items.await?;
+            workspace.update(cx, |workspace, _| {
+                workspace.restoring_session_items = true;
+            })?;
+            let restored_items = restored_items.await;
+            workspace.update(cx, |workspace, _| {
+                workspace.restoring_session_items = false;
+            })?;
+            let restored_items = restored_items?;
 
             let restored_project_paths = restored_items
                 .iter()

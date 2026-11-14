@@ -856,6 +856,13 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub auto_reveal_entries: Option<bool>,
+    /// Whether the project panel should start with all directories collapsed
+    /// (including each worktree root) when a workspace is opened. Auto-reveal
+    /// still expands the active file's parent directories once the workspace
+    /// has finished restoring.
+    ///
+    /// Default: false
+    pub collapse_on_open: Option<bool>,
     /// Whether to fold directories automatically
     /// when directory has only one directory inside.
     ///

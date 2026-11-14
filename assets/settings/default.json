@@ -887,6 +887,11 @@
     // when a corresponding project entry becomes active.
     // Gitignored entries are never auto revealed.
     "auto_reveal_entries": true,
+    // Whether the project panel should start with all directories collapsed
+    // (including each worktree root) when a workspace is opened. Auto-reveal
+    // still expands the active file's parent directories once the workspace
+    // has finished restoring.
+    "collapse_on_open": false,
     // Whether the project panel should open on startup.
     "starts_open": true,
     // Whether to fold directories automatically and show compact folders
