@@ -4694,10 +4694,12 @@ impl ProjectPanel {
                                         // The first time a worktree's root entry becomes available,
                                         // mark that root entry as expanded, unless the panel is
                                         // configured to start collapsed.
-                                        if !collapse_on_open
-                                            && let Some(entry) = worktree_snapshot.root_entry()
-                                        {
-                                            e.insert(vec![entry.id]).as_slice()
+                                        if let Some(entry) = worktree_snapshot.root_entry() {
+                                            if collapse_on_open {
+                                                e.insert(Vec::new()).as_slice()
+                                            } else {
+                                                e.insert(vec![entry.id]).as_slice()
+                                            }
                                         } else {
                                             &[]
                                         }
