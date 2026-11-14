@@ -596,6 +596,7 @@ fn main() {
         debugger_ui::init(cx);
         debugger_tools::init(cx);
         devops_panel::init(cx);
+        secret_panel::init(cx);
         client::init(&client, cx);
         feature_flags::FeatureFlagStore::init(cx);
 

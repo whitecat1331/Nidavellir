@@ -27,7 +27,9 @@ mod memory_tool;
 mod move_path_tool;
 mod network_tool;
 mod read_file_tool;
+mod redaction;
 mod rename_tool;
+mod secret_tool;
 mod skill_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
@@ -107,7 +109,9 @@ pub use memory_tool::*;
 pub use move_path_tool::*;
 pub use network_tool::*;
 pub use read_file_tool::*;
+pub use redaction::*;
 pub use rename_tool::*;
+pub use secret_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use symbol_locator::*;
@@ -243,6 +247,7 @@ tools! {
     MovePathTool,
     ReadFileTool,
     RenameTool,
+    SecretTool,
     SkillTool,
     SpawnAgentTool,
     TerminalTool,
@@ -315,6 +320,7 @@ mod tests {
         assert!(!tool_allowed_in_restricted_mode(ContainerTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(VmTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(GitTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(SecretTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
@@ -322,7 +328,8 @@ mod tests {
                 && *name != TerminalTool::NAME
                 && *name != ContainerTool::NAME
                 && *name != VmTool::NAME
-                && *name != GitTool::NAME;
+                && *name != GitTool::NAME
+                && *name != SecretTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

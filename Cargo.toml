@@ -53,6 +53,7 @@ members = [
     "crates/debugger_tools",
     "crates/debugger_ui",
     "crates/devops_panel",
+    "crates/secret_panel",
     "crates/deepseek",
     "crates/dev_container",
     "crates/diagnostics",
@@ -332,6 +333,7 @@ debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
 devops_panel = { path = "crates/devops_panel" }
+secret_panel = { path = "crates/secret_panel" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }

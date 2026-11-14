@@ -1309,6 +1309,7 @@
           "terminal": true,
           "container": true,
           "vm": true,
+          "secret-tool": true,
         },
       },
       "write": {
@@ -1386,6 +1387,7 @@
           "terminal": true,
           "container": true,
           "vm": true,
+          "secret-tool": true,
           "search_web": true,
         },
       },
@@ -1427,6 +1429,7 @@
           "terminal": true,
           "container": true,
           "vm": true,
+          "secret-tool": true,
           "search_web": true,
         },
       },
