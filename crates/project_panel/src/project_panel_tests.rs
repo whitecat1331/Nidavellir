@@ -10888,16 +10888,16 @@ async fn test_collapse_on_open_keeps_auto_reveal(cx: &mut gpui::TestAppContext) 
     });
     let panel = workspace.update_in(cx, ProjectPanel::new);
     cx.run_until_parked();
-    assert_eq!(visible_entries_as_strings(&panel, 0..10, cx), &[
-        "> root1"
-    ]);
+    assert_eq!(visible_entries_as_strings(&panel, 0..10, cx), &["> root1"]);
 
-    let file_entry = find_project_entry(&panel, "root1/dir_1/file_1.txt", cx)
-        .expect("file entry should exist");
+    let file_entry =
+        find_project_entry(&panel, "root1/dir_1/file_1.txt", cx).expect("file entry should exist");
 
     // While the previous session is being restored, revealing the restored
     // active entry must not expand the tree.
-    workspace.update(cx, |workspace, _| workspace.set_restoring_session_items(true));
+    workspace.update(cx, |workspace, _| {
+        workspace.set_restoring_session_items(true)
+    });
     panel.update(cx, |panel, cx| {
         panel.project.update(cx, |_, cx| {
             cx.emit(project::Event::ActiveEntryChanged(Some(file_entry)))
@@ -10911,7 +10911,9 @@ async fn test_collapse_on_open_keeps_auto_reveal(cx: &mut gpui::TestAppContext) 
     );
 
     // Once the session restore is done, tracking resumes.
-    workspace.update(cx, |workspace, _| workspace.set_restoring_session_items(false));
+    workspace.update(cx, |workspace, _| {
+        workspace.set_restoring_session_items(false)
+    });
     panel.update(cx, |panel, cx| {
         panel.project.update(cx, |_, cx| {
             cx.emit(project::Event::ActiveEntryChanged(Some(file_entry)))
