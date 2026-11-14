@@ -834,6 +834,7 @@ impl VsCodeSettings {
         let mut project_panel_settings = ProjectPanelSettingsContent {
             auto_fold_dirs: self.read_bool("explorer.compactFolders"),
             auto_reveal_entries: self.read_bool("explorer.autoReveal"),
+            collapse_on_open: None,
             bold_folder_labels: None,
             button: None,
             title_tooltip_delay: None,
