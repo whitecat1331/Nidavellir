@@ -1429,6 +1429,11 @@ mod tests {
             // tool input, not a settings-driven permission rule.
             "container",
             "vm",
+            // Keyring access is delegated to the `secretsh` helper: store/rotate
+            // are human-in-the-loop (masked terminal prompt), run is authorized
+            // per call via event_stream.authorize, and every op is denied in
+            // restricted mode — no settings-driven permission rules.
+            "secret-tool",
             "diagnostics",
             "find_path",
             "find_references",

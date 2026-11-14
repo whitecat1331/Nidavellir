@@ -879,6 +879,7 @@ async fn run_terminal_tool(
                     working_dir.clone(),
                     output_byte_limit,
                     effective_wrap.clone(),
+                    false,
                     cx,
                 )
                 .await
@@ -945,6 +946,7 @@ async fn run_terminal_tool(
             working_dir.clone(),
             output_byte_limit,
             sandbox_wrap.clone(),
+            false,
             cx,
         )
         .await

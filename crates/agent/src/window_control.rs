@@ -7,21 +7,19 @@
 //! reach it through `ThreadEnvironment::window_control`, so the tool layer
 //! never depends on `agent_ui`.
 //!
-//! This module also owns the two security requirements of the plan's Design D
-//! contract: [`redact_sensitive`] scrubs secrets and private paths out of the
-//! `state` snapshot (it is an *output* boundary), and [`WindowControlEnvelope`]
-//! carries the bearer token the local command file (Phase 3) must present.
+//! This module owns the bearer-token half of the plan's Design D contract:
+//! [`WindowControlEnvelope`] carries the token the local command file (Phase 3)
+//! must present. The `state` snapshot's redaction lives in
+//! `crate::tools::redaction` (`redact_sensitive`), shared with every other
+//! output boundary.
 //!
 //! Everything here is **dev-channel only**: [`window_control_enabled`] gates
 //! both installing the host and exposing the `window_control` tool, so the
 //! surface is never shipped in a real release (`Preview`/`Stable`) or
 //! `Nightly` build.
 
-use std::sync::OnceLock;
-
 use anyhow::Result;
 use gpui::{App, AsyncApp, Task};
-use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -238,59 +236,6 @@ pub fn generate_channel_token() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
-/// Redact likely secrets and private absolute paths from a string before it
-/// leaves the process through the `window_control` surface (`state`, and the
-/// selector text that `find`/`assert` return).
-///
-/// The snapshot is an *output* boundary: without redaction, `state` would hand
-/// the model — and any transcript or log that captures its tool result — the
-/// user's credentials, tokens, and account path. It is intentionally
-/// conservative (over-redacts rather than under-redacts) and only ever removes
-/// detail, so it cannot reveal more than the raw string would.
-pub fn redact_sensitive(text: &str) -> String {
-    let mut redacted = redact_home_dir(text);
-    for pattern in secret_patterns() {
-        redacted = pattern.replace_all(&redacted, "<redacted>").into_owned();
-    }
-    redacted
-}
-
-/// Replace the user's home directory prefix with `~`, so absolute paths in the
-/// snapshot don't reveal the account name.
-fn redact_home_dir(text: &str) -> String {
-    let home = paths::home_dir();
-    let home = home.to_string_lossy();
-    if home.is_empty() {
-        return text.to_owned();
-    }
-    text.replace(home.as_ref(), "~")
-}
-
-/// Substrings that are almost always credentials. Compiled once.
-fn secret_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        [
-            // Provider API keys (OpenAI, Anthropic, GitHub, Slack, AWS, Google).
-            r"\bsk-[A-Za-z0-9_-]{16,}\b",
-            r"\bsk-ant-[A-Za-z0-9_-]{16,}\b",
-            r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
-            r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-            r"\bAKIA[0-9A-Z]{16}\b",
-            r"\bAIza[0-9A-Za-z_-]{30,}\b",
-            // JSON Web Tokens: three base64url segments.
-            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b",
-            // `key = value` / `key: value` assignments for secret-ish keys.
-            r#"(?i)\b(?:api[_-]?key|secret|token|password|passwd|authorization|bearer)\b\s*[:=]\s*['\"]?[^\s'\"]{6,}"#,
-            // `Bearer <token>` authorization headers.
-            r"(?i)\bbearer\s+[A-Za-z0-9._-]{8,}",
-        ]
-        .iter()
-        .filter_map(|pattern| Regex::new(pattern).ok())
-        .collect()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,30 +288,6 @@ mod tests {
         assert_eq!(value["selector"], "agent_panel.message_editor");
         assert_eq!(value["expect_text"], "hi");
         assert_eq!(value["expect_visible"], true);
-    }
-
-    #[test]
-    fn redaction_removes_secrets_and_home_paths() {
-        let home = paths::home_dir().to_string_lossy().into_owned();
-        let input =
-            format!("open {home}/src/secret.rs\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx\n");
-        let redacted = redact_sensitive(&input);
-        assert!(!redacted.contains(&home), "home dir leaked: {redacted}");
-        assert!(redacted.contains('~'), "home path should collapse to ~");
-        assert!(
-            !redacted.contains("sk-abcdefghijklmnopqrstuvwx"),
-            "api key leaked: {redacted}"
-        );
-        assert!(redacted.contains("<redacted>"));
-    }
-
-    #[test]
-    fn redaction_leaves_ordinary_text_untouched() {
-        assert_eq!(redact_sensitive("hello window"), "hello window");
-        assert_eq!(
-            redact_sensitive("Continued from thread \"Old thread\""),
-            "Continued from thread \"Old thread\""
-        );
     }
 
     #[test]
