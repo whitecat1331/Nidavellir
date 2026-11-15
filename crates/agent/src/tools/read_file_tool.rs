@@ -18,6 +18,26 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
     LanguageModelToolResultContent::from(e.to_string())
 }
 
+/// Caps model-visible file content read through the line-range path (MCP
+/// parity). The no-arguments path already returns a bounded outline; this
+/// closes the remaining hole where `start_line` without `end_line` (or a large
+/// explicit range) streams the whole file.
+const MAX_READ_FILE_OUTPUT_BYTES: usize = 64 * 1024;
+
+fn truncate_file_output(text: &str) -> String {
+    if text.len() <= MAX_READ_FILE_OUTPUT_BYTES {
+        return text.to_string();
+    }
+    let total_bytes = text.len();
+    let mut truncated =
+        crate::db::truncate_at_char_boundary(text, MAX_READ_FILE_OUTPUT_BYTES).to_string();
+    truncated.push_str(&format!(
+        "\n\n[... file content truncated to {} bytes of {} total ...]",
+        MAX_READ_FILE_OUTPUT_BYTES, total_bytes,
+    ));
+    truncated
+}
+
 /// Resolves the optional `start_line` / `end_line` inputs from the tool schema
 /// to a concrete 1-indexed, inclusive `(start, end)` line range:
 ///
@@ -441,7 +461,7 @@ impl AgentTool for ReadFileTool {
                         buffer.text_for_range(start_anchor..end_anchor),
                         start,
                     );
-                    output
+                    truncate_file_output(&output)
                 });
 
                 action_log.update(cx, |log, cx| {
@@ -546,6 +566,17 @@ mod test {
     use std::path::PathBuf;
     use std::sync::Arc;
     use util::path;
+
+    #[test]
+    fn truncates_oversized_file_output() {
+        assert_eq!(truncate_file_output("ok"), "ok");
+
+        let long = "x".repeat(MAX_READ_FILE_OUTPUT_BYTES + 4096);
+        let truncated = truncate_file_output(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.ends_with("total ...]"));
+        assert!(truncated.starts_with(&"x".repeat(MAX_READ_FILE_OUTPUT_BYTES)));
+    }
 
     #[gpui::test]
     async fn test_read_directory_path(cx: &mut TestAppContext) {
