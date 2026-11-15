@@ -9151,6 +9151,11 @@ mod tests {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
         });
+        // The panel has to be the dock's active panel for the workspace to draw
+        // it; otherwise only the centre pane contributes nodes to the tree.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
         cx.run_until_parked();
 
         // Drive the same top-level entry point the host uses, so this test would
