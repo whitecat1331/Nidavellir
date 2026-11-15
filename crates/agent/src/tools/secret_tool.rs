@@ -9,13 +9,14 @@
 //! value never enters the Zed process at all. The model sees a *name* and the
 //! command's output, never the value.
 
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use futures::FutureExt as _;
-use gpui::{App, AsyncApp, SharedString, Task};
+use gpui::{App, AsyncApp, BackgroundExecutor, SharedString, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,6 +29,12 @@ use util::ResultExt as _;
 
 /// How long to wait for the human to type the secret into the masked prompt.
 const STORE_PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long the fork waits for a single non-interactive `secretsh` probe
+/// (`exists` / `delete`) before treating the OS keyring as unavailable. The
+/// `secretsh` helper bounds its own keyring I/O, but this is the fork-side
+/// backstop against a wedged helper or a hung D-Bus daemon.
+const KEYRING_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One `secret-tool` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -156,7 +163,12 @@ async fn run_operation(
         SecretOperation::Store => {
             let name = required_name(&input)?;
             validate_name(&name)?;
-            if secret_exists(&name).await {
+            if matches!(
+                probe_secret(cx, &name)
+                    .await
+                    .map_err(|error| SecretToolOutput::Error { error })?,
+                SecretPresence::Present
+            ) {
                 return Err(SecretToolOutput::Error {
                     error: format!(
                         "A secret named {name:?} already exists; use `rotate` to change it."
@@ -172,7 +184,12 @@ async fn run_operation(
         SecretOperation::Rotate => {
             let name = required_name(&input)?;
             validate_name(&name)?;
-            if !secret_exists(&name).await {
+            if matches!(
+                probe_secret(cx, &name)
+                    .await
+                    .map_err(|error| SecretToolOutput::Error { error })?,
+                SecretPresence::Missing
+            ) {
                 return Err(SecretToolOutput::Error {
                     error: format!("No secret named {name:?} is stored; use `store` first."),
                 });
@@ -186,14 +203,28 @@ async fn run_operation(
         SecretOperation::Delete => {
             let name = required_name(&input)?;
             validate_name(&name)?;
-            if !secret_exists(&name).await {
+            if matches!(
+                probe_secret(cx, &name)
+                    .await
+                    .map_err(|error| SecretToolOutput::Error { error })?,
+                SecretPresence::Missing
+            ) {
                 return Err(SecretToolOutput::Error {
                     error: format!("No secret named {name:?} is stored."),
                 });
             }
-            run_secretsh(&["delete", name.as_str()])
+            let result = run_secretsh(cx, &["delete", name.as_str()])
                 .await
                 .map_err(|error| SecretToolOutput::Error { error })?;
+            if result.exit_code != Some(0) {
+                return Err(SecretToolOutput::Error {
+                    error: if result.combined.is_empty() {
+                        format!("deleting {name:?} failed")
+                    } else {
+                        result.combined
+                    },
+                });
+            }
             record_event(cx, &name, "delete", &event_stream).await?;
             Ok(SecretToolOutput::Success {
                 message: format!("deleted {name:?}"),
@@ -211,6 +242,16 @@ async fn run_operation(
             if program.is_empty() {
                 return Err(SecretToolOutput::Error {
                     error: "`program` must not be empty.".into(),
+                });
+            }
+            if matches!(
+                probe_secret(cx, &name)
+                    .await
+                    .map_err(|error| SecretToolOutput::Error { error })?,
+                SecretPresence::Missing
+            ) {
+                return Err(SecretToolOutput::Error {
+                    error: format!("No secret named {name:?} is stored."),
                 });
             }
             authorize_run(&name, &program, &event_stream, cx).await?;
@@ -259,14 +300,21 @@ async fn list(cx: &mut AsyncApp) -> Result<SecretToolOutput, SecretToolOutput> {
         })?;
 
     // The audit log is the name registry; derive the distinct names and drop
-    // any whose keyring entries were removed outside this tool.
+    // any whose keyring entries were removed outside this tool. A locked or
+    // unresponsive keyring is an error here, never a partial list.
     let mut present: Vec<String> = Vec::new();
     for event in events {
         if present.contains(&event.secret_name) {
             continue;
         }
-        if secret_exists(&event.secret_name).await {
-            present.push(event.secret_name);
+        match probe_secret(cx, &event.secret_name).await {
+            Ok(SecretPresence::Present) => present.push(event.secret_name),
+            Ok(SecretPresence::Missing) => {}
+            Err(error) => {
+                return Err(SecretToolOutput::Error {
+                    error: format!("keyring unavailable: {error}"),
+                });
+            }
         }
     }
     present.sort();
@@ -287,8 +335,25 @@ async fn connect_db(cx: &mut AsyncApp) -> Result<Arc<ThreadsDatabase>, SecretToo
         })
 }
 
-async fn secret_exists(name: &str) -> bool {
-    run_secretsh(&["exists", name]).await.is_ok()
+enum SecretPresence {
+    Present,
+    Missing,
+}
+
+/// Probe whether a named secret exists, distinguishing "missing" from "keyring
+/// unavailable". Bounded by the fork-side timeout so a locked or unresponsive
+/// keyring can never wedge a tool call.
+async fn probe_secret(cx: &mut AsyncApp, name: &str) -> Result<SecretPresence, String> {
+    let result = run_secretsh(cx, &["exists", name]).await?;
+    match result.exit_code {
+        Some(0) => Ok(SecretPresence::Present),
+        Some(1) => Ok(SecretPresence::Missing),
+        _ => Err(if result.combined.is_empty() {
+            format!("the OS keyring could not be read for {name:?}")
+        } else {
+            result.combined
+        }),
+    }
 }
 
 /// Ask the human to confirm the command before it runs with the named secret
@@ -427,30 +492,54 @@ async fn run_secret_command(
     Ok(message)
 }
 
-/// Run a non-interactive `secretsh` subcommand and return its combined output.
-async fn run_secretsh(args: &[&str]) -> Result<String, String> {
-    let output = util::command::new_command("secretsh")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| format!("Failed to run `secretsh`: {error}"))?;
+struct SecretshResult {
+    exit_code: Option<i32>,
+    combined: String,
+}
+
+/// Run a non-interactive `secretsh` subcommand, bounded by
+/// [`KEYRING_PROBE_TIMEOUT`], returning its exit code and combined output.
+async fn run_secretsh(cx: &mut AsyncApp, args: &[&str]) -> Result<SecretshResult, String> {
+    let output = bounded(
+        cx.background_executor(),
+        KEYRING_PROBE_TIMEOUT,
+        util::command::new_command("secretsh").args(args).output(),
+    )
+    .await?
+    .map_err(|error| format!("Failed to run `secretsh`: {error}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut message = String::new();
+    let mut combined = String::new();
     if !stdout.trim().is_empty() {
-        message.push_str(stdout.trim());
+        combined.push_str(stdout.trim());
     }
     if !stderr.trim().is_empty() {
-        if !message.is_empty() {
-            message.push('\n');
+        if !combined.is_empty() {
+            combined.push('\n');
         }
-        message.push_str(stderr.trim());
+        combined.push_str(stderr.trim());
     }
-    if !output.status.success() {
-        return Err(message);
+    Ok(SecretshResult {
+        exit_code: output.status.code(),
+        combined,
+    })
+}
+
+/// Race `future` against `timeout` on `executor`, returning an error instead of
+/// hanging when the future never completes.
+async fn bounded<T>(
+    executor: &BackgroundExecutor,
+    timeout: Duration,
+    future: impl Future<Output = T>,
+) -> Result<T, String> {
+    let future = future.fuse();
+    let timer = executor.timer(timeout).fuse();
+    futures::pin_mut!(future, timer);
+    futures::select! {
+        value = future => Ok(value),
+        _ = timer => Err(format!("timed out after {timeout:?}")),
     }
-    Ok(message)
 }
 
 async fn record_event(
@@ -473,4 +562,29 @@ async fn record_event(
         .map_err(|error| SecretToolOutput::Error {
             error: format!("Failed to record the secret audit event: {error}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn probe_timeout_bounds_a_hung_future(cx: &mut gpui::TestAppContext) {
+        let result = bounded(
+            &cx.background_executor,
+            Duration::from_millis(50),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[gpui::test]
+    async fn probe_timeout_returns_the_value_on_completion(cx: &mut gpui::TestAppContext) {
+        let result = bounded(&cx.background_executor, Duration::from_secs(5), async {
+            7u8
+        })
+        .await;
+        assert_eq!(result, Ok(7u8));
+    }
 }
