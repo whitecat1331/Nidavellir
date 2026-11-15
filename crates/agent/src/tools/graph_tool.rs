@@ -424,30 +424,33 @@ struct Decision {
     last_failure: Option<FailureRecord>,
 }
 
-/// The nodes whose gate passed. A failed node is not satisfied: it must be
-/// retried (or re-opened by a declared back-edge) before its successors run.
-fn satisfied_nodes(state: &GraphState) -> HashSet<&str> {
-    state
-        .done
+/// The permitted successors, derived from the route and `done` (D6 — never stored).
+///
+/// Presence-based by design: D17 makes a failed gate advisory for an unprotected
+/// change (merge may still proceed), so the edge guard cannot hard-block on it.
+/// The *coordinator* prefers a retry of a failed node before any successor —
+/// see `retry_candidate`.
+fn derive_next(state: &GraphState) -> Vec<String> {
+    let done: HashSet<&str> = state.done.iter().map(|entry| entry.node.as_str()).collect();
+    ROUTE
         .iter()
-        .filter(|entry| !entry.failed)
-        .map(|entry| entry.node.as_str())
+        .filter(|&node| !done.contains(node) && prereqs(node).iter().all(|p| done.contains(*p)))
+        .map(|node| (*node).to_string())
         .collect()
 }
 
-/// The permitted next nodes, derived from the route and `done` (D6 — never
-/// stored). A failed node is itself ready again (a retry); its successors are
-/// not, because its prerequisite is unsatisfied.
-fn derive_next(state: &GraphState) -> Vec<String> {
-    let satisfied = satisfied_nodes(state);
+/// A node recorded but not passed, which must be retried before its successors
+/// are dispatched. Route order makes the choice deterministic.
+fn retry_candidate(state: &GraphState) -> Option<String> {
     ROUTE
         .iter()
-        .filter(|&node| {
-            !satisfied.contains(node)
-                && prereqs(node).iter().all(|p| satisfied.contains(*p))
+        .find(|node| {
+            state
+                .done
+                .iter()
+                .any(|entry| entry.node == **node && entry.failed)
         })
         .map(|node| (*node).to_string())
-        .collect()
 }
 
 fn transitive_prereqs(node: &str, out: &mut Vec<&'static str>) {
@@ -820,6 +823,20 @@ fn coordinate(state: &mut GraphState, ask: bool, now: DateTime<Utc>) -> Decision
         );
     }
 
+    // A recorded-but-failed node is retried before any successor is dispatched.
+    if let Some(node) = retry_candidate(state) {
+        return Decision {
+            action: "dispatch".to_string(),
+            node: Some(node.clone()),
+            reason: format!("{node} failed on a previous attempt — retry it"),
+            brief: Some(brief_for(&node, &state.plan, true)),
+            fresh_executor: true,
+            predicate: None,
+            spent_tokens: spent_tokens(state),
+            last_failure: latest_failure(state),
+        };
+    }
+
     let ready = derive_next(state);
     let Some(node) = ready.first() else {
         return pause_decision(
@@ -878,7 +895,9 @@ fn begin(state: &mut GraphState, node: &str, executor: &str, now: DateTime<Utc>)
         ));
     }
     if !derive_next(state).iter().any(|ready| ready == node) {
-        return Err(format!("{node} is not ready"));
+        if retry_candidate(state).as_deref() != Some(node) {
+            return Err(format!("{node} is not ready"));
+        }
     }
     let timestamp = now.to_rfc3339();
     state.active = Some(ActiveNode {
@@ -1068,13 +1087,10 @@ fn advance(
             });
         }
     } else {
-        let satisfied = satisfied_nodes(state);
+        let done: HashSet<&str> = state.done.iter().map(|entry| entry.node.as_str()).collect();
         let mut missing = Vec::new();
         transitive_prereqs(node, &mut missing);
-        let mut missing: Vec<&str> = missing
-            .into_iter()
-            .filter(|p| !satisfied.contains(p))
-            .collect();
+        let mut missing: Vec<&str> = missing.into_iter().filter(|p| !done.contains(p)).collect();
         missing.sort_unstable();
         missing.dedup();
         if !missing.is_empty() {
@@ -1378,25 +1394,6 @@ mod tests {
         advance(state, node, artifact, false, false, None, None, None, None).unwrap();
     }
 
-    fn done_entry(node: &str, failed: bool) -> DoneEntry {
-        let failure = failed.then(failed_record);
-        DoneEntry {
-            node: node.to_string(),
-            artifact: "artifact".to_string(),
-            at: String::new(),
-            failed,
-            attempts: vec![Attempt {
-                at: String::new(),
-                artifact: "artifact".to_string(),
-                failed,
-                failure,
-                cost: None,
-                warnings: Vec::new(),
-            }],
-            cost: None,
-        }
-    }
-
     fn at(seconds: i64) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-11-15T12:00:00+00:00")
             .unwrap()
@@ -1430,12 +1427,23 @@ mod tests {
     #[test]
     fn protected_change_blocks_merge_on_failed_verify() {
         let mut state = fresh();
-        state.done = ["plan", "promote", "claim", "fork", "implement"]
-            .into_iter()
-            .map(|node| done_entry(node, false))
-            .chain([done_entry("verify", true)])
-            .chain(["compile", "accept"].into_iter().map(|node| done_entry(node, false)))
-            .collect();
+        for node in ["plan", "promote", "claim", "fork", "implement"] {
+            step(&mut state, node);
+        }
+        advance(
+            &mut state,
+            "verify",
+            "report",
+            false,
+            true,
+            Some(failed_record()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        step(&mut state, "compile");
+        step(&mut state, "accept");
         let error =
             advance(&mut state, "merge", SHA, true, false, None, None, None, None).unwrap_err();
         assert!(error.contains("protected"), "error was: {error}");
@@ -1463,12 +1471,23 @@ mod tests {
     #[test]
     fn unprotected_change_allows_merge_even_if_verification_failed() {
         let mut state = fresh();
-        state.done = ["plan", "promote", "claim", "fork", "implement"]
-            .into_iter()
-            .map(|node| done_entry(node, false))
-            .chain([done_entry("verify", true)])
-            .chain(["compile", "accept"].into_iter().map(|node| done_entry(node, false)))
-            .collect();
+        for node in ["plan", "promote", "claim", "fork", "implement"] {
+            step(&mut state, node);
+        }
+        advance(
+            &mut state,
+            "verify",
+            "report",
+            false,
+            true,
+            Some(failed_record()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        step(&mut state, "compile");
+        step(&mut state, "accept");
         advance(&mut state, "merge", SHA, false, false, None, None, None, None).unwrap();
         assert_eq!(state.current.as_deref(), Some("merge"));
     }
@@ -1491,14 +1510,14 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(derive_next(&state), vec!["verify".to_string()]);
-        let error =
-            advance(&mut state, "compile", SHA, false, false, None, None, None, None).unwrap_err();
-        assert!(error.contains("verify"), "error was: {error}");
         let decision = coordinate(&mut state, false, at(0));
         assert_eq!(decision.action, "dispatch");
         assert_eq!(decision.node.as_deref(), Some("verify"));
         assert!(decision.brief.unwrap().contains("back-edge"));
+
+        // The edge guard stays D17-advisory for successors; the coordinator is
+        // what prefers the retry, so an unprotected flow may still proceed.
+        advance(&mut state, "compile", SHA, false, false, None, None, None, None).unwrap();
     }
 
     #[test]
