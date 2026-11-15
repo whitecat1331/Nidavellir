@@ -351,7 +351,7 @@ mod tests {
     fn truncates_oversized_subagent_output() {
         assert_eq!(truncate_subagent_output("ok"), "ok");
 
-        let long = "x".repeat(MAX_SUBAGENT_OUTPUT_BYTES + 32);
+        let long = "x".repeat(MAX_SUBAGENT_OUTPUT_BYTES + 4096);
         let truncated = truncate_subagent_output(&long);
         assert!(truncated.len() < long.len());
         assert!(truncated.ends_with("total ...]"));

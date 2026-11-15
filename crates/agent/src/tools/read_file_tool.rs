@@ -571,7 +571,7 @@ mod test {
     fn truncates_oversized_file_output() {
         assert_eq!(truncate_file_output("ok"), "ok");
 
-        let long = "x".repeat(MAX_READ_FILE_OUTPUT_BYTES + 32);
+        let long = "x".repeat(MAX_READ_FILE_OUTPUT_BYTES + 4096);
         let truncated = truncate_file_output(&long);
         assert!(truncated.len() < long.len());
         assert!(truncated.ends_with("total ...]"));

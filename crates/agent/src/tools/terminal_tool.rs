@@ -1714,7 +1714,7 @@ mod tests {
     fn truncates_oversized_terminal_content() {
         assert_eq!(truncate_terminal_content("ok"), "ok");
 
-        let long = "x".repeat(COMMAND_OUTPUT_LIMIT as usize + 32);
+        let long = "x".repeat(COMMAND_OUTPUT_LIMIT as usize + 4096);
         let truncated = truncate_terminal_content(&long);
         assert!(truncated.len() < long.len());
         assert!(truncated.ends_with("total ...]"));

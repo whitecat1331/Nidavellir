@@ -286,7 +286,7 @@ mod tests {
     fn truncates_oversized_diagnostics_output() {
         assert_eq!(truncate_diagnostics_output("ok"), "ok");
 
-        let long = "x".repeat(MAX_DIAGNOSTICS_OUTPUT_BYTES + 32);
+        let long = "x".repeat(MAX_DIAGNOSTICS_OUTPUT_BYTES + 4096);
         let truncated = truncate_diagnostics_output(&long);
         assert!(truncated.len() < long.len());
         assert!(truncated.ends_with("total ...]"));
