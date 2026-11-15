@@ -5484,6 +5484,7 @@ impl ThreadView {
                 .gap_1()
                 .child(
                     IconButton::new("sandbox-status", icon)
+                        .aria_label("Sandbox status")
                         .icon_size(IconSize::Small)
                         .icon_color(icon_color)
                         .tooltip(Tooltip::element(move |_window, _cx| {
@@ -5528,6 +5529,7 @@ impl ThreadView {
 
         Some(
             IconButton::new("plan-mode", IconName::ListTodo)
+                .aria_label(tooltip_label)
                 .icon_size(IconSize::Small)
                 .icon_color(color)
                 .tooltip(move |_, cx| {
@@ -5572,6 +5574,7 @@ impl ThreadView {
 
         Some(
             IconButton::new("rea-mode", IconName::MagnifyingGlass)
+                .aria_label(tooltip_label)
                 .icon_size(IconSize::Small)
                 .icon_color(color)
                 .tooltip(move |_, cx| {
@@ -5623,6 +5626,7 @@ impl ThreadView {
             .flatten();
 
         let icon_button = IconButton::new("fast-mode", icon)
+            .aria_label(tooltip_label)
             .icon_size(IconSize::Small)
             .icon_color(color);
 
@@ -5773,6 +5777,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         let thinking_toggle = IconButton::new("thinking-mode", icon)
+            .aria_label(tooltip_label)
             .icon_size(IconSize::Small)
             .icon_color(color)
             .tooltip(move |_, cx| {
