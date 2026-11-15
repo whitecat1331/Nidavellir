@@ -54,6 +54,13 @@ pub enum WindowControlOperation {
     /// the UI instead of OCR. `selector` filters nodes, `limit` bounds the
     /// count, and `x`/`y` resolve the deepest node under a point (`hit`).
     Snapshot,
+    /// Capture the window (or a single node's bounds) as a PNG.
+    ///
+    /// Dev-channel only and permission-gated (`confirm` by default): pixels
+    /// cannot be redacted, so consent is the only control. `target` defaults to
+    /// `window`; a node ref (`#id` / `role[name="…"]`) or `node` crops to that
+    /// node's bounds.
+    Screenshot,
     /// Add a git worktree as a workspace root, so the agent can reach a
     /// `../zed-wip-<slug>` worktree it just created. Skips the interactive
     /// folder picker. Auto-allowed by default (the agent created the worktree);
@@ -79,6 +86,7 @@ impl WindowControlOperation {
             Self::Click => "click",
             Self::Assert => "assert",
             Self::Snapshot => "snapshot",
+            Self::Screenshot => "screenshot",
             Self::AddWorktreeRoot => "add_worktree_root",
             Self::AddProjectRoot => "add_project_root",
         }
@@ -106,6 +114,8 @@ pub struct WindowControlRequest {
 
     /// For `focus`: the target view/handle. Known targets are
     /// `agent_panel.message_editor`, `agent_panel`, `editor`, and `terminal`.
+    /// For `screenshot`: what to capture. Defaults to `window`; a node ref
+    /// (`#id` / `role[name="…"]`) crops to that node's bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 
@@ -162,10 +172,11 @@ pub struct WindowControlRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub y: Option<f32>,
 
-    /// For `snapshot`/`click`: a node reference resolved against the current
-    /// accessibility tree — `#<id>` or `role[name="…"]`, with an optional
-    /// `#<n>` ordinal when several nodes match. An unresolved or ambiguous ref
-    /// is a hard error; take a fresh `snapshot` after the UI changes.
+    /// For `snapshot`/`click`/`screenshot`: a node reference resolved against
+    /// the current accessibility tree — `#<id>` or `role[name="…"]`, with an
+    /// optional `#<n>` ordinal when several nodes match. An unresolved or
+    /// ambiguous ref is a hard error; take a fresh `snapshot` after the UI
+    /// changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
 }

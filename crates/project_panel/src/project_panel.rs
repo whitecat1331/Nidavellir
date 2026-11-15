@@ -6010,6 +6010,8 @@ impl ProjectPanel {
 
         div()
             .id(id.clone())
+            .role(gpui::Role::TreeItem)
+            .aria_label(file_name.clone())
             .relative()
             .group(GROUP_NAME)
             .when_some(

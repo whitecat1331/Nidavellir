@@ -1555,6 +1555,9 @@ impl AgentPanel {
         // real adapter is active).
         if agent::window_control_enabled(cx) {
             window.set_a11y_forced(true);
+            // Screenshot readback is runtime-gated in `gpui`; this is the only
+            // call site, and it sits behind the dev-channel predicate.
+            window.set_dev_capture_enabled(true);
         }
 
         let fs = workspace.app_state().fs.clone();
@@ -6300,22 +6303,107 @@ pub(crate) fn window_control_dispatch(
             }
             Ok(value)
         }
+        Operation::Screenshot => {
+            let target = request.target.as_deref().unwrap_or("window");
+            let node_reference = request
+                .node
+                .as_deref()
+                .or_else(|| (target != "window").then_some(target));
+
+            let png = if let Some(reference) = node_reference {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                let node = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .ok_or_else(|| anyhow!("resolved node {reference:?} is missing"))?;
+                let bounds = node.bounds.ok_or_else(|| {
+                    anyhow!("accessibility node {reference:?} has no bounds to capture")
+                })?;
+                window.screenshot_region(bounds)?
+            } else {
+                window.screenshot()?
+            };
+
+            use base64::Engine as _;
+            Ok(serde_json::json!({
+                "target": target,
+                "node": node_reference.map(|reference| reference.to_string()),
+                "encoding": "base64",
+                "media_type": "image/png",
+                "bytes": png.len(),
+                "data": base64::engine::general_purpose::STANDARD.encode(&png),
+            }))
+        }
         Operation::Click => {
-            let selector = request
-                .selector
-                .clone()
-                .ok_or_else(|| anyhow!("`click` requires `selector`"))?;
-            window_control_click(panel, &selector, window, cx)?;
-            Ok(serde_json::json!({ "clicked": selector }))
+            if let Some(reference) = request.node.as_deref() {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                window.perform_a11y_action(node_id, gpui::accesskit::Action::Click, cx);
+                Ok(serde_json::json!({
+                    "clicked": window_control_node_ref(node_id),
+                    "via": "accessibility",
+                }))
+            } else if let (Some(x), Some(y)) = (request.x, request.y) {
+                let position = gpui::point(gpui::px(x), gpui::px(y));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: gpui::Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: gpui::Modifiers::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+                Ok(serde_json::json!({
+                    "clicked": { "x": x, "y": y },
+                    "via": "coordinates",
+                }))
+            } else if let Some(selector) = request.selector.clone() {
+                window_control_click(panel, &selector, window, cx)?;
+                Ok(serde_json::json!({ "clicked": selector, "via": "selector" }))
+            } else {
+                Err(anyhow!(
+                    "`click` requires `selector`, `node`, or both `x` and `y`"
+                ))
+            }
         }
         Operation::Assert => {
-            let selector = request
-                .selector
-                .clone()
-                .ok_or_else(|| anyhow!("`assert` requires `selector`"))?;
-            panel.read_with(cx, |panel, cx| {
-                window_control_assert(panel, &selector, &request, window, cx)
-            })
+            if let Some(reference) = request.node.as_deref() {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                let node = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .ok_or_else(|| anyhow!("resolved node {reference:?} is missing"))?;
+                window_control_assert_node(node, reference, &request)
+            } else {
+                let selector = request
+                    .selector
+                    .clone()
+                    .ok_or_else(|| anyhow!("`assert` requires `selector` or `node`"))?;
+                panel.read_with(cx, |panel, cx| {
+                    window_control_assert(panel, &selector, &request, window, cx)
+                })
+            }
         }
         Operation::AddWorktreeRoot | Operation::AddProjectRoot => {
             // Handled by the host, which can await the worktree open
@@ -6550,7 +6638,65 @@ fn window_control_node_json(
         "depth": depth,
         "children": node.children.len(),
         "focused": focused,
+        "focusable": node.focusable,
     })
+}
+
+/// Roles that represent a control a user can act on. Used by the coverage
+/// metric to tell an unlabelled control apart from an unlabelled container.
+fn window_control_role_is_interactive(role: gpui::Role) -> bool {
+    use gpui::Role;
+    matches!(
+        role,
+        Role::Button
+            | Role::DefaultButton
+            | Role::Link
+            | Role::TextInput
+            | Role::MultilineTextInput
+            | Role::CheckBox
+            | Role::RadioButton
+            | Role::Switch
+            | Role::MenuItem
+            | Role::MenuItemCheckBox
+            | Role::MenuItemRadio
+            | Role::Tab
+            | Role::TreeItem
+            | Role::ListItem
+            | Role::ComboBox
+            | Role::Slider
+            | Role::SpinButton
+            | Role::DisclosureTriangle
+            | Role::ScrollBar
+    )
+}
+
+/// Assert on a node's visibility or label/value; `passed` reports the result.
+fn window_control_assert_node(
+    node: &gpui::A11yNodeSnapshot,
+    reference: &str,
+    request: &agent::WindowControlRequest,
+) -> Result<serde_json::Value> {
+    let visible = node
+        .bounds
+        .is_some_and(|bounds| bounds.size.width.0 > 0.0 && bounds.size.height.0 > 0.0);
+    let mut passed = true;
+    if let Some(expect_visible) = request.expect_visible {
+        passed &= visible == expect_visible;
+    }
+    if let Some(expect_text) = request.expect_text.as_deref() {
+        passed &= node.label.as_deref() == Some(expect_text)
+            || node.value.as_deref() == Some(expect_text);
+    }
+
+    Ok(serde_json::json!({
+        "reference": reference,
+        "node": window_control_node_ref(node.id),
+        "role": format!("{:?}", node.role),
+        "label": node.label.as_deref().map(agent::redact_sensitive),
+        "value": node.value.as_deref().map(agent::redact_sensitive),
+        "visible": visible,
+        "passed": passed,
+    }))
 }
 
 /// Serialize the live accessibility tree for the dev-only `window_control`
@@ -6572,6 +6718,40 @@ fn window_control_tree(
             "text": "",
         });
     };
+
+    // Coverage is measured over the whole tree, independent of `limit`/filter:
+    // an unlabelled control is one with an interactive role (or a focus handle)
+    // and neither a label nor a value.
+    let unlabelled: Vec<&gpui::A11yNodeSnapshot> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.focusable || window_control_role_is_interactive(node.role))
+        .filter(|node| {
+            node.label
+                .as_deref()
+                .is_none_or(|label| label.trim().is_empty())
+                && node
+                    .value
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+        })
+        .collect();
+    let interactive = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.focusable || window_control_role_is_interactive(node.role))
+        .count();
+    let unlabelled_sample: Vec<String> = unlabelled
+        .iter()
+        .take(10)
+        .map(|node| format!("{} {:?}", window_control_node_ref(node.id), node.role))
+        .collect();
+    let coverage = serde_json::json!({
+        "nodes": snapshot.nodes.len(),
+        "interactive": interactive,
+        "unlabelled": unlabelled.len(),
+        "unlabelled_sample": unlabelled_sample,
+    });
 
     let by_id: std::collections::HashMap<_, _> =
         snapshot.nodes.iter().map(|node| (node.id, node)).collect();
@@ -6670,6 +6850,7 @@ fn window_control_tree(
         "nodes": nodes,
         "text": text,
         "hit": hit,
+        "coverage": coverage,
     })
 }
 
@@ -7275,6 +7456,7 @@ impl AgentPanel {
                                 .child(editable_title)
                                 .child(
                                     IconButton::new("retry-thread-title", IconName::XCircle)
+                                        .aria_label("Retry thread title")
                                         .icon_color(Color::Error)
                                         .icon_size(IconSize::Small)
                                         .tooltip(move |_window, cx| {
@@ -7384,6 +7566,7 @@ impl AgentPanel {
                             .bg(cx.theme().colors().tab_bar_background)
                             .child(
                                 IconButton::new("edit_tile", IconName::Pencil)
+                                    .aria_label("Edit thread title")
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Edit Thread Title")),
                             ),
@@ -7484,6 +7667,7 @@ impl AgentPanel {
         PopoverMenu::new("agent-options-menu")
             .trigger_with_tooltip(
                 IconButton::new("agent-options-menu", IconName::Ellipsis)
+                    .aria_label("Agent menu")
                     .icon_size(IconSize::Small),
                 move |_window, cx| {
                     Tooltip::for_action_in(
@@ -7960,6 +8144,7 @@ impl AgentPanel {
             (IconName::Maximize, "Enable Full Screen")
         };
         let full_screen_button = IconButton::new("toggle-full-screen", icon_name)
+            .aria_label(tooltip_text)
             .icon_size(IconSize::Small)
             .toggle_state(is_full_screen)
             .tooltip(move |_, cx| Tooltip::for_action(tooltip_text, &ToggleZoom, cx))
@@ -7991,6 +8176,7 @@ impl AgentPanel {
             let new_thread_menu = PopoverMenu::new("new_thread_menu")
                 .trigger_with_tooltip(
                     IconButton::new("new_thread_menu_btn", IconName::Plus)
+                        .aria_label("New thread")
                         .icon_size(IconSize::Small),
                     {
                         move |_window, cx| {
@@ -8826,6 +9012,7 @@ mod tests {
             description: None,
             bounds: None,
             children: Vec::new(),
+            focusable: false,
         };
         gpui::A11ySnapshot {
             root: root.id,
@@ -8842,6 +9029,7 @@ mod tests {
                             description: None,
                             bounds: None,
                             children: Vec::new(),
+                            focusable: false,
                         }),
                 )
                 .collect(),
@@ -9050,6 +9238,21 @@ mod tests {
                 .any(|node| node["ref"].as_str().is_some_and(|r| r.starts_with('#'))),
             "nodes carry stable #id refs: {tree:?}"
         );
+        assert!(
+            nodes.iter().all(|node| node["focusable"].is_boolean()),
+            "nodes report whether they are focusable: {tree:?}"
+        );
+        let coverage = &tree["coverage"];
+        assert!(
+            coverage["interactive"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "coverage counts interactive nodes: {tree:?}"
+        );
+        assert!(
+            coverage["unlabelled"].as_u64().is_some(),
+            "coverage reports an unlabelled-node count: {tree:?}"
+        );
 
         let (x, y) = nodes
             .iter()
@@ -9125,6 +9328,82 @@ mod tests {
             asserted["passed"],
             json!(true),
             "assert text should pass: {asserted}"
+        );
+
+        // Phase 4: assert and click through a tree node ref, and click by
+        // coordinate. The message editor is labelled and carries the typed text.
+        let node_asserted = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Assert,
+                        node: Some("multilinetextinput[name=\"Message editor\"]".to_string()),
+                        expect_text: Some("hello window".to_string()),
+                        expect_visible: Some(true),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("node assert should succeed");
+        assert_eq!(
+            node_asserted["passed"],
+            json!(true),
+            "asserting a node's value should pass: {node_asserted}"
+        );
+
+        let node_clicked = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Click,
+                        node: Some("multilinetextinput[name=\"Message editor\"]".to_string()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("node click should succeed");
+        assert_eq!(
+            node_clicked["via"],
+            json!("accessibility"),
+            "a node click runs through the accessibility path: {node_clicked}"
+        );
+
+        let (editor_x, editor_y) = nodes
+            .iter()
+            .find(|node| node["label"] == json!("Message editor"))
+            .and_then(|node| {
+                let bounds = node.get("bounds")?;
+                Some((
+                    (bounds["x"].as_f64()? + bounds["width"].as_f64()? / 2.0) as f32,
+                    (bounds["y"].as_f64()? + bounds["height"].as_f64()? / 2.0) as f32,
+                ))
+            })
+            .expect("the message editor has bounds");
+        let coord_clicked = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Click,
+                        x: Some(editor_x),
+                        y: Some(editor_y),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("coordinate click should succeed");
+        assert_eq!(
+            coord_clicked["via"],
+            json!("coordinates"),
+            "a click with x/y synthesizes a mouse event: {coord_clicked}"
         );
 
         let clicked = cx

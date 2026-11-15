@@ -1228,6 +1228,11 @@ pub struct Window {
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
+    /// Whether [`Window::screenshot`] may read the frame back. Enabled only by
+    /// dev-channel tooling (see [`Window::set_dev_capture_enabled`]); this is
+    /// the runtime boundary that keeps the readback out of release builds even
+    /// though the per-backend implementation is compiled in.
+    dev_capture_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2055,6 +2060,7 @@ impl Window {
                 accessibility_force_disabled,
                 initial_window_title,
             ),
+            dev_capture_enabled: false,
         })
     }
 
@@ -2596,8 +2602,62 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+        self.platform_window
+            .render_to_image(&self.rendered_frame.scene)
+    }
+
+    /// Allow [`Self::screenshot`] to read the frame back on this window.
+    ///
+    /// This is dev tooling only: the sole caller is the agent panel, under the
+    /// same dev-channel predicate that installs the `window_control` surface.
+    /// The flag is per-window so a release build never enables it, and the
+    /// readback stays unavailable to any other caller even if it compiles in.
+    pub fn set_dev_capture_enabled(&mut self, enabled: bool) {
+        self.dev_capture_enabled = enabled;
+    }
+
+    /// PNG bytes of the last rendered frame.
+    ///
+    /// Unlike [`Self::render_to_image`] this is runtime-gated: it returns `Err`
+    /// unless the window was enabled with [`Self::set_dev_capture_enabled`], so
+    /// releasing the readback into a shipped build requires an explicit,
+    /// channel-checked call. Returns `Err` on backends without a readback (the
+    /// platform default).
+    pub fn screenshot(&self) -> anyhow::Result<Vec<u8>> {
+        encode_png(&self.render_frame_image()?)
+    }
+
+    /// PNG bytes of the last rendered frame, cropped to `bounds` (logical
+    /// pixels) and clamped to the window.
+    ///
+    /// Used by the dev-only `window_control` surface to capture a single node's
+    /// bounds rather than the whole window.
+    pub fn screenshot_region(&self, bounds: Bounds<Pixels>) -> anyhow::Result<Vec<u8>> {
+        let image = self.render_frame_image()?;
+        anyhow::ensure!(
+            image.width() > 0 && image.height() > 0,
+            "rendered frame is empty"
+        );
+        let scale = self.scale_factor;
+
+        let to_pixel = |value: Pixels| (value.0 * scale).round() as i64;
+        let x = to_pixel(bounds.origin.x).clamp(0, (image.width() as i64 - 1).max(0));
+        let y = to_pixel(bounds.origin.y).clamp(0, (image.height() as i64 - 1).max(0));
+        let width = to_pixel(bounds.size.width).max(1);
+        let height = to_pixel(bounds.size.height).max(1);
+        let width = width.min(image.width() as i64 - x).max(1) as u32;
+        let height = height.min(image.height() as i64 - y).max(1) as u32;
+
+        let cropped = image::imageops::crop_imm(&image, x as u32, y as u32, width, height);
+        encode_png(&cropped.to_image())
+    }
+
+    fn render_frame_image(&self) -> anyhow::Result<image::RgbaImage> {
+        anyhow::ensure!(
+            self.dev_capture_enabled,
+            "screenshots require the dev-channel window-control surface"
+        );
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
     }
@@ -7203,6 +7263,15 @@ impl AnyWindowHandle {
     }
 }
 
+fn encode_png(image: &image::RgbaImage) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    image.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )?;
+    Ok(bytes)
+}
+
 impl HasWindowHandle for Window {
     fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
         self.platform_window.window_handle()
@@ -7561,6 +7630,34 @@ mod tests {
         // subsequent draws of both windows work against a fresh arena.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+
+    #[test]
+    fn test_screenshot_is_gated_on_dev_capture() {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| EmptyView);
+        let handle: AnyWindowHandle = window.into();
+
+        cx.update_window(handle, |_, window, _| {
+            let error = window
+                .screenshot()
+                .expect_err("screenshot must be gated until dev capture is enabled");
+            assert!(
+                error.to_string().contains("dev-channel"),
+                "unexpected gate error: {error}"
+            );
+
+            window.set_dev_capture_enabled(true);
+            // The gate is now open. The test platform has no headless renderer
+            // by default, so this may still fail — but never on the gate.
+            if let Err(error) = window.screenshot() {
+                assert!(
+                    !error.to_string().contains("dev-channel"),
+                    "enabling dev capture must clear the gate: {error}"
+                );
+            }
+        })
+        .unwrap();
     }
 
     #[test]

@@ -6010,6 +6010,7 @@ impl ThreadView {
                 .into_any_element()
         } else if is_generating && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
+                .aria_label("Stop generation")
                 .icon_color(Color::Error)
                 .style(ButtonStyle::Tinted(TintColor::Error))
                 .tooltip(move |_window, cx| {
@@ -6024,6 +6025,11 @@ impl ThreadView {
                 IconName::Send
             };
             IconButton::new("send-message", send_icon)
+                .aria_label(if is_generating {
+                    "Queue and send"
+                } else {
+                    "Send message"
+                })
                 .style(ButtonStyle::Filled)
                 .map(|this| {
                     if is_editor_empty && !is_generating {
@@ -6082,6 +6088,7 @@ impl ThreadView {
         PopoverMenu::new("add-context-menu")
             .trigger_with_tooltip(
                 IconButton::new("add-context", IconName::Plus)
+                    .aria_label("Add context")
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted),
                 {

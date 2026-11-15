@@ -350,6 +350,7 @@ impl A11y {
                     description: node.description().map(str::to_owned),
                     bounds,
                     children: node.children().to_vec(),
+                    focusable: self.focus_ids.contains_key(id),
                 }
             })
             .collect();
@@ -399,6 +400,10 @@ pub struct A11yNodeSnapshot {
     pub bounds: Option<Bounds<Pixels>>,
     /// The ids of this node's children.
     pub children: Vec<NodeId>,
+    /// Whether the node is registered with a focus handle. Interactive nodes
+    /// (buttons, text inputs, list rows) set this; coverage checks use it to
+    /// tell an unlabelled control apart from an unlabelled container.
+    pub focusable: bool,
 }
 
 /// Builder API for synthetic children. See the docs for
