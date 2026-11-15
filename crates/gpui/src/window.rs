@@ -66,7 +66,7 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
-pub use a11y::A11ySubtreeBuilder;
+pub use a11y::{A11yNodeSnapshot, A11ySnapshot, A11ySubtreeBuilder};
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1228,6 +1228,11 @@ pub struct Window {
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
+    /// Whether [`Window::screenshot`] may read the frame back. Enabled only by
+    /// dev-channel tooling (see [`Window::set_dev_capture_enabled`]); this is
+    /// the runtime boundary that keeps the readback out of release builds even
+    /// though the per-backend implementation is compiled in.
+    dev_capture_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2055,6 +2060,7 @@ impl Window {
                 accessibility_force_disabled,
                 initial_window_title,
             ),
+            dev_capture_enabled: false,
         })
     }
 
@@ -2596,8 +2602,62 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+        self.platform_window
+            .render_to_image(&self.rendered_frame.scene)
+    }
+
+    /// Allow [`Self::screenshot`] to read the frame back on this window.
+    ///
+    /// This is dev tooling only: the sole caller is the agent panel, under the
+    /// same dev-channel predicate that installs the `window_control` surface.
+    /// The flag is per-window so a release build never enables it, and the
+    /// readback stays unavailable to any other caller even if it compiles in.
+    pub fn set_dev_capture_enabled(&mut self, enabled: bool) {
+        self.dev_capture_enabled = enabled;
+    }
+
+    /// PNG bytes of the last rendered frame.
+    ///
+    /// Unlike [`Self::render_to_image`] this is runtime-gated: it returns `Err`
+    /// unless the window was enabled with [`Self::set_dev_capture_enabled`], so
+    /// releasing the readback into a shipped build requires an explicit,
+    /// channel-checked call. Returns `Err` on backends without a readback (the
+    /// platform default).
+    pub fn screenshot(&self) -> anyhow::Result<Vec<u8>> {
+        encode_png(&self.render_frame_image()?)
+    }
+
+    /// PNG bytes of the last rendered frame, cropped to `bounds` (logical
+    /// pixels) and clamped to the window.
+    ///
+    /// Used by the dev-only `window_control` surface to capture a single node's
+    /// bounds rather than the whole window.
+    pub fn screenshot_region(&self, bounds: Bounds<Pixels>) -> anyhow::Result<Vec<u8>> {
+        let image = self.render_frame_image()?;
+        anyhow::ensure!(
+            image.width() > 0 && image.height() > 0,
+            "rendered frame is empty"
+        );
+        let scale = self.scale_factor;
+
+        let to_pixel = |value: Pixels| (value.0 * scale).round() as i64;
+        let x = to_pixel(bounds.origin.x).clamp(0, (image.width() as i64 - 1).max(0));
+        let y = to_pixel(bounds.origin.y).clamp(0, (image.height() as i64 - 1).max(0));
+        let width = to_pixel(bounds.size.width).max(1);
+        let height = to_pixel(bounds.size.height).max(1);
+        let width = width.min(image.width() as i64 - x).max(1) as u32;
+        let height = height.min(image.height() as i64 - y).max(1) as u32;
+
+        let cropped = image::imageops::crop_imm(&image, x as u32, y as u32, width, height);
+        encode_png(&cropped.to_image())
+    }
+
+    fn render_frame_image(&self) -> anyhow::Result<image::RgbaImage> {
+        anyhow::ensure!(
+            self.dev_capture_enabled,
+            "screenshots require the dev-channel window-control surface"
+        );
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
     }
@@ -3347,10 +3407,14 @@ impl Window {
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
+        let a11y_really_active_start = self.a11y.is_really_active();
         self.a11y.sync_active_flag();
-        let a11y_active_end_of_frame = self.a11y.is_active();
+        let a11y_really_active_end = self.a11y.is_really_active();
 
-        let should_send_a11y_update = a11y_active_start_of_frame && a11y_active_end_of_frame;
+        // A forced tree (dev tooling) is for in-process observation only: it is
+        // sent to the platform only when a real adapter is attached at both
+        // ends of the frame.
+        let should_send_a11y_update = a11y_really_active_start && a11y_really_active_end;
 
         if a11y_active_start_of_frame {
             // Harvest frame metadata for the debug dump while the live window
@@ -6593,6 +6657,70 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// Force the in-process accessibility tree to be built every frame, even
+    /// when no assistive technology is connected.
+    ///
+    /// Dev tooling (`window_control`) uses this to observe the UI. The tree is
+    /// never sent to the platform unless a real assistive technology is active.
+    pub fn set_a11y_forced(&mut self, forced: bool) {
+        self.a11y.set_forced_active(forced);
+        self.refresh();
+    }
+
+    /// A snapshot of the last frame's accessibility tree.
+    ///
+    /// Returns `None` when the tree was not built — no assistive technology is
+    /// attached and the tree is not forced (see [`Self::set_a11y_forced`]).
+    pub fn a11y_snapshot(&self) -> Option<A11ySnapshot> {
+        self.a11y.snapshot()
+    }
+
+    /// The deepest node in the last frame's tree whose bounds contain `point`,
+    /// falling back to the smallest area when depths tie.
+    pub fn a11y_hit_test(&self, point: Point<Pixels>) -> Option<accesskit::NodeId> {
+        let snapshot = self.a11y.snapshot()?;
+        let by_id: collections::FxHashMap<_, _> =
+            snapshot.nodes.iter().map(|node| (node.id, node)).collect();
+
+        let mut depth: collections::FxHashMap<accesskit::NodeId, usize> =
+            collections::FxHashMap::default();
+        depth.insert(snapshot.root, 0);
+        let mut frontier = vec![snapshot.root];
+        while let Some(node_id) = frontier.pop() {
+            let Some(node) = by_id.get(&node_id) else {
+                continue;
+            };
+            let child_depth = depth[&node_id] + 1;
+            for child in &node.children {
+                depth.insert(*child, child_depth);
+                frontier.push(*child);
+            }
+        }
+
+        let mut best: Option<(usize, f32, accesskit::NodeId)> = None;
+        for node in &snapshot.nodes {
+            let Some(bounds) = node.bounds else {
+                continue;
+            };
+            if !bounds.contains(&point) {
+                continue;
+            }
+            let node_depth = depth.get(&node.id).copied().unwrap_or(0);
+            let area = bounds.size.width.0 * bounds.size.height.0;
+            let is_better = match best {
+                None => true,
+                Some((best_depth, best_area, _)) => {
+                    node_depth > best_depth || (node_depth == best_depth && area < best_area)
+                }
+            };
+            if is_better {
+                best = Some((node_depth, area, node.id));
+            }
+        }
+
+        best.map(|(_, _, id)| id)
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.
@@ -6613,29 +6741,59 @@ impl Window {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+        let accesskit::ActionRequest {
+            action,
+            target_node,
+            data,
+            ..
+        } = request;
+        self.dispatch_a11y_action(target_node, action, data.as_ref(), cx);
+    }
+
+    /// Perform an accessibility action on `node_id`, as a screen reader would.
+    ///
+    /// This is the in-process entry point for dev tooling (`window_control`):
+    /// it runs any listener registered with [`Self::on_a11y_action`], then falls
+    /// back to the built-in handling — `Click` synthesizes mouse events at the
+    /// node's center, `Focus` focuses the node's focus handle.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn perform_a11y_action(
+        &mut self,
+        node_id: accesskit::NodeId,
+        action: accesskit::Action,
+        cx: &mut App,
+    ) {
+        self.dispatch_a11y_action(node_id, action, None, cx);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn dispatch_a11y_action(
+        &mut self,
+        target_node: accesskit::NodeId,
+        action: accesskit::Action,
+        data: Option<&accesskit::ActionData>,
+        cx: &mut App,
+    ) {
         // Take listeners out temporarily so the closures can borrow Window
         // mutably, then restore them afterward.
-        if let Some(mut listeners) = self.a11y.action_listeners.remove(&request.target_node) {
-            let extra_data = request.data.as_ref();
+        if let Some(mut listeners) = self.a11y.action_listeners.remove(&target_node) {
             let mut matched = false;
-            for (action, listener) in &mut listeners {
-                if *action == request.action {
-                    listener(extra_data, self, cx);
+            for (listener_action, listener) in &mut listeners {
+                if *listener_action == action {
+                    listener(data, self, cx);
                     matched = true;
                 }
             }
-            self.a11y
-                .action_listeners
-                .insert(request.target_node, listeners);
+            self.a11y.action_listeners.insert(target_node, listeners);
             if matched {
                 return;
             }
         }
 
         // Fall back to built-in action handling.
-        match request.action {
+        match action {
             accesskit::Action::Click => {
-                if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
+                if let Some(bounds) = self.a11y.node_bounds.get(&target_node).copied() {
                     let center = bounds.center();
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
                         button: MouseButton::Left,
@@ -6655,7 +6813,7 @@ impl Window {
                 }
             }
             accesskit::Action::Focus => {
-                if let Some(focus_id) = self.a11y.focus_ids.get(&request.target_node).copied()
+                if let Some(focus_id) = self.a11y.focus_ids.get(&target_node).copied()
                     && let Some(handle) = FocusHandle::for_id(focus_id, &cx.focus_handles)
                 {
                     self.focus(&handle, cx);
@@ -6665,11 +6823,7 @@ impl Window {
                 self.blur(cx);
             }
             _ => {
-                log::debug!(
-                    "Unhandled a11y action: {:?} on {:?}",
-                    request.action,
-                    request.target_node
-                );
+                log::debug!("Unhandled a11y action: {:?} on {:?}", action, target_node);
             }
         }
     }
@@ -7109,6 +7263,15 @@ impl AnyWindowHandle {
     }
 }
 
+fn encode_png(image: &image::RgbaImage) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    image.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )?;
+    Ok(bytes)
+}
+
 impl HasWindowHandle for Window {
     fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
         self.platform_window.window_handle()
@@ -7467,6 +7630,34 @@ mod tests {
         // subsequent draws of both windows work against a fresh arena.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+
+    #[test]
+    fn test_screenshot_is_gated_on_dev_capture() {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| EmptyView);
+        let handle: AnyWindowHandle = window.into();
+
+        cx.update_window(handle, |_, window, _| {
+            let error = window
+                .screenshot()
+                .expect_err("screenshot must be gated until dev capture is enabled");
+            assert!(
+                error.to_string().contains("dev-channel"),
+                "unexpected gate error: {error}"
+            );
+
+            window.set_dev_capture_enabled(true);
+            // The gate is now open. The test platform has no headless renderer
+            // by default, so this may still fail — but never on the gate.
+            if let Err(error) = window.screenshot() {
+                assert!(
+                    !error.to_string().contains("dev-channel"),
+                    "enabling dev capture must clear the gate: {error}"
+                );
+            }
+        })
+        .unwrap();
     }
 
     #[test]

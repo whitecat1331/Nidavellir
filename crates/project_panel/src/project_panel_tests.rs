@@ -12214,3 +12214,64 @@ async fn test_file_rows_reserve_the_chevron_slot(cx: &mut gpui::TestAppContext) 
         );
     }
 }
+
+/// The dev-only `window_control` surface addresses project entries by their
+/// accessibility nodes, so every rendered row must carry a label.
+#[gpui::test]
+async fn test_project_panel_entries_are_labelled_in_the_a11y_tree(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "dir": { "nested.rs": "" },
+            "file.rs": "",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let focused = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel, window, cx);
+        workspace.focus_panel::<ProjectPanel>(window, cx)
+    });
+    assert!(focused.is_some(), "the project panel should open");
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        window.set_a11y_forced(true);
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+
+    let snapshot = cx
+        .update(|window, _| window.a11y_snapshot())
+        .expect("the forced tree should be available");
+    let rows: Vec<_> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.role == gpui::Role::TreeItem)
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|node| node.label.as_deref() == Some("file.rs")),
+        "the tree should expose file entries: {:?}",
+        rows.iter()
+            .map(|node| node.label.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().all(|node| node.label.is_some()),
+        "every project entry needs a label: {:?}",
+        rows.iter()
+            .map(|node| node.label.clone())
+            .collect::<Vec<_>>()
+    );
+}

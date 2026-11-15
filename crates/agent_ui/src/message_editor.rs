@@ -2102,7 +2102,12 @@ impl Focusable for MessageEditor {
 
 impl Render for MessageEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text: String = self.editor.read(cx).text(cx).chars().take(8192).collect();
         div()
+            .id("agent-panel-message-editor")
+            .role(gpui::Role::MultilineTextInput)
+            .aria_label("Message editor")
+            .aria_value(text)
             .key_context("MessageEditor")
             .on_action(cx.listener(Self::chat))
             .on_action(cx.listener(Self::send_immediately))

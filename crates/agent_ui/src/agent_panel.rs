@@ -1548,7 +1548,18 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The accessibility tree is only built when an assistive technology is
+        // attached. The dev-only `window_control` surface observes that tree, so
+        // force it on for this window (it is never sent to the platform unless a
+        // real adapter is active).
+        if agent::window_control_enabled(cx) {
+            window.set_a11y_forced(true);
+            // Screenshot readback is runtime-gated in `gpui`; this is the only
+            // call site, and it sits behind the dev-channel predicate.
+            window.set_dev_capture_enabled(true);
+        }
+
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -6247,24 +6258,152 @@ pub(crate) fn window_control_dispatch(
             Ok(serde_json::json!({ "opened": true }))
         }
         Operation::Find => Ok(panel.read_with(cx, |panel, cx| {
-            window_control_find(panel, window, request.selector.as_deref(), cx)
+            let mut value = window_control_find(panel, window, request.selector.as_deref(), cx);
+            let tree = window_control_tree(
+                window,
+                request.selector.as_deref(),
+                request.limit.unwrap_or(50).clamp(1, 1000) as usize,
+                None,
+            );
+            if let Some(object) = value.as_object_mut() {
+                object.insert("nodes".into(), tree["nodes"].clone());
+                object.insert("node_count".into(), tree["count"].clone());
+                object.insert("truncated".into(), tree["truncated"].clone());
+            }
+            value
         })),
+        Operation::Snapshot => {
+            let hit_point = match (request.x, request.y) {
+                (Some(x), Some(y)) => Some(gpui::point(gpui::px(x), gpui::px(y))),
+                (None, None) => None,
+                _ => return Err(anyhow!("`snapshot` hit-test requires both `x` and `y`")),
+            };
+            let mut value = window_control_tree(
+                window,
+                request.selector.as_deref(),
+                request.limit.unwrap_or(200).clamp(1, 1000) as usize,
+                hit_point,
+            );
+            if let Some(reference) = request.node.as_deref() {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                let node = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .ok_or_else(|| anyhow!("resolved node {reference:?} is missing"))?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "node".into(),
+                        window_control_node_json(node, 0, node.id == snapshot.focus),
+                    );
+                }
+            }
+            Ok(value)
+        }
+        Operation::Screenshot => {
+            let target = request.target.as_deref().unwrap_or("window");
+            let node_reference = request
+                .node
+                .as_deref()
+                .or_else(|| (target != "window").then_some(target));
+
+            let png = if let Some(reference) = node_reference {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                let node = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .ok_or_else(|| anyhow!("resolved node {reference:?} is missing"))?;
+                let bounds = node.bounds.ok_or_else(|| {
+                    anyhow!("accessibility node {reference:?} has no bounds to capture")
+                })?;
+                window.screenshot_region(bounds)?
+            } else {
+                window.screenshot()?
+            };
+
+            use base64::Engine as _;
+            Ok(serde_json::json!({
+                "target": target,
+                "node": node_reference.map(|reference| reference.to_string()),
+                "encoding": "base64",
+                "media_type": "image/png",
+                "bytes": png.len(),
+                "data": base64::engine::general_purpose::STANDARD.encode(&png),
+            }))
+        }
         Operation::Click => {
-            let selector = request
-                .selector
-                .clone()
-                .ok_or_else(|| anyhow!("`click` requires `selector`"))?;
-            window_control_click(panel, &selector, window, cx)?;
-            Ok(serde_json::json!({ "clicked": selector }))
+            if let Some(reference) = request.node.as_deref() {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                window.perform_a11y_action(node_id, gpui::accesskit::Action::Click, cx);
+                Ok(serde_json::json!({
+                    "clicked": window_control_node_ref(node_id),
+                    "via": "accessibility",
+                }))
+            } else if let (Some(x), Some(y)) = (request.x, request.y) {
+                let position = gpui::point(gpui::px(x), gpui::px(y));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: gpui::Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: gpui::Modifiers::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+                Ok(serde_json::json!({
+                    "clicked": { "x": x, "y": y },
+                    "via": "coordinates",
+                }))
+            } else if let Some(selector) = request.selector.clone() {
+                window_control_click(panel, &selector, window, cx)?;
+                Ok(serde_json::json!({ "clicked": selector, "via": "selector" }))
+            } else {
+                Err(anyhow!(
+                    "`click` requires `selector`, `node`, or both `x` and `y`"
+                ))
+            }
         }
         Operation::Assert => {
-            let selector = request
-                .selector
-                .clone()
-                .ok_or_else(|| anyhow!("`assert` requires `selector`"))?;
-            panel.read_with(cx, |panel, cx| {
-                window_control_assert(panel, &selector, &request, window, cx)
-            })
+            if let Some(reference) = request.node.as_deref() {
+                let snapshot = window.a11y_snapshot().ok_or_else(|| {
+                    anyhow!("no accessibility tree for this frame; cannot resolve {reference:?}")
+                })?;
+                let node_id = window_control_resolve_node_ref(&snapshot, reference)?;
+                let node = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .ok_or_else(|| anyhow!("resolved node {reference:?} is missing"))?;
+                window_control_assert_node(node, reference, &request)
+            } else {
+                let selector = request
+                    .selector
+                    .clone()
+                    .ok_or_else(|| anyhow!("`assert` requires `selector` or `node`"))?;
+                panel.read_with(cx, |panel, cx| {
+                    window_control_assert(panel, &selector, &request, window, cx)
+                })
+            }
         }
         Operation::AddWorktreeRoot | Operation::AddProjectRoot => {
             // Handled by the host, which can await the worktree open
@@ -6376,6 +6515,343 @@ fn window_control_find(
         })
         .collect();
     serde_json::json!({ "selectors": selectors })
+}
+
+/// The stable reference for an accessibility node: `#<accesskit id>`.
+///
+/// AccessKit node ids derive from the element's `ElementId`, so they are stable
+/// across frames for the same element, which is what makes a ref usable across
+/// a `snapshot` → `click` sequence.
+fn window_control_node_ref(id: gpui::accesskit::NodeId) -> String {
+    format!("#{}", id.0)
+}
+
+/// Resolve a node reference against the current tree.
+///
+/// Accepted forms: `#<id>` (the ref `snapshot` prints) or
+/// `role[name="…"]` with an optional `#<n>` ordinal (1-based) when several
+/// nodes match. A ref that no longer resolves is a hard error rather than a
+/// guess — the UI changed, so the caller must take a fresh `snapshot`.
+fn window_control_resolve_node_ref(
+    snapshot: &gpui::A11ySnapshot,
+    reference: &str,
+) -> Result<gpui::accesskit::NodeId> {
+    let reference = reference.trim();
+
+    if let Some(id) = reference.strip_prefix('#') {
+        let id: u64 = id
+            .parse()
+            .map_err(|_| anyhow!("Not a node ref: {reference:?} (expected `#<id>`)"))?;
+        let node_id = gpui::accesskit::NodeId(id);
+        return snapshot
+            .nodes
+            .iter()
+            .any(|node| node.id == node_id)
+            .then_some(node_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "No accessibility node {reference} in the current frame; take a fresh `snapshot`"
+                )
+            });
+    }
+
+    let (base, ordinal) =
+        match reference.rfind(']') {
+            Some(index) => {
+                let tail = reference[index + 1..].trim();
+                match tail.strip_prefix('#') {
+                    Some(ordinal) => (
+                        &reference[..=index],
+                        Some(ordinal.parse::<usize>().map_err(|_| {
+                            anyhow!("Bad ordinal {tail:?} in node ref {reference:?}")
+                        })?),
+                    ),
+                    None => (reference, None),
+                }
+            }
+            None => (reference, None),
+        };
+
+    let (role, name) = base.split_once('[').ok_or_else(|| {
+        anyhow!("Not a node ref: {reference:?} (expected `#<id>` or `role[name=\"…\"]`)")
+    })?;
+    let name = name
+        .strip_suffix(']')
+        .ok_or_else(|| anyhow!("Not a node ref: {reference:?} (unclosed `[`)"))?
+        .trim()
+        .strip_prefix("name=")
+        .ok_or_else(|| anyhow!("Not a node ref: {reference:?} (expected `role[name=\"…\"]`)"))?
+        .trim()
+        .trim_matches('"');
+    let role = role.trim();
+
+    let matches: Vec<gpui::accesskit::NodeId> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| {
+            format!("{:?}", node.role).eq_ignore_ascii_case(role)
+                && node
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.eq_ignore_ascii_case(name))
+        })
+        .map(|node| node.id)
+        .collect();
+
+    match (matches.len(), ordinal) {
+        (0, _) => Err(anyhow!(
+            "No node matches {reference:?} in the current frame; take a fresh `snapshot`"
+        )),
+        (1, None) => Ok(matches[0]),
+        (count, None) => Err(anyhow!(
+            "{reference:?} is ambiguous ({count} nodes match); append `#<n>` (1-based) or use `#<id>`"
+        )),
+        (count, Some(ordinal)) => {
+            let index = ordinal
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("Ordinals are 1-based; {reference:?} uses 0"))?;
+            matches.get(index).copied().ok_or_else(|| {
+                anyhow!("Ordinal {ordinal} is out of range for {reference:?} ({count} match)")
+            })
+        }
+    }
+}
+
+fn window_control_node_json(
+    node: &gpui::A11yNodeSnapshot,
+    depth: usize,
+    focused: bool,
+) -> serde_json::Value {
+    let redact = agent::redact_sensitive;
+    serde_json::json!({
+        "ref": window_control_node_ref(node.id),
+        "role": format!("{:?}", node.role),
+        "label": node.label.as_deref().map(redact),
+        "value": node.value.as_deref().map(redact),
+        "description": node.description.as_deref().map(redact),
+        "bounds": node.bounds.map(|bounds| serde_json::json!({
+            "x": bounds.origin.x.as_f32(),
+            "y": bounds.origin.y.as_f32(),
+            "width": bounds.size.width.as_f32(),
+            "height": bounds.size.height.as_f32(),
+        })),
+        "depth": depth,
+        "children": node.children.len(),
+        "focused": focused,
+        "focusable": node.focusable,
+    })
+}
+
+/// Roles that represent a control a user can act on. Used by the coverage
+/// metric to tell an unlabelled control apart from an unlabelled container.
+fn window_control_role_is_interactive(role: gpui::Role) -> bool {
+    use gpui::Role;
+    matches!(
+        role,
+        Role::Button
+            | Role::DefaultButton
+            | Role::Link
+            | Role::TextInput
+            | Role::MultilineTextInput
+            | Role::CheckBox
+            | Role::RadioButton
+            | Role::Switch
+            | Role::MenuItem
+            | Role::MenuItemCheckBox
+            | Role::MenuItemRadio
+            | Role::Tab
+            | Role::TreeItem
+            | Role::ListItem
+            | Role::ComboBox
+            | Role::Slider
+            | Role::SpinButton
+            | Role::DisclosureTriangle
+            | Role::ScrollBar
+    )
+}
+
+/// Assert on a node's visibility or label/value; `passed` reports the result.
+fn window_control_assert_node(
+    node: &gpui::A11yNodeSnapshot,
+    reference: &str,
+    request: &agent::WindowControlRequest,
+) -> Result<serde_json::Value> {
+    let visible = node.bounds.is_some_and(|bounds| {
+        bounds.size.width.as_f32() > 0.0 && bounds.size.height.as_f32() > 0.0
+    });
+    let mut passed = true;
+    if let Some(expect_visible) = request.expect_visible {
+        passed &= visible == expect_visible;
+    }
+    if let Some(expect_text) = request.expect_text.as_deref() {
+        passed &= node.label.as_deref() == Some(expect_text)
+            || node.value.as_deref() == Some(expect_text);
+    }
+
+    Ok(serde_json::json!({
+        "reference": reference,
+        "node": window_control_node_ref(node.id),
+        "role": format!("{:?}", node.role),
+        "label": node.label.as_deref().map(agent::redact_sensitive),
+        "value": node.value.as_deref().map(agent::redact_sensitive),
+        "visible": visible,
+        "passed": passed,
+    }))
+}
+
+/// Serialize the live accessibility tree for the dev-only `window_control`
+/// surface: bounded, redacted, and text-first (a readable indented tree plus a
+/// structured node list).
+fn window_control_tree(
+    window: &Window,
+    filter: Option<&str>,
+    limit: usize,
+    hit_point: Option<gpui::Point<gpui::Pixels>>,
+) -> serde_json::Value {
+    let Some(snapshot) = window.a11y_snapshot() else {
+        return serde_json::json!({
+            "available": false,
+            "reason": "no accessibility tree for this frame: no assistive technology is attached and the tree is not forced",
+            "count": 0,
+            "truncated": false,
+            "nodes": [],
+            "text": "",
+        });
+    };
+
+    // Coverage is measured over the whole tree, independent of `limit`/filter:
+    // an unlabelled control is one with an interactive role (or a focus handle)
+    // and neither a label nor a value.
+    let unlabelled: Vec<&gpui::A11yNodeSnapshot> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.focusable || window_control_role_is_interactive(node.role))
+        .filter(|node| {
+            node.label
+                .as_deref()
+                .is_none_or(|label| label.trim().is_empty())
+                && node
+                    .value
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+        })
+        .collect();
+    let interactive = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.focusable || window_control_role_is_interactive(node.role))
+        .count();
+    let unlabelled_sample: Vec<String> = unlabelled
+        .iter()
+        .take(10)
+        .map(|node| format!("{} {:?}", window_control_node_ref(node.id), node.role))
+        .collect();
+    let coverage = serde_json::json!({
+        "nodes": snapshot.nodes.len(),
+        "interactive": interactive,
+        "unlabelled": unlabelled.len(),
+        "unlabelled_sample": unlabelled_sample,
+    });
+
+    let by_id: std::collections::HashMap<_, _> =
+        snapshot.nodes.iter().map(|node| (node.id, node)).collect();
+
+    // Pre-order walk from the root so the text tree reads top-down. The tree is
+    // built with children before parents, so the walk (not the raw order) is
+    // what gives a usable outline.
+    let mut ordered: Vec<(usize, &gpui::A11yNodeSnapshot)> = Vec::new();
+    let mut stack = vec![(0usize, snapshot.root)];
+    while let Some((depth, id)) = stack.pop() {
+        let Some(node) = by_id.get(&id) else {
+            continue;
+        };
+        ordered.push((depth, *node));
+        for child in node.children.iter().rev() {
+            stack.push((depth + 1, *child));
+        }
+    }
+
+    let filter = filter.map(|filter| filter.to_lowercase());
+    let matches = |node: &&gpui::A11yNodeSnapshot| {
+        filter.as_ref().is_none_or(|filter| {
+            window_control_node_ref(node.id)
+                .to_lowercase()
+                .contains(filter)
+                || format!("{:?}", node.role).to_lowercase().contains(filter)
+                || node
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.to_lowercase().contains(filter))
+                || node
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| value.to_lowercase().contains(filter))
+        })
+    };
+
+    let matching: Vec<(usize, &gpui::A11yNodeSnapshot)> = ordered
+        .into_iter()
+        .filter(|(_, node)| matches(node))
+        .collect();
+    let count = matching.len();
+    let truncated = count > limit;
+    let shown = &matching[..count.min(limit)];
+
+    let mut text = String::new();
+    for (depth, node) in shown {
+        text.push_str(&"  ".repeat(*depth));
+        text.push_str(&format!("{:?}", node.role));
+        if let Some(label) = node.label.as_deref() {
+            text.push_str(&format!(" {:?}", agent::redact_sensitive(label)));
+        }
+        if let Some(value) = node.value.as_deref() {
+            text.push_str(&format!(" value={:?}", agent::redact_sensitive(value)));
+        }
+        text.push(' ');
+        text.push_str(&window_control_node_ref(node.id));
+        if let Some(bounds) = node.bounds {
+            text.push_str(&format!(
+                " @{:.0},{:.0} {:.0}x{:.0}",
+                bounds.origin.x.as_f32(),
+                bounds.origin.y.as_f32(),
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32()
+            ));
+        }
+        if node.id == snapshot.focus {
+            text.push_str(" [focused]");
+        }
+        text.push('\n');
+    }
+
+    let nodes: Vec<serde_json::Value> = shown
+        .iter()
+        .map(|(depth, node)| window_control_node_json(node, *depth, node.id == snapshot.focus))
+        .collect();
+
+    let hit = hit_point
+        .and_then(|point| window.a11y_hit_test(point))
+        .and_then(|id| by_id.get(&id).copied())
+        .map(|node| {
+            let depth = shown
+                .iter()
+                .find(|(_, shown_node)| shown_node.id == node.id)
+                .map(|(depth, _)| *depth)
+                .unwrap_or(0);
+            window_control_node_json(node, depth, node.id == snapshot.focus)
+        });
+
+    serde_json::json!({
+        "available": true,
+        "count": count,
+        "truncated": truncated,
+        "root": window_control_node_ref(snapshot.root),
+        "focus": window_control_node_ref(snapshot.focus),
+        "nodes": nodes,
+        "text": text,
+        "hit": hit,
+        "coverage": coverage,
+    })
 }
 
 /// Invoke a selector's handler directly: focus it, then dispatch its action.
@@ -6980,6 +7456,7 @@ impl AgentPanel {
                                 .child(editable_title)
                                 .child(
                                     IconButton::new("retry-thread-title", IconName::XCircle)
+                                        .aria_label("Retry thread title")
                                         .icon_color(Color::Error)
                                         .icon_size(IconSize::Small)
                                         .tooltip(move |_window, cx| {
@@ -7089,6 +7566,7 @@ impl AgentPanel {
                             .bg(cx.theme().colors().tab_bar_background)
                             .child(
                                 IconButton::new("edit_tile", IconName::Pencil)
+                                    .aria_label("Edit thread title")
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Edit Thread Title")),
                             ),
@@ -7189,6 +7667,7 @@ impl AgentPanel {
         PopoverMenu::new("agent-options-menu")
             .trigger_with_tooltip(
                 IconButton::new("agent-options-menu", IconName::Ellipsis)
+                    .aria_label("Agent menu")
                     .icon_size(IconSize::Small),
                 move |_window, cx| {
                     Tooltip::for_action_in(
@@ -7665,6 +8144,7 @@ impl AgentPanel {
             (IconName::Maximize, "Enable Full Screen")
         };
         let full_screen_button = IconButton::new("toggle-full-screen", icon_name)
+            .aria_label(tooltip_text)
             .icon_size(IconSize::Small)
             .toggle_state(is_full_screen)
             .tooltip(move |_, cx| Tooltip::for_action(tooltip_text, &ToggleZoom, cx))
@@ -7696,6 +8176,7 @@ impl AgentPanel {
             let new_thread_menu = PopoverMenu::new("new_thread_menu")
                 .trigger_with_tooltip(
                     IconButton::new("new_thread_menu_btn", IconName::Plus)
+                        .aria_label("New thread")
                         .icon_size(IconSize::Small),
                     {
                         move |_window, cx| {
@@ -8522,6 +9003,74 @@ mod tests {
         assert!(!window_control_synthetic_input_active());
     }
 
+    fn a11y_snapshot_with(nodes: Vec<(u64, gpui::Role, Option<&str>)>) -> gpui::A11ySnapshot {
+        let root = gpui::A11yNodeSnapshot {
+            id: gpui::accesskit::NodeId(0),
+            role: gpui::Role::Window,
+            label: None,
+            value: None,
+            description: None,
+            bounds: None,
+            children: Vec::new(),
+            focusable: false,
+        };
+        gpui::A11ySnapshot {
+            root: root.id,
+            focus: root.id,
+            nodes: std::iter::once(root)
+                .chain(
+                    nodes
+                        .into_iter()
+                        .map(|(id, role, label)| gpui::A11yNodeSnapshot {
+                            id: gpui::accesskit::NodeId(id),
+                            role,
+                            label: label.map(str::to_owned),
+                            value: None,
+                            description: None,
+                            bounds: None,
+                            children: Vec::new(),
+                            focusable: false,
+                        }),
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_window_control_resolve_node_ref() {
+        let snapshot = a11y_snapshot_with(vec![
+            (1, gpui::Role::Button, Some("Open")),
+            (2, gpui::Role::Button, Some("Open")),
+            (3, gpui::Role::Button, Some("Close")),
+        ]);
+
+        assert_eq!(
+            window_control_resolve_node_ref(&snapshot, "#2").ok(),
+            Some(gpui::accesskit::NodeId(2))
+        );
+        assert!(
+            window_control_resolve_node_ref(&snapshot, "#99").is_err(),
+            "a stale id must be a hard error"
+        );
+        assert_eq!(
+            window_control_resolve_node_ref(&snapshot, "button[name=\"Close\"]").ok(),
+            Some(gpui::accesskit::NodeId(3))
+        );
+        assert!(
+            window_control_resolve_node_ref(&snapshot, "button[name=\"Open\"]").is_err(),
+            "an ambiguous role/name ref must be a hard error"
+        );
+        assert_eq!(
+            window_control_resolve_node_ref(&snapshot, "button[name=\"Open\"]#2").ok(),
+            Some(gpui::accesskit::NodeId(2))
+        );
+        assert!(
+            window_control_resolve_node_ref(&snapshot, "button[name=\"Open\"]#3").is_err(),
+            "an out-of-range ordinal must be a hard error"
+        );
+        assert!(window_control_resolve_node_ref(&snapshot, "nonsense").is_err());
+    }
+
     #[test]
     fn test_window_control_action_names() {
         for name in [
@@ -8602,6 +9151,11 @@ mod tests {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
         });
+        // The panel has to be the dock's active panel for the workspace to draw
+        // it; otherwise only the centre pane contributes nodes to the tree.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
         cx.run_until_parked();
 
         // Drive the same top-level entry point the host uses, so this test would
@@ -8652,6 +9206,103 @@ mod tests {
             "state should report the text typed through window_control"
         );
 
+        // Phase 1: the accessibility tree is forced on for dev panels, so
+        // `snapshot` returns real nodes and hit-testing resolves a point.
+        cx.update(|window, cx| {
+            window.set_a11y_forced(true);
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+
+        let tree = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Snapshot,
+                        limit: Some(1000),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("snapshot op should succeed");
+        assert_eq!(
+            tree["available"],
+            json!(true),
+            "snapshot should see the forced a11y tree: {tree:?}"
+        );
+        let nodes = tree["nodes"].as_array().expect("nodes array");
+        assert!(
+            !nodes.is_empty(),
+            "the forced a11y tree should contain nodes: {tree:?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["ref"].as_str().is_some_and(|r| r.starts_with('#'))),
+            "nodes carry stable #id refs: {tree:?}"
+        );
+        assert!(
+            nodes.iter().all(|node| node["focusable"].is_boolean()),
+            "nodes report whether they are focusable: {tree:?}"
+        );
+        let coverage = &tree["coverage"];
+        assert!(
+            coverage["interactive"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "coverage counts interactive nodes: {tree:?}"
+        );
+        assert!(
+            coverage["unlabelled"].as_u64().is_some(),
+            "coverage reports an unlabelled-node count: {tree:?}"
+        );
+        assert_eq!(
+            coverage["unlabelled"],
+            json!(0),
+            "audited agent-panel controls should all be labelled: {coverage}\ntree:\n{}",
+            tree["text"].as_str().unwrap_or_default()
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["label"] == json!("Message editor")),
+            "the message editor node should be in the tree:\n{}",
+            tree["text"].as_str().unwrap_or_default()
+        );
+
+        let (x, y) = nodes
+            .iter()
+            .find_map(|node| {
+                let bounds = node.get("bounds")?;
+                Some((
+                    (bounds["x"].as_f64()? + bounds["width"].as_f64()? / 2.0) as f32,
+                    (bounds["y"].as_f64()? + bounds["height"].as_f64()? / 2.0) as f32,
+                ))
+            })
+            .expect("at least one node with bounds");
+        let hit = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Snapshot,
+                        x: Some(x),
+                        y: Some(y),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("hit-test snapshot should succeed");
+        assert!(
+            hit["hit"]["ref"].as_str().is_some(),
+            "a point inside a node's bounds should hit a node: {hit:?}"
+        );
+
         // Phase 2: find / assert / click.
         let found = cx
             .update(|window, cx| {
@@ -8696,6 +9347,82 @@ mod tests {
             asserted["passed"],
             json!(true),
             "assert text should pass: {asserted}"
+        );
+
+        // Phase 4: assert and click through a tree node ref, and click by
+        // coordinate. The message editor is labelled and carries the typed text.
+        let node_asserted = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Assert,
+                        node: Some("multilinetextinput[name=\"Message editor\"]".to_string()),
+                        expect_text: Some("hello window".to_string()),
+                        expect_visible: Some(true),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("node assert should succeed");
+        assert_eq!(
+            node_asserted["passed"],
+            json!(true),
+            "asserting a node's value should pass: {node_asserted}"
+        );
+
+        let node_clicked = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Click,
+                        node: Some("multilinetextinput[name=\"Message editor\"]".to_string()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("node click should succeed");
+        assert_eq!(
+            node_clicked["via"],
+            json!("accessibility"),
+            "a node click runs through the accessibility path: {node_clicked}"
+        );
+
+        let (editor_x, editor_y) = nodes
+            .iter()
+            .find(|node| node["label"] == json!("Message editor"))
+            .and_then(|node| {
+                let bounds = node.get("bounds")?;
+                Some((
+                    (bounds["x"].as_f64()? + bounds["width"].as_f64()? / 2.0) as f32,
+                    (bounds["y"].as_f64()? + bounds["height"].as_f64()? / 2.0) as f32,
+                ))
+            })
+            .expect("the message editor has bounds");
+        let coord_clicked = cx
+            .update(|window, cx| {
+                window_control_dispatch(
+                    &panel,
+                    agent::WindowControlRequest {
+                        operation: agent::WindowControlOperation::Click,
+                        x: Some(editor_x),
+                        y: Some(editor_y),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("coordinate click should succeed");
+        assert_eq!(
+            coord_clicked["via"],
+            json!("coordinates"),
+            "a click with x/y synthesizes a mouse event: {coord_clicked}"
         );
 
         let clicked = cx

@@ -28,10 +28,23 @@ use crate::{
 /// - `state` — a JSON snapshot of the active thread, focused/agent message
 ///   editor text, and the active item.
 /// - `find` — list the registered, addressable UI selectors (optionally
-///   filtered by `selector`), with their ids, labels, visibility, and text.
-/// - `click` — invoke a selector's handler directly by `selector` id (no
-///   synthetic mouse event, no foreground dependency).
-/// - `assert` — check a selector's `expect_text` and/or `expect_visible`.
+///   filtered by `selector`), with their ids, labels, visibility, and text,
+///   plus the matching accessibility-tree nodes (bounded by `limit`).
+/// - `snapshot` — walk the live accessibility tree and return a bounded,
+///   text-first view of the UI: role, label/value, a stable `#id` ref, and
+///   bounds for each node. `selector` filters, `limit` bounds the count,
+///   `x`/`y` resolve the deepest node under that point (`hit`), and `node`
+///   resolves a ref (`#id` or `role[name="…"]`) into `node` — an unresolved
+///   ref is an error, never a guess.
+/// - `screenshot` — capture the window, or one node's bounds, as a PNG
+///   (`target`: `window` by default, or a node ref). Prompts by default:
+///   pixels cannot be redacted.
+/// - `click` — invoke a selector's handler directly by `selector` id, click an
+///   accessibility node by `node` ref (through its action listener or the
+///   built-in click path), or click a point by `x`/`y`. No OS foreground
+///   dependency.
+/// - `assert` — check a selector's `expect_text`/`expect_visible`, or a
+///   `node` ref's label/value/visibility.
 /// - `dispatch_action` — dispatch a registered action by name.
 /// - `focus` — move focus to a named view/handle
 ///   (`agent_panel.message_editor`, `agent_panel`, `editor`, `terminal`).
