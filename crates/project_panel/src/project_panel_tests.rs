@@ -12050,8 +12050,9 @@ async fn test_project_panel_entries_are_labelled_in_the_a11y_tree(cx: &mut TestA
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
     let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    workspace.update_in(cx, ProjectPanel::new);
     let focused = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
         workspace.focus_panel::<ProjectPanel>(window, cx)
     });
     assert!(focused.is_some(), "the project panel should open");
