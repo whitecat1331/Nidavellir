@@ -1496,6 +1496,23 @@ enum StopSource {
     GenerationStop,
 }
 
+/// Backstop cap on the selected terminal output. The capture is already bounded
+/// to `COMMAND_OUTPUT_LIMIT` when no head/tail selection is set; this also
+/// bounds the head/tail path so a single very long line cannot exceed the limit.
+fn truncate_terminal_content(text: &str) -> String {
+    let max_bytes = COMMAND_OUTPUT_LIMIT as usize;
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let total_bytes = text.len();
+    let mut truncated = crate::db::truncate_at_char_boundary(text, max_bytes).to_string();
+    truncated.push_str(&format!(
+        "\n\n[... terminal output truncated to {} bytes of {} total ...]",
+        max_bytes, total_bytes,
+    ));
+    truncated
+}
+
 fn process_content(
     output: acp::TerminalOutputResponse,
     command: &str,
@@ -1505,6 +1522,7 @@ fn process_content(
 ) -> String {
     let content = output.output.trim();
     let content = select_terminal_output_lines(content, selection);
+    let content = truncate_terminal_content(&content);
     let is_empty = content.is_empty();
 
     // On Windows, recognize the kernel-style diagnostics WSL prints when a
@@ -1691,6 +1709,17 @@ fn resolve_cd_in_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncates_oversized_terminal_content() {
+        assert_eq!(truncate_terminal_content("ok"), "ok");
+
+        let long = "x".repeat(COMMAND_OUTPUT_LIMIT as usize + 4096);
+        let truncated = truncate_terminal_content(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.ends_with("total ...]"));
+        assert!(truncated.starts_with(&"x".repeat(COMMAND_OUTPUT_LIMIT as usize)));
+    }
 
     #[test]
     fn test_sampler_stops_when_unanswered() {
