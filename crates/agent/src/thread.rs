@@ -2440,7 +2440,7 @@ impl Thread {
             code_action_store,
         ));
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
-        self.add_tool(GraphTool);
+        self.add_tool(GraphTool::new(cx.weak_entity()));
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
