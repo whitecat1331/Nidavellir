@@ -9262,7 +9262,8 @@ mod tests {
         assert_eq!(
             coverage["unlabelled"],
             json!(0),
-            "audited agent-panel controls should all be labelled: {coverage}"
+            "audited agent-panel controls should all be labelled: {coverage}\ntree:\n{}",
+            tree["text"].as_str().unwrap_or_default()
         );
         assert!(
             nodes
