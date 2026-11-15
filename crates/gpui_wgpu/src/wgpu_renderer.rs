@@ -1540,7 +1540,9 @@ impl WgpuRenderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        self.resources().device.poll(wgpu::Maintain::Wait);
+        self.resources()
+            .device
+            .poll(wgpu::wgt::PollType::wait_indefinitely())?;
         receiver
             .recv()
             .map_err(|_| anyhow::anyhow!("render_to_image map channel closed"))??;
