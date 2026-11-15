@@ -266,7 +266,10 @@ impl AgentTool for DiagnosticsTool {
 
                     let freshness = freshness_message(refreshed);
                     if has_diagnostics {
-                        Ok(format!("{freshness}\n\n{}", truncate_diagnostics_output(&output)))
+                        Ok(format!(
+                            "{freshness}\n\n{}",
+                            truncate_diagnostics_output(&output)
+                        ))
                     } else {
                         Ok(format!(
                             "{freshness}\n\nNo errors or warnings found in the project."
