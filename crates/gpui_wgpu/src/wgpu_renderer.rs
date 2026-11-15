@@ -18,6 +18,11 @@ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
+/// Round `value` up to the next multiple of `alignment`.
+fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
 const STORAGE_BUFFER_SHADERS: &str = concat!(
@@ -1400,6 +1405,173 @@ impl WgpuRenderer {
 
         frame.present();
         true
+    }
+
+    /// Render `scene` to an offscreen texture and read it back as an RGBA image,
+    /// without presenting to the surface.
+    ///
+    /// This is the Linux readback path for the dev-only `window_control`
+    /// screenshot surface; the caller gates it on the dev release channel.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
+        anyhow::ensure!(
+            self.surface_configured,
+            "surface is not configured; cannot render to image"
+        );
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "surface has zero size; cannot render to image"
+        );
+
+        self.atlas.before_frame();
+        self.ensure_intermediate_textures();
+
+        let texture = self
+            .resources()
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("render_to_image"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // The offscreen target uses the surface format so the existing pipelines
+        // validate; the shader therefore swizzles exactly as it does for the live
+        // surface, and the readback below un-swizzles BGR back to RGB.
+        let gamma_params = GammaParams {
+            gamma_ratios: self.rendering_params.gamma_ratios,
+            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
+            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
+            is_bgr: self.is_bgr as u32,
+            _pad: 0,
+        };
+        let globals = GlobalParams {
+            viewport_size: [width as f32, height as f32],
+            premultiplied_alpha: if self.surface_config.alpha_mode
+                == wgpu::CompositeAlphaMode::PreMultiplied
+            {
+                1
+            } else {
+                0
+            },
+            pad: 0,
+        };
+        let path_globals = GlobalParams {
+            premultiplied_alpha: 0,
+            ..globals
+        };
+        {
+            let resources = self.resources();
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                0,
+                bytemuck::bytes_of(&globals),
+            );
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                self.path_globals_offset,
+                bytemuck::bytes_of(&path_globals),
+            );
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                self.gamma_offset,
+                bytemuck::bytes_of(&gamma_params),
+            );
+        }
+
+        self.record_frame(scene, &view)?;
+
+        let bytes_per_row = align_to(width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self
+            .resources()
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render_to_image_buffer"),
+                size: (bytes_per_row as u64) * (height as u64),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("render_to_image_copy"),
+                });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.resources().device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("render_to_image map channel closed"))??;
+
+        let row_bytes = (width as usize) * 4;
+        let mut image = image::RgbaImage::new(width, height);
+        {
+            let mapped = slice.get_mapped_range();
+            for (row, row_slice) in mapped.chunks(bytes_per_row as usize).enumerate() {
+                if row >= height as usize {
+                    break;
+                }
+                for (column, pixel) in row_slice[..row_bytes].chunks_exact(4).enumerate() {
+                    // The surface format is BGRA on many Linux compositors, while
+                    // `RgbaImage` is RGBA; un-swizzle here.
+                    let (red, blue) = if self.is_bgr {
+                        (pixel[2], pixel[0])
+                    } else {
+                        (pixel[0], pixel[2])
+                    };
+                    image.put_pixel(
+                        column as u32,
+                        row as u32,
+                        image::Rgba([red, pixel[1], blue, pixel[3]]),
+                    );
+                }
+            }
+        }
+        drop(slice);
+        buffer.unmap();
+        Ok(image)
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {

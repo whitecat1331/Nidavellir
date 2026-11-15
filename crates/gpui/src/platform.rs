@@ -1007,9 +1007,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
-        anyhow::bail!(
-            "screenshots are not supported on this platform backend (implemented on Windows and macOS)"
-        )
+        anyhow::bail!("screenshots are not supported on this platform backend")
     }
 }
 
