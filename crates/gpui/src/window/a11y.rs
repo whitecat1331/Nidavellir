@@ -216,7 +216,11 @@ impl A11y {
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
         let platform_active = self.is_really_active();
-        self.active_this_frame = platform_active || (self.forced_active && !self.force_disabled);
+        // The forced tree is for in-process observation only, so it stays active
+        // even when accessibility is force-disabled (Zed launches with
+        // `Application::new_inaccessible` unless `ZED_EXPERIMENTAL_A11Y=1`).
+        // `force_disabled` governs the platform adapter, not in-process tooling.
+        self.active_this_frame = platform_active || self.forced_active;
     }
 
     /// Whether a real assistive technology is attached (and a11y is not
@@ -231,7 +235,7 @@ impl A11y {
     /// observe the UI without a screen reader.
     pub(crate) fn set_forced_active(&mut self, forced: bool) {
         self.forced_active = forced;
-        self.active_this_frame = self.is_really_active() || (forced && !self.force_disabled);
+        self.active_this_frame = self.is_really_active() || forced;
     }
 
     pub(crate) fn is_active(&self) -> bool {
