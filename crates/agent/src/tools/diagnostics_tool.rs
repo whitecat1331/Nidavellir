@@ -13,6 +13,24 @@ use util::markdown::MarkdownInlineCode;
 
 type Result<T, E = String> = core::result::Result<T, E>;
 
+/// Caps model-visible diagnostics output (MCP parity) so a project with a very
+/// large number of diagnostics cannot exhaust the turn's context window.
+const MAX_DIAGNOSTICS_OUTPUT_BYTES: usize = 64 * 1024;
+
+fn truncate_diagnostics_output(text: &str) -> String {
+    if text.len() <= MAX_DIAGNOSTICS_OUTPUT_BYTES {
+        return text.to_string();
+    }
+    let total_bytes = text.len();
+    let mut truncated =
+        crate::db::truncate_at_char_boundary(text, MAX_DIAGNOSTICS_OUTPUT_BYTES).to_string();
+    truncated.push_str(&format!(
+        "\n\n[... diagnostics output truncated to {} bytes of {} total ...]",
+        MAX_DIAGNOSTICS_OUTPUT_BYTES, total_bytes,
+    ));
+    truncated
+}
+
 /// Get errors and warnings for the project or a specific file.
 ///
 /// This tool can be invoked after a series of edits to determine if further edits are necessary, or if the user asks to fix errors or warnings in their codebase.
@@ -212,7 +230,10 @@ impl AgentTool for DiagnosticsTool {
                             "{freshness}\n\nFile doesn't have errors or warnings!"
                         ))
                     } else {
-                        Ok(format!("{freshness}\n\n{output}"))
+                        Ok(format!(
+                            "{freshness}\n\n{}",
+                            truncate_diagnostics_output(&output)
+                        ))
                     }
                 }
                 _ => {
@@ -245,7 +266,7 @@ impl AgentTool for DiagnosticsTool {
 
                     let freshness = freshness_message(refreshed);
                     if has_diagnostics {
-                        Ok(format!("{freshness}\n\n{output}"))
+                        Ok(format!("{freshness}\n\n{}", truncate_diagnostics_output(&output)))
                     } else {
                         Ok(format!(
                             "{freshness}\n\nNo errors or warnings found in the project."
@@ -254,5 +275,21 @@ impl AgentTool for DiagnosticsTool {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_oversized_diagnostics_output() {
+        assert_eq!(truncate_diagnostics_output("ok"), "ok");
+
+        let long = "x".repeat(MAX_DIAGNOSTICS_OUTPUT_BYTES + 32);
+        let truncated = truncate_diagnostics_output(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.ends_with("total ...]"));
+        assert!(truncated.starts_with(&"x".repeat(MAX_DIAGNOSTICS_OUTPUT_BYTES)));
     }
 }

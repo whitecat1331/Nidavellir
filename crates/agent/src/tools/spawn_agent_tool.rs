@@ -10,6 +10,25 @@ use std::sync::Arc;
 
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
+/// Caps a sub-agent's final message (MCP parity). The sub-agent's own thread
+/// keeps the full output; the parent thread only needs the summary plus the
+/// session id for follow-up.
+const MAX_SUBAGENT_OUTPUT_BYTES: usize = 64 * 1024;
+
+fn truncate_subagent_output(text: &str) -> String {
+    if text.len() <= MAX_SUBAGENT_OUTPUT_BYTES {
+        return text.to_string();
+    }
+    let total_bytes = text.len();
+    let mut truncated =
+        crate::db::truncate_at_char_boundary(text, MAX_SUBAGENT_OUTPUT_BYTES).to_string();
+    truncated.push_str(&format!(
+        "\n\n[... subagent output truncated to {} bytes of {} total ...]",
+        MAX_SUBAGENT_OUTPUT_BYTES, total_bytes,
+    ));
+    truncated
+}
+
 /// Spawn a sub-agent for a well-scoped task.
 ///
 /// ### Designing delegated subtasks
@@ -228,16 +247,19 @@ impl AgentTool for SpawnAgentTool {
             )]));
 
             let (output, result) = match send_result {
-                Ok(output) => (
-                    output.clone(),
-                    Ok(SpawnAgentToolOutput::Success {
-                        session_id: session_info.session_id.clone(),
-                        session_info,
-                        output,
-                    }),
-                ),
+                Ok(output) => {
+                    let output = truncate_subagent_output(&output);
+                    (
+                        output.clone(),
+                        Ok(SpawnAgentToolOutput::Success {
+                            session_id: session_info.session_id.clone(),
+                            session_info,
+                            output,
+                        }),
+                    )
+                }
                 Err(e) => {
-                    let error = e.to_string();
+                    let error = truncate_subagent_output(&e.to_string());
                     (
                         error.clone(),
                         Err(SpawnAgentToolOutput::Error {
@@ -323,5 +345,16 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.session_id.unwrap().to_string(), "existing-session");
+    }
+
+    #[test]
+    fn truncates_oversized_subagent_output() {
+        assert_eq!(truncate_subagent_output("ok"), "ok");
+
+        let long = "x".repeat(MAX_SUBAGENT_OUTPUT_BYTES + 32);
+        let truncated = truncate_subagent_output(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.ends_with("total ...]"));
+        assert!(truncated.starts_with(&"x".repeat(MAX_SUBAGENT_OUTPUT_BYTES)));
     }
 }
