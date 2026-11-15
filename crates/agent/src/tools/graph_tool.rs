@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext as _, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1131,12 +1131,15 @@ fn advance(
 }
 
 pub struct GraphTool {
-    thread: WeakEntity<Thread>,
+    /// The owning thread's session id, captured when the tool is registered.
+    /// Reading the `Thread` entity inside `run` would panic: the tool is
+    /// dispatched while the thread is already being updated.
+    executor: String,
 }
 
 impl GraphTool {
-    pub fn new(thread: WeakEntity<Thread>) -> Self {
-        Self { thread }
+    pub fn new(executor: String) -> Self {
+        Self { executor }
     }
 }
 
@@ -1183,16 +1186,13 @@ impl AgentTool for GraphTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        let executor = self
-            .thread
-            .read_with(cx, |thread, _cx| thread.id().to_string())
-            .ok();
+        let executor = self.executor.clone();
         cx.background_spawn(async move {
             let input = input.recv().await.map_err(|error| GraphToolOutput::Error {
                 error: format!("Failed to receive graph tool input: {error}"),
             })?;
             let path = PathBuf::from(&input.path);
-            run_operation(input, path, executor.as_deref())
+            run_operation(input, path, Some(executor.as_str()))
         })
     }
 }
