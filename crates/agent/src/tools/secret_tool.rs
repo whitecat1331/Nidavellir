@@ -342,10 +342,9 @@ async fn run_masked_prompt(
     let terminal_id = terminal.id(cx).map_err(|error| SecretToolOutput::Error {
         error: format!("Failed to reference the secret prompt terminal: {error}"),
     })?;
-    event_stream.update_fields(
-        acp::ToolCallUpdateFields::new()
-            .content(vec![acp::ToolCallContent::Terminal(acp::Terminal::new(terminal_id))]),
-    );
+    event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+        acp::ToolCallContent::Terminal(acp::Terminal::new(terminal_id)),
+    ]));
 
     let wait_for_exit = terminal
         .wait_for_exit(cx)

@@ -817,19 +817,17 @@ impl ThreadsDatabase {
             "})?()
         .map_err(|e| e.context("Failed to create review_comments table"))?;
 
-        connection
-            .exec(indoc! {"
+        connection.exec(indoc! {"
                 CREATE INDEX IF NOT EXISTS review_comments_thread_id
                     ON review_comments(thread_id)
             "})?()
-            .map_err(|e| e.context("Failed to create review_comments index"))?;
+        .map_err(|e| e.context("Failed to create review_comments index"))?;
 
         // Phase C: `secret-tool` audit log. Kept in its own side table (like
         // review_comments) so the panel can list recent uses by name without
         // ever touching the thread blob. Names and operation only — secret
         // values never reach SQLite.
-        connection
-            .exec(indoc! {"
+        connection.exec(indoc! {"
                 CREATE TABLE IF NOT EXISTS secret_audit_log (
                     id TEXT PRIMARY KEY,
                     secret_name TEXT NOT NULL,
@@ -838,14 +836,13 @@ impl ThreadsDatabase {
                     at TEXT NOT NULL
                 )
             "})?()
-            .map_err(|e| e.context("Failed to create secret_audit_log table"))?;
+        .map_err(|e| e.context("Failed to create secret_audit_log table"))?;
 
-        connection
-            .exec(indoc! {"
+        connection.exec(indoc! {"
                 CREATE INDEX IF NOT EXISTS secret_audit_log_name
                     ON secret_audit_log(secret_name)
             "})?()
-            .map_err(|e| e.context("Failed to create secret_audit_log index"))?;
+        .map_err(|e| e.context("Failed to create secret_audit_log index"))?;
 
         let db = Self {
             executor,

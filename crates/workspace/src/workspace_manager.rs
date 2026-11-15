@@ -723,10 +723,7 @@ mod tests {
             Path::new("/stale"),
         ]);
 
-        assert_eq!(
-            index.workspace_id_for_paths_relaxed(&paths),
-            Some(main_id)
-        );
+        assert_eq!(index.workspace_id_for_paths_relaxed(&paths), Some(main_id));
     }
 
     #[test]
@@ -740,4 +737,3 @@ mod tests {
         assert_eq!(index.workspace_id_for_paths_relaxed(&paths), None);
     }
 }
-
