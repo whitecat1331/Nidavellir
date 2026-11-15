@@ -5905,19 +5905,22 @@ impl ThreadView {
         });
 
         let trigger = if standalone {
-            ButtonLike::new("effort-selector-trigger").child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::ThinkingMode)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                    )
-                    .child(Label::new(label).size(LabelSize::Small).color(label_color))
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
-            )
+            ButtonLike::new("effort-selector-trigger")
+                .aria_label("Thinking effort")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::ThinkingMode)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        )
+                        .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+                )
         } else {
             ButtonLike::new_rounded_right("effort-selector-trigger")
+                .aria_label("Thinking effort")
                 .child(Label::new(label).size(LabelSize::Small).color(label_color))
                 .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
         };
