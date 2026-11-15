@@ -142,6 +142,13 @@ const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 /// (the incident thread's last successful send was ≈10.4 MB).
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
+/// Stored tool results larger than this are candidates for the no-model
+/// salvage: they predate the per-tool caps (Phase 1) or arrived through a path
+/// that never bounded them, and a single one is enough to make the whole
+/// thread un-sendable. Mirrors `MAX_MCP_TOOL_RESULT_BYTES` (the on-the-way-in
+/// cap this recovery trims back down to).
+const SALVAGE_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
@@ -2982,6 +2989,60 @@ impl Thread {
 
         log::debug!("Total messages in thread: {}", self.messages.len());
         self.run_turn(cx)
+    }
+
+    /// Trims oversized stored tool results in place so the thread becomes
+    /// sendable again without a model call — the recovery of last resort for
+    /// history that already carries an oversized result (the 2026-10-16
+    /// incident). Each result whose stored text exceeds
+    /// [`SALVAGE_TOOL_RESULT_BYTES`] is replaced with a bounded head slice plus
+    /// a note, and its raw `output` (which double-stores the same text) is
+    /// dropped. Everything else — the tool calls, other messages, and the
+    /// summary — survives.
+    ///
+    /// Returns the number of tool results trimmed.
+    pub fn salvage_oversized_tool_results(&mut self, cx: &mut Context<Self>) -> usize {
+        let mut trimmed = 0usize;
+        for message in &mut self.messages {
+            let Message::Agent(agent) = Arc::make_mut(message) else {
+                continue;
+            };
+            for tool_result in agent.tool_results.values_mut() {
+                if salvage_tool_result(tool_result) {
+                    trimmed += 1;
+                }
+            }
+        }
+        if trimmed > 0 {
+            cx.notify();
+        }
+        trimmed
+    }
+
+    /// Trims oversized stored tool results in place and emits a short
+    /// acknowledgment through the returned event stream. This is the
+    /// no-model `/salvage` recovery: it needs no model call and never fails
+    /// on an un-sendable thread.
+    pub fn salvage(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> mpsc::UnboundedReceiver<Result<ThreadEvent>> {
+        let trimmed = self.salvage_oversized_tool_results(cx);
+
+        let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let event_stream = ThreadEventStream::new(events_tx);
+        if trimmed > 0 {
+            event_stream.send_text(&format!(
+                "Trimmed {trimmed} oversized tool result(s) so this thread can be sent again. The rest of the thread is unchanged."
+            ));
+        } else {
+            event_stream.send_text(
+                "No oversized tool results were found; this thread is already below the salvage threshold.",
+            );
+        }
+        event_stream.send_stop(acp::StopReason::EndTurn);
+
+        events_rx
     }
 
     /// Force a manual context compaction using the summary strategy,
@@ -5886,6 +5947,49 @@ fn append_text_to_message(message: &mut LanguageModelRequestMessage, text: Strin
     // A message made only of non-text parts (images, tool calls, compaction) is
     // never the oversized text case, but keep the note visible if reached.
     message.content.push(MessageContent::Text(text));
+}
+
+/// Trims a single stored tool result to [`SALVAGE_TOOL_RESULT_BYTES`], replacing
+/// its text with a bounded head slice plus a note, and dropping its raw
+/// `output` (the debug state that double-stores the same text). Returns `true`
+/// when anything changed.
+fn salvage_tool_result(tool_result: &mut LanguageModelToolResult) -> bool {
+    let total_text_bytes: usize = tool_result
+        .content
+        .iter()
+        .map(|part| match part {
+            LanguageModelToolResultContent::Text(text) => text.len(),
+            LanguageModelToolResultContent::Image(_) => 0,
+        })
+        .sum();
+
+    let trim_text = total_text_bytes > SALVAGE_TOOL_RESULT_BYTES;
+    if !trim_text && tool_result.output.is_none() {
+        return false;
+    }
+
+    if trim_text {
+        let concatenated = tool_result.text_contents();
+        let mut text =
+            crate::db::truncate_at_char_boundary(&concatenated, SALVAGE_TOOL_RESULT_BYTES)
+                .to_string();
+        write!(
+            text,
+            "\n\n[... oversized tool result trimmed to {} bytes of {} total ...]",
+            SALVAGE_TOOL_RESULT_BYTES, total_text_bytes,
+        )
+        .ok();
+
+        tool_result
+            .content
+            .retain(|part| matches!(part, LanguageModelToolResultContent::Image(_)));
+        tool_result
+            .content
+            .push(LanguageModelToolResultContent::Text(text.into()));
+    }
+
+    tool_result.output = None;
+    true
 }
 
 /// Trims `messages` — a request whose first message is the system prompt and
@@ -9995,6 +10099,88 @@ mod tests {
             request_message_byte_len(&truncated)
         );
         assert!(truncated.string_contents().contains("content truncated"));
+    }
+
+    /// The no-model salvage trims an oversized stored tool result in place,
+    /// drops its double-stored `output`, and leaves the call and other content
+    /// intact.
+    #[gpui::test]
+    async fn test_salvage_trims_oversized_tool_result(cx: &mut TestAppContext) {
+        let (thread, _event_stream, _fake) = setup_thread_for_test(cx).await;
+
+        let tool_use_id: LanguageModelToolUseId = "call_salvage".into();
+        let oversized = "x".repeat(SALVAGE_TOOL_RESULT_BYTES + 1024);
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "run grep"));
+                thread.messages.push(Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::ToolUse(LanguageModelToolUse {
+                        id: tool_use_id.clone(),
+                        name: "grep".into(),
+                        raw_input: "{}".into(),
+                        input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    })],
+                    tool_results: [(
+                        tool_use_id.clone(),
+                        LanguageModelToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: "grep".into(),
+                            is_error: false,
+                            content: vec![LanguageModelToolResultContent::Text(
+                                oversized.clone().into(),
+                            )],
+                            output: Some(json!({ "rendered": oversized.clone() })),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    reasoning_details: None,
+                })));
+
+                assert_eq!(thread.salvage_oversized_tool_results(cx), 1);
+
+                let Message::Agent(agent) = &*thread.messages[1] else {
+                    panic!("expected an agent message");
+                };
+                let result = agent.tool_results.get(&tool_use_id).unwrap();
+                assert!(
+                    result.output.is_none(),
+                    "the double-stored output must be dropped"
+                );
+                assert!(
+                    result
+                        .text_contents()
+                        .contains("oversized tool result trimmed"),
+                    "the result must carry the truncation note"
+                );
+                assert!(
+                    result.text_contents().len() <= SALVAGE_TOOL_RESULT_BYTES + 512,
+                    "the trimmed result is still oversized: {} bytes",
+                    result.text_contents().len()
+                );
+            });
+        });
+    }
+
+    /// A stored tool result under the salvage threshold (and with no raw
+    /// output) is left untouched.
+    #[test]
+    fn salvage_tool_result_keeps_small_results() {
+        let mut result = LanguageModelToolResult {
+            tool_use_id: "call_small".into(),
+            tool_name: "grep".into(),
+            is_error: false,
+            content: vec![LanguageModelToolResultContent::Text("small result".into())],
+            output: None,
+        };
+
+        assert!(!salvage_tool_result(&mut result));
+        assert_eq!(result.text_contents(), "small result");
     }
 
     /// When the window can't even hold the system and compaction prompts, a
