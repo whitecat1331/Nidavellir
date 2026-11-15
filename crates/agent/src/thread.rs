@@ -133,6 +133,15 @@ pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
+/// Conservative ceiling on a compaction request's serialized size, applied at
+/// request-build time so compaction stays sendable even when history already
+/// holds an oversized stored result. The token estimate (≈4 bytes/token) bounds
+/// most requests, but a transport can reject a body before the model counts
+/// tokens (DeepSeek's edge answers `413 Payload Too Large`). This backstop is
+/// independent of token math and sits below every transport limit observed
+/// (the incident thread's last successful send was ≈10.4 MB).
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
@@ -5370,6 +5379,9 @@ impl Thread {
             return None;
         }
 
+        request.messages =
+            bound_request_messages_to_byte_budget(request.messages, MAX_REQUEST_BYTES);
+
         Some(request)
     }
 
@@ -5807,6 +5819,75 @@ fn truncate_request_message_to_byte_budget(
     }
 }
 
+/// Truncates a request message so its content fits within `byte_budget`, then
+/// appends a truncation note describing the head slice. The note is placed
+/// inside the last text-bearing content part — a tool result's text, not a
+/// free-floating part — so a `tool` role message never mixes plain text with
+/// its result. Returns `None` when nothing can be kept.
+fn truncate_request_message_with_note(
+    message: LanguageModelRequestMessage,
+    byte_budget: usize,
+) -> Option<LanguageModelRequestMessage> {
+    let total_bytes = request_message_byte_len(&message);
+    let note = format!(
+        "\n\n[... content truncated to {} bytes of {} total ...]",
+        byte_budget, total_bytes,
+    );
+    let content_budget = byte_budget.saturating_sub(note.len());
+    let mut truncated = truncate_request_message_to_byte_budget(message, content_budget)?;
+    append_text_to_message(&mut truncated, note);
+    Some(truncated)
+}
+
+/// Appends `text` to the last text-bearing content part of a request message.
+/// This keeps a truncation note inside a tool result rather than adding a
+/// separate text part to a `tool` role message, which some providers reject.
+fn append_text_to_message(message: &mut LanguageModelRequestMessage, text: String) {
+    for content in message.content.iter_mut().rev() {
+        match content {
+            MessageContent::Text(existing) => {
+                existing.push_str(&text);
+                return;
+            }
+            MessageContent::Thinking { text: existing, .. } => {
+                existing.push_str(&text);
+                return;
+            }
+            MessageContent::RedactedThinking(existing) => {
+                existing.push_str(&text);
+                return;
+            }
+            MessageContent::ToolResult(tool_result) => {
+                if let Some(part) = tool_result
+                    .content
+                    .iter_mut()
+                    .rev()
+                    .find_map(|part| match part {
+                        LanguageModelToolResultContent::Text(text) => Some(text),
+                        _ => None,
+                    })
+                {
+                    let mut merged = part.to_string();
+                    merged.push_str(&text);
+                    *part = Arc::from(merged);
+                } else {
+                    tool_result
+                        .content
+                        .push(LanguageModelToolResultContent::Text(text.into()));
+                }
+                return;
+            }
+            MessageContent::Image(_)
+            | MessageContent::ToolUse(_)
+            | MessageContent::Compaction(_) => {}
+        }
+    }
+
+    // A message made only of non-text parts (images, tool calls, compaction) is
+    // never the oversized text case, but keep the note visible if reached.
+    message.content.push(MessageContent::Text(text));
+}
+
 /// Trims `messages` — a request whose first message is the system prompt and
 /// whose last message is the compaction prompt — so that the estimated token
 /// count fits within `capacity_tokens`, keeping the most recent history.
@@ -5924,6 +6005,57 @@ fn repair_tool_call_pairing(messages: &mut Vec<LanguageModelRequestMessage>) {
     }
 
     messages.retain(|message| !message.content.is_empty());
+}
+
+/// Byte-budgets a request whose first message is the system prompt and whose
+/// last message is the compaction/merge prompt, so the serialized body stays
+/// under `max_bytes` no matter what oversized content history already holds.
+/// Mirrors [`bound_request_messages_to_token_budget`]: walk newest-first, keep
+/// each message that fits, and head-slice the first (newest) message that does
+/// not, appending a truncation note. Older history is dropped, and tool-call
+/// pairing is repaired last.
+fn bound_request_messages_to_byte_budget(
+    messages: Vec<LanguageModelRequestMessage>,
+    max_bytes: usize,
+) -> Vec<LanguageModelRequestMessage> {
+    if messages.len() <= 2 {
+        return messages;
+    }
+
+    let mut messages = messages;
+    let system = messages.remove(0);
+    let prompt = messages.pop().unwrap();
+    let history = messages;
+
+    let fixed_bytes =
+        request_message_byte_len(&system).saturating_add(request_message_byte_len(&prompt));
+    let mut budget = max_bytes.saturating_sub(fixed_bytes);
+
+    let mut kept_rev = Vec::new();
+    for message in history.into_iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        let message_bytes = request_message_byte_len(&message);
+        if message_bytes <= budget {
+            budget -= message_bytes;
+            kept_rev.push(message);
+        } else if let Some(truncated) = truncate_request_message_with_note(message, budget) {
+            budget = 0;
+            kept_rev.push(truncated);
+        } else {
+            break;
+        }
+    }
+
+    kept_rev.reverse();
+
+    let mut trimmed = Vec::with_capacity(kept_rev.len() + 2);
+    trimmed.push(system);
+    trimmed.extend(kept_rev);
+    trimmed.push(prompt);
+    repair_tool_call_pairing(&mut trimmed);
+    trimmed
 }
 
 /// Splits a thread's history into window-fitting slices for map-reduce
@@ -6152,6 +6284,7 @@ fn build_chunk_condense_request(
         bound_request_messages_to_token_budget(request.messages, map_reduce_chunk_capacity(model))
             .0;
     repair_tool_call_pairing(&mut request.messages);
+    request.messages = bound_request_messages_to_byte_budget(request.messages, MAX_REQUEST_BYTES);
     request
 }
 
@@ -6193,6 +6326,7 @@ fn build_merge_request(
     request.messages =
         bound_request_messages_to_token_budget(request.messages, map_reduce_chunk_capacity(model))
             .0;
+    request.messages = bound_request_messages_to_byte_budget(request.messages, MAX_REQUEST_BYTES);
     request
 }
 
@@ -9710,6 +9844,157 @@ mod tests {
             cache: false,
             reasoning_details: None,
         }
+    }
+
+    /// A compaction request must never exceed the transport byte ceiling, even
+    /// when the model's token window is large enough that the token budget
+    /// keeps an oversized history item. The byte budget head-slices that item
+    /// with a truncation note and keeps the most recent turn intact.
+    #[gpui::test]
+    async fn test_compaction_request_is_bounded_to_request_bytes(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            // A token window far larger than MAX_REQUEST_BYTES so the token
+            // budget keeps the oversized history and only the byte budget
+            // clamps it.
+            model.max_token_count = 4_000_000;
+            model.max_input_tokens = 4_000_000;
+            model.max_output_tokens = None;
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "old task"));
+                let oversized = "x".repeat(MAX_REQUEST_BYTES + 64 * 1024);
+                thread.messages.push(agent_text_message(&oversized));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "recent task"));
+                thread.messages.push(agent_text_message("recent answer"));
+
+                let request = thread
+                    .build_compaction_request(thread.messages.len(), &model, cx)
+                    .expect("a byte-bounded request should be buildable");
+                let total_bytes: usize =
+                    request.messages.iter().map(request_message_byte_len).sum();
+                assert!(
+                    total_bytes <= MAX_REQUEST_BYTES,
+                    "compaction request is {total_bytes} bytes, over {MAX_REQUEST_BYTES}"
+                );
+
+                let texts = request_texts_after_system(&request.messages);
+                assert!(
+                    texts.iter().any(|text| text.contains("recent task")),
+                    "the most recent user turn must be retained"
+                );
+                assert!(
+                    texts.iter().any(|text| text.contains("content truncated")),
+                    "the oversized item must carry a truncation note"
+                );
+            });
+        });
+    }
+
+    /// When the byte budget exhausts between a tool call and its oversized
+    /// result, the orphaned result is dropped rather than sent, matching the
+    /// token budget's pairing rule. The recent turn survives.
+    #[test]
+    fn byte_budget_drops_orphaned_tool_result() {
+        let system = request_text_message(Role::System, "system");
+        let prompt = request_text_message(Role::User, "summarize");
+        let tool_call = request_tool_call_message("call_1", "grep");
+        let oversized = "x".repeat(8 * 1024);
+        let tool_result = request_tool_result_message("call_1", "grep", &oversized);
+        let recent_task = request_text_message(Role::User, "recent task");
+        let recent_answer = request_text_message(Role::Assistant, "recent answer");
+
+        let bounded = bound_request_messages_to_byte_budget(
+            vec![
+                system,
+                tool_call,
+                tool_result,
+                recent_task,
+                recent_answer,
+                prompt,
+            ],
+            4 * 1024,
+        );
+
+        let total_bytes: usize = bounded.iter().map(request_message_byte_len).sum();
+        assert!(
+            total_bytes <= 4 * 1024,
+            "byte-bounded request is {total_bytes} bytes, over the 4 KiB budget"
+        );
+        assert!(
+            bounded
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(content, MessageContent::ToolResult(_))),
+            "no tool result may survive without its preceding tool call"
+        );
+        assert!(
+            bounded
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(content, MessageContent::ToolUse(_))),
+            "no tool call may survive without its result"
+        );
+        let texts: Vec<String> = bounded
+            .iter()
+            .map(LanguageModelRequestMessage::string_contents)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["system", "recent task", "recent answer", "summarize"]
+        );
+    }
+
+    /// The truncation note must land inside a tool result's text, not as a
+    /// separate plain-text part, so a `tool` role message never mixes text with
+    /// its result.
+    #[test]
+    fn truncate_request_message_with_note_puts_note_inside_tool_result() {
+        let message = request_tool_result_message("call_1", "grep", &"x".repeat(8 * 1024));
+
+        let truncated = truncate_request_message_with_note(message, 4 * 1024)
+            .expect("a head slice should be kept");
+
+        assert_eq!(truncated.content.len(), 1);
+        assert!(matches!(
+            &truncated.content[0],
+            MessageContent::ToolResult(_)
+        ));
+        let MessageContent::ToolResult(result) = &truncated.content[0] else {
+            panic!("expected a tool result, got {:?}", truncated.content[0]);
+        };
+        assert!(result.text_contents().contains("content truncated"));
+        assert!(
+            truncated
+                .content
+                .iter()
+                .all(|content| !matches!(content, MessageContent::Text(_))),
+            "the note must not be a free-floating text part"
+        );
+    }
+
+    /// A plain-text message is head-sliced to the byte budget with a note, and
+    /// its serialized size stays within the budget.
+    #[test]
+    fn truncate_request_message_with_note_bounds_text() {
+        let message = request_text_message(Role::Assistant, &"x".repeat(8 * 1024));
+
+        let truncated = truncate_request_message_with_note(message, 4 * 1024)
+            .expect("a head slice should be kept");
+
+        assert!(
+            request_message_byte_len(&truncated) <= 4 * 1024,
+            "truncated text is {} bytes, over the 4 KiB budget",
+            request_message_byte_len(&truncated)
+        );
+        assert!(truncated.string_contents().contains("content truncated"));
     }
 
     /// When the window can't even hold the system and compaction prompts, a
