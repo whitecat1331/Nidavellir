@@ -395,6 +395,25 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_operation_round_trips() {
+        let value = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::Screenshot,
+            target: Some("button[name=\"Send\"]".into()),
+            node: Some("#42".into()),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(value["operation"], "screenshot");
+        assert_eq!(value["target"], "button[name=\"Send\"]");
+        assert_eq!(value["node"], "#42");
+
+        let round_trip: WindowControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.operation, WindowControlOperation::Screenshot);
+        assert_eq!(round_trip.target.as_deref(), Some("button[name=\"Send\"]"));
+        assert_eq!(round_trip.node.as_deref(), Some("#42"));
+    }
+
+    #[test]
     fn click_and_assert_operations_serialize() {
         let value = serde_json::to_value(WindowControlRequest {
             operation: WindowControlOperation::Assert,
