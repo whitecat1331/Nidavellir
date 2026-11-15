@@ -9259,6 +9259,11 @@ mod tests {
             coverage["unlabelled"].as_u64().is_some(),
             "coverage reports an unlabelled-node count: {tree:?}"
         );
+        assert_eq!(
+            coverage["unlabelled"],
+            json!(0),
+            "audited agent-panel controls should all be labelled: {coverage}"
+        );
         assert!(
             nodes
                 .iter()
