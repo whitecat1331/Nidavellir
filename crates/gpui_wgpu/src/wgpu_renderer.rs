@@ -1571,7 +1571,6 @@ impl WgpuRenderer {
                 }
             }
         }
-        drop(slice);
         buffer.unmap();
         Ok(image)
     }
