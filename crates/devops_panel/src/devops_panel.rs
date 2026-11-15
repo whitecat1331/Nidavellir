@@ -165,8 +165,8 @@ impl DevOpsPanel {
                 log::error!("failed to load vm store, using empty: {error}");
                 VmStore::default()
             });
-            let container_store =
-                ContainerStore::load(ContainerStore::default_path()).unwrap_or_else(|error| {
+            let container_store = ContainerStore::load(ContainerStore::default_path())
+                .unwrap_or_else(|error| {
                     log::error!("failed to load container store, using empty: {error}");
                     ContainerStore::default()
                 });
@@ -235,17 +235,17 @@ impl DevOpsPanel {
             let mut next_container = Instant::now();
             let mut initialized = false;
             loop {
-                let (ping_interval, proxmox_interval, container_interval) = match this
-                    .read_with(cx, |panel, _cx| {
+                let (ping_interval, proxmox_interval, container_interval) =
+                    match this.read_with(cx, |panel, _cx| {
                         (
                             panel.ping_interval(),
                             panel.proxmox_interval(),
                             panel.container_interval(),
                         )
                     }) {
-                    Ok(intervals) => intervals,
-                    Err(_) => break,
-                };
+                        Ok(intervals) => intervals,
+                        Err(_) => break,
+                    };
                 let now = Instant::now();
                 if !initialized {
                     let (pings, nodes, vms, containers) = futures::join!(
@@ -509,7 +509,8 @@ impl DevOpsPanel {
                     node.node.clone()
                 };
                 let expanded = !self.collapsed.contains(&node.node);
-                let selected = matches!(&self.selected, Some(Selection::Node(name)) if name == &node.node);
+                let selected =
+                    matches!(&self.selected, Some(Selection::Node(name)) if name == &node.node);
                 tree_group_row(
                     &node.node,
                     &title,
@@ -547,7 +548,8 @@ impl DevOpsPanel {
             }
             Some(Row::HostHeader(host)) => {
                 let expanded = !self.collapsed.contains(host);
-                let selected = matches!(&self.selected, Some(Selection::Host(name)) if name == host);
+                let selected =
+                    matches!(&self.selected, Some(Selection::Host(name)) if name == host);
                 tree_group_row(
                     host,
                     &format!("host · {host}"),
@@ -588,7 +590,10 @@ impl DevOpsPanel {
                     .color(Color::Muted),
             ),
             Some(Selection::Node(node_name)) => {
-                let node = self.node_reports.iter().find(|node| &node.node == node_name);
+                let node = self
+                    .node_reports
+                    .iter()
+                    .find(|node| &node.node == node_name);
                 match node {
                     Some(node) => node_details(node, self.ping_for_node(node_name)),
                     None => empty_details(&format!("Node {node_name}")),
@@ -827,7 +832,11 @@ impl DevOpsPanel {
             .items_center()
             .pl_4()
             .pr_1()
-            .child(Label::new(info.name.clone()).size(LabelSize::Small).truncate())
+            .child(
+                Label::new(info.name.clone())
+                    .size(LabelSize::Small)
+                    .truncate(),
+            )
             .child(
                 Label::new(format!("vmid {vmid}"))
                     .size(LabelSize::Small)
@@ -996,15 +1005,13 @@ impl DevOpsPanel {
     }
 
     fn vm_node_field(&self, selected: &str, cx: &mut Context<Self>) -> Div {
-        let mut field = h_flex()
-            .gap_1()
-            .items_center()
-            .child(
-                div()
-                    .w(px(72.))
-                    .flex_shrink_0()
-                    .child(Label::new("node").size(LabelSize::Small).color(Color::Muted)),
-            );
+        let mut field = h_flex().gap_1().items_center().child(
+            div().w(px(72.)).flex_shrink_0().child(
+                Label::new("node")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        );
         for node in self.vm_store.targets.keys() {
             let label = if node.as_str() == selected {
                 format!("● {node}")
@@ -1037,10 +1044,11 @@ impl DevOpsPanel {
             .gap_1()
             .items_center()
             .child(
-                div()
-                    .w(px(72.))
-                    .flex_shrink_0()
-                    .child(Label::new("driver").size(LabelSize::Small).color(Color::Muted)),
+                div().w(px(72.)).flex_shrink_0().child(
+                    Label::new("driver")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
             )
             .child(self.driver_button(current, ContainerDriver::Compose, "compose", cx))
             .child(self.driver_button(current, ContainerDriver::Systemd, "systemd", cx))
@@ -1204,12 +1212,7 @@ impl DevOpsPanel {
         cx.notify();
     }
 
-    fn start_container_edit(
-        &mut self,
-        id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_container_edit(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.container_store.targets.get(&id);
         let (host, driver, dir, file, service, ips, os, roles, probe_port) = match target {
             Some(target) => (
@@ -1340,7 +1343,8 @@ impl DevOpsPanel {
                     return self.fail_settings(&format!("node {node} not found"), cx);
                 };
                 if is_new && target.vms.contains_key(&vmid) {
-                    return self.fail_settings(&format!("vmid {vmid} already exists on {node}"), cx);
+                    return self
+                        .fail_settings(&format!("vmid {vmid} already exists on {node}"), cx);
                 }
                 target.vms.insert(
                     vmid,
@@ -1522,7 +1526,11 @@ fn static_field(label: &'static str, value: &str) -> Div {
                 .flex_shrink_0()
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
         )
-        .child(Label::new(value.to_string()).size(LabelSize::Small).truncate())
+        .child(
+            Label::new(value.to_string())
+                .size(LabelSize::Small)
+                .truncate(),
+        )
 }
 
 /// Splits a comma-separated list into a deduplicated, trimmed list of values.
@@ -1648,7 +1656,11 @@ fn tree_group_row(
             this.toggle_collapse(id.clone(), cx);
             this.select(selection.clone(), cx);
         }))
-        .child(Label::new(chevron).size(LabelSize::Small).color(Color::Muted))
+        .child(
+            Label::new(chevron)
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
         .child(title_label)
         .child(div().flex_1())
         .when_some(ping, |this, ping| this.child(ping_label(&ping)))
@@ -1728,7 +1740,6 @@ fn node_resource_summary(node: &VmNodeStatus) -> String {
     }
 }
 
-
 /// Maps a VM's live Proxmox state to a display label + colour. A `stopped` VM
 /// is rendered as `off` so a powered-off guest reads unambiguously.
 fn vm_state(status: &VmStatus) -> (String, Color) {
@@ -1766,7 +1777,11 @@ fn detail_row(label: &str, value: &str) -> Div {
                 .flex_shrink_0()
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
         )
-        .child(Label::new(value.to_string()).size(LabelSize::Small).truncate())
+        .child(
+            Label::new(value.to_string())
+                .size(LabelSize::Small)
+                .truncate(),
+        )
 }
 
 fn vm_buttons(cx: &mut Context<DevOpsPanel>, target: &str, vmid: u32) -> Div {
@@ -1814,7 +1829,6 @@ fn vm_button(
         }))
 }
 
-
 fn node_details(node: &VmNodeStatus, ping: Reachability) -> Div {
     let name = if node.danger {
         format!("{} ⚠", node.node)
@@ -1838,11 +1852,7 @@ fn node_details(node: &VmNodeStatus, ping: Reachability) -> Div {
         .child(detail_row("ping", &ping_text(&ping)))
 }
 
-fn vm_details(
-    status: &VmStatus,
-    ping: Reachability,
-    cx: &mut Context<DevOpsPanel>,
-) -> Div {
+fn vm_details(status: &VmStatus, ping: Reachability, cx: &mut Context<DevOpsPanel>) -> Div {
     let vmid = status.vmid.parse::<u32>().unwrap_or(0);
     let name = if status.danger {
         format!("{} ⚠", status.name)
@@ -1926,7 +1936,6 @@ fn container_details(
         .child(detail_row("ping", &ping_text(&ping)))
         .child(div().pt_1().child(container_buttons(cx, &status.target)))
 }
-
 
 fn container_buttons(cx: &mut Context<DevOpsPanel>, target: &str) -> Div {
     h_flex()

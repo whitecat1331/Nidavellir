@@ -245,9 +245,7 @@ async fn best_reachability(cx: &AsyncApp, ips: &[String], port: u16) -> Reachabi
         let probe = probe_tcp(cx.background_executor(), ip, port).await;
         best = Some(match best {
             Some(Reachability::Reachable(existing)) => match probe {
-                Reachability::Reachable(latency) => {
-                    Reachability::Reachable(existing.min(latency))
-                }
+                Reachability::Reachable(latency) => Reachability::Reachable(existing.min(latency)),
                 _ => Reachability::Reachable(existing),
             },
             _ => probe,
