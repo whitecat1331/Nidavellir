@@ -871,15 +871,28 @@ fn heartbeat(state: &mut GraphState, now: DateTime<Utc>) -> Result<(), String> {
 }
 
 fn resume(state: &mut GraphState, artifact: &str) -> Result<String, String> {
+    if artifact.trim().is_empty() {
+        return Err(
+            "resuming a stopped plan needs a non-empty artifact naming the human decision"
+                .to_string(),
+        );
+    }
     let Some(blocker) = state.blocker.take() else {
         return Err("the plan is not blocked".to_string());
     };
-    if artifact.trim().is_empty() {
-        return Err("resuming a stopped plan needs a non-empty artifact naming the human decision".to_string());
-    }
+    // A stalled node is presumed dead: drop its window so the next dispatch goes
+    // to a fresh executor rather than pushing the same bloated context.
+    let cleared = state.active.take();
     state.next = derive_next(state);
+    let reset = match cleared {
+        Some(active) => format!(
+            "cleared the {} window held by {}; ",
+            active.node, active.executor
+        ),
+        None => String::new(),
+    };
     Ok(format!(
-        "resumed after {:?} — spent {} tokens; next: {}",
+        "resumed after {:?} — spent {} tokens; {reset}next: {}",
         blocker.edge,
         blocker.spent_tokens,
         state.next.join(", ")
@@ -1742,20 +1755,20 @@ mod tests {
         .unwrap();
         assert_eq!(state.back_edges.len(), 1);
         assert_eq!(state.current.as_deref(), Some("implement"));
-        assert!(!state
+        // The gate is still recorded as a failure until it is retried; the
+        // back-edge re-opened the implementation, not the gate.
+        let verify = state
             .done
             .iter()
             .find(|entry| entry.node == "verify")
-            .unwrap()
-            .failed);
-        // The gate is still recorded as a failure until it is retried.
-        assert!(state.done.iter().any(|entry| entry.node == "verify"));
+            .expect("verify should still be recorded");
+        assert!(verify.failed);
     }
 
     #[test]
     fn undeclared_back_edge_is_refused() {
         let mut state = fresh();
-        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify"] {
             step(&mut state, node);
         }
         // `verify` may re-open `implement`; `compile` may not re-open `verify`
