@@ -1,3 +1,4 @@
+use crate::db::truncate_at_char_boundary;
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use acp_thread::MentionUri;
 use agent_client_protocol::schema::v1 as acp;
@@ -15,7 +16,7 @@ use settings::Settings;
 use std::{cmp, fmt::Write, sync::Arc};
 use util::RangeExt;
 use util::markdown::{MarkdownCodeBlock, MarkdownInlineCode};
-use util::paths::PathMatcher;
+use util::paths::{PathMatcher, is_absolute};
 
 /// Searches the contents of files in the project with a regular expression
 ///
@@ -66,6 +67,12 @@ impl GrepToolInput {
 }
 
 const RESULTS_PER_PAGE: u32 = 20;
+
+/// Cap on a single rendered match's snippet. A grep hit on a pathological
+/// single line (the 2026-10-16 incident was a 71 MB one-line JSON artifact)
+/// must not be persisted whole into the transcript; head-bias and note the
+/// truncation, mirroring `MAX_MCP_TOOL_RESULT_BYTES`.
+const MAX_SNIPPET_BYTES: usize = 64 * 1024;
 
 pub struct GrepTool {
     project: Entity<Project>,
@@ -131,6 +138,12 @@ impl AgentTool for GrepTool {
 
             let results = cx.update(|cx| {
                 let path_style = project.read(cx).path_style(cx);
+
+                if let Some(include_pattern) = input.include_pattern.as_ref()
+                    && is_absolute(include_pattern, path_style)
+                {
+                    return Err("include_pattern must be a project-root-relative glob (e.g. \"**/*.rs\" or \"frontend/src/**/*.ts\"); absolute paths are not supported".to_string());
+                }
 
                 let include_matcher = PathMatcher::new(
                     input
@@ -322,7 +335,17 @@ impl AgentTool for GrepTool {
                     };
                     writeln!(output, "{line_label}").ok();
 
-                    let snippet: String = snapshot.text_for_range(range.clone()).collect();
+                    let mut snippet: String = snapshot.text_for_range(range.clone()).collect();
+                    if snippet.len() > MAX_SNIPPET_BYTES {
+                        let total_bytes = snippet.len();
+                        snippet = truncate_at_char_boundary(&snippet, MAX_SNIPPET_BYTES).to_string();
+                        write!(
+                            snippet,
+                            "\n\n[... grep result truncated to {} bytes of {} total ...]",
+                            MAX_SNIPPET_BYTES, total_bytes,
+                        )
+                        .ok();
+                    }
                     output.push_str("```\n");
                     output.push_str(&snippet);
                     output.push_str("\n```\n");
@@ -485,6 +508,92 @@ mod tests {
         assert!(
             result.contains("test_main.rs"),
             "Should include test_main.rs"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_grep_tool_rejects_absolute_include_pattern(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            serde_json::json!({
+                "src": {
+                    "main.rs": "fn main() {}\n",
+                },
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let tool = Arc::new(GrepTool { project });
+
+        let input = GrepToolInput {
+            regex: "fn".to_string(),
+            include_pattern: Some("/etc/passwd".to_string()),
+            offset: 0,
+            case_sensitive: false,
+        };
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(input),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        match result {
+            Err(error) => assert!(
+                error.contains("absolute"),
+                "expected an absolute-path error, got: {error}"
+            ),
+            Ok(output) => {
+                panic!("expected an error for an absolute include pattern, got: {output}")
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_grep_tool_truncates_oversized_match(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        let oversized_body = "x".repeat(MAX_SNIPPET_BYTES * 2);
+        fs.insert_tree(
+            path!("/root"),
+            serde_json::json!({
+                "big.txt": format!("needle {}\n", oversized_body),
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let input = GrepToolInput {
+            regex: "needle".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+        };
+
+        let result = run_grep_tool(input, project.clone(), cx).await;
+        assert!(
+            result.contains("truncated to"),
+            "expected a truncation marker, got: {result}"
+        );
+        assert!(
+            result.contains("needle"),
+            "expected the matched line head, got: {result}"
+        );
+        assert!(
+            !result.contains(&oversized_body),
+            "the full oversized line must not be rendered"
         );
     }
 

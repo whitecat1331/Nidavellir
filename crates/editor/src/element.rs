@@ -41,6 +41,7 @@ use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
+use gpui::accesskit;
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
     Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Edges,
@@ -249,6 +250,8 @@ pub struct EditorElement {
     editor: Entity<Editor>,
     style: EditorStyle,
     split_side: Option<SplitSide>,
+    a11y_label: Option<SharedString>,
+    a11y_value: Option<SharedString>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,7 +268,25 @@ impl EditorElement {
             editor: editor.clone(),
             style,
             split_side: None,
+            a11y_label: None,
+            a11y_value: None,
         }
+    }
+
+    /// Expose this editor as a text input in the accessibility tree. Elements
+    /// without a label or value stay out of the tree, so preview editors do not
+    /// add unlabelled nodes.
+    pub fn with_a11y_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = Some(label.into());
+        self
+    }
+
+    /// Report the editor's current contents to assistive technology (and the
+    /// dev-only `window_control` snapshot). Keep it small: the value is copied
+    /// into the tree every frame.
+    pub fn with_a11y_value(mut self, value: impl Into<SharedString>) -> Self {
+        self.a11y_value = Some(value.into());
+        self
     }
 
     pub fn set_split_side(&mut self, side: SplitSide) {
@@ -8009,7 +8030,26 @@ impl Element for EditorElement {
     type PrepaintState = EditorLayout;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        (self.a11y_label.is_some() || self.a11y_value.is_some()).then(|| {
+            ElementId::Name(SharedString::from(format!(
+                "editor-a11y-{:?}",
+                self.editor.entity_id()
+            )))
+        })
+    }
+
+    fn a11y_role(&self) -> Option<accesskit::Role> {
+        (self.a11y_label.is_some() || self.a11y_value.is_some())
+            .then_some(accesskit::Role::MultilineTextInput)
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        if let Some(label) = self.a11y_label.as_deref() {
+            node.set_label(label);
+        }
+        if let Some(value) = self.a11y_value.as_deref() {
+            node.set_value(value);
+        }
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {

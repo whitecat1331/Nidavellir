@@ -47,6 +47,18 @@ pub enum WindowControlOperation {
     Click,
     /// Assert on a selector's visibility or text.
     Assert,
+    /// Walk the live accessibility tree and return a bounded, text-first view
+    /// of the UI (role, label/value, stable ref, bounds). Use this to observe
+    /// the UI instead of OCR. `selector` filters nodes, `limit` bounds the
+    /// count, and `x`/`y` resolve the deepest node under a point (`hit`).
+    Snapshot,
+    /// Capture the window (or a single node's bounds) as a PNG.
+    ///
+    /// Dev-channel only and permission-gated (`confirm` by default): pixels
+    /// cannot be redacted, so consent is the only control. `target` defaults to
+    /// `window`; a node ref (`#id` / `role[name="…"]`) or `node` crops to that
+    /// node's bounds.
+    Screenshot,
     /// Add a git worktree as a workspace root, so the agent can reach a
     /// `../zed-wip-<slug>` worktree it just created. Skips the interactive
     /// folder picker. Auto-allowed by default (the agent created the worktree);
@@ -71,6 +83,8 @@ impl WindowControlOperation {
             Self::Find => "find",
             Self::Click => "click",
             Self::Assert => "assert",
+            Self::Snapshot => "snapshot",
+            Self::Screenshot => "screenshot",
             Self::AddWorktreeRoot => "add_worktree_root",
             Self::AddProjectRoot => "add_project_root",
         }
@@ -98,6 +112,8 @@ pub struct WindowControlRequest {
 
     /// For `focus`: the target view/handle. Known targets are
     /// `agent_panel.message_editor`, `agent_panel`, `editor`, and `terminal`.
+    /// For `screenshot`: what to capture. Defaults to `window`; a node ref
+    /// (`#id` / `role[name="…"]`) crops to that node's bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 
@@ -123,6 +139,7 @@ pub struct WindowControlRequest {
 
     /// For `find`/`click`/`assert`: the selector id (e.g.
     /// `agent_panel.message_editor`). For `find`, an optional substring filter.
+    /// For `snapshot`, a case-insensitive filter over role/label/value/ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
 
@@ -138,6 +155,28 @@ pub struct WindowControlRequest {
     /// existing directory to add as a workspace root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+
+    /// For `snapshot`/`find`: cap the number of accessibility nodes returned
+    /// (default 200, maximum 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+
+    /// For `snapshot`: a window-space x coordinate (logical pixels) to resolve
+    /// to the deepest accessibility node under that point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f32>,
+
+    /// For `snapshot`: the y coordinate paired with `x`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f32>,
+
+    /// For `snapshot`/`click`/`screenshot`: a node reference resolved against
+    /// the current accessibility tree — `#<id>` or `role[name="…"]`, with an
+    /// optional `#<n>` ordinal when several nodes match. An unresolved or
+    /// ambiguous ref is a hard error; take a fresh `snapshot` after the UI
+    /// changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 impl WindowControlRequest {
@@ -165,6 +204,10 @@ impl Default for WindowControlRequest {
             expect_text: None,
             expect_visible: None,
             path: None,
+            limit: None,
+            x: None,
+            y: None,
+            node: None,
         }
     }
 }
@@ -272,6 +315,47 @@ mod tests {
             WindowControlRequest::default().operation,
             WindowControlOperation::State
         );
+    }
+
+    #[test]
+    fn snapshot_operation_round_trips() {
+        let value = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::Snapshot,
+            selector: Some("Button".into()),
+            limit: Some(50),
+            x: Some(120.0),
+            y: Some(80.0),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(value["operation"], "snapshot");
+        assert_eq!(value["selector"], "Button");
+        assert_eq!(value["limit"], 50);
+        assert_eq!(value["x"], 120.0);
+
+        let round_trip: WindowControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.operation, WindowControlOperation::Snapshot);
+        assert_eq!(round_trip.limit, Some(50));
+        assert_eq!(round_trip.y, Some(80.0));
+    }
+
+    #[test]
+    fn screenshot_operation_round_trips() {
+        let value = serde_json::to_value(WindowControlRequest {
+            operation: WindowControlOperation::Screenshot,
+            target: Some("button[name=\"Send\"]".into()),
+            node: Some("#42".into()),
+            ..WindowControlRequest::default()
+        })
+        .unwrap();
+        assert_eq!(value["operation"], "screenshot");
+        assert_eq!(value["target"], "button[name=\"Send\"]");
+        assert_eq!(value["node"], "#42");
+
+        let round_trip: WindowControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.operation, WindowControlOperation::Screenshot);
+        assert_eq!(round_trip.target.as_deref(), Some("button[name=\"Send\"]"));
+        assert_eq!(round_trip.node.as_deref(), Some("#42"));
     }
 
     #[test]

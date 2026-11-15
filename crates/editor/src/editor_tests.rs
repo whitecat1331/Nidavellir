@@ -48606,3 +48606,35 @@ fn multiline_add_selection_history_states() -> [(bool, &'static str, &'static st
         ),
     ]
 }
+
+/// The dev-only `window_control` surface observes the editor through the a11y
+/// tree, so a rendered editor must expose a labelled text-input node.
+#[gpui::test]
+fn test_editor_exposes_a_labelled_text_input_node(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let buffer = cx.new(|cx| language::Buffer::local("hello", cx));
+    let editor = cx.add_window(|window, cx| Editor::for_buffer(buffer, None, window, cx));
+    let handle: gpui::AnyWindowHandle = editor.into();
+
+    cx.update_window(handle, |_, window, cx| {
+        window.set_a11y_forced(true);
+        window.draw(cx).clear(cx);
+    })
+    .expect("the window should draw");
+
+    let snapshot = cx
+        .update_window(handle, |_, window, _| window.a11y_snapshot())
+        .expect("the snapshot should be readable")
+        .expect("the forced tree should be available");
+    assert!(
+        snapshot.nodes.iter().any(|node| {
+            node.role == gpui::Role::MultilineTextInput && node.label.as_deref() == Some("Editor")
+        }),
+        "the editor should expose a labelled text input: {:?}",
+        snapshot
+            .nodes
+            .iter()
+            .map(|node| (format!("{:?}", node.role), node.label.clone()))
+            .collect::<Vec<_>>()
+    );
+}

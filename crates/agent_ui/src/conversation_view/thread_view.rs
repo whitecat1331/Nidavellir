@@ -4902,6 +4902,7 @@ impl ThreadView {
                                         .hover(|s| s.opacity(1.0))
                                         .child(
                                             IconButton::new("toggle-height", expand_icon)
+                                                .aria_label(expand_tooltip)
                                                 .icon_size(IconSize::Small)
                                                 .icon_color(Color::Muted)
                                                 .tooltip({
@@ -5483,6 +5484,7 @@ impl ThreadView {
                 .gap_1()
                 .child(
                     IconButton::new("sandbox-status", icon)
+                        .aria_label("Sandbox status")
                         .icon_size(IconSize::Small)
                         .icon_color(icon_color)
                         .tooltip(Tooltip::element(move |_window, _cx| {
@@ -5527,6 +5529,7 @@ impl ThreadView {
 
         Some(
             IconButton::new("plan-mode", IconName::ListTodo)
+                .aria_label(tooltip_label)
                 .icon_size(IconSize::Small)
                 .icon_color(color)
                 .tooltip(move |_, cx| {
@@ -5571,6 +5574,7 @@ impl ThreadView {
 
         Some(
             IconButton::new("rea-mode", IconName::MagnifyingGlass)
+                .aria_label(tooltip_label)
                 .icon_size(IconSize::Small)
                 .icon_color(color)
                 .tooltip(move |_, cx| {
@@ -5622,6 +5626,7 @@ impl ThreadView {
             .flatten();
 
         let icon_button = IconButton::new("fast-mode", icon)
+            .aria_label(tooltip_label)
             .icon_size(IconSize::Small)
             .icon_color(color);
 
@@ -5772,6 +5777,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         let thinking_toggle = IconButton::new("thinking-mode", icon)
+            .aria_label(tooltip_label)
             .icon_size(IconSize::Small)
             .icon_color(color)
             .tooltip(move |_, cx| {
@@ -5899,19 +5905,22 @@ impl ThreadView {
         });
 
         let trigger = if standalone {
-            ButtonLike::new("effort-selector-trigger").child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::ThinkingMode)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                    )
-                    .child(Label::new(label).size(LabelSize::Small).color(label_color))
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
-            )
+            ButtonLike::new("effort-selector-trigger")
+                .aria_label("Thinking effort")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::ThinkingMode)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        )
+                        .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+                )
         } else {
             ButtonLike::new_rounded_right("effort-selector-trigger")
+                .aria_label("Thinking effort")
                 .child(Label::new(label).size(LabelSize::Small).color(label_color))
                 .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
         };
@@ -6010,6 +6019,7 @@ impl ThreadView {
                 .into_any_element()
         } else if is_generating && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
+                .aria_label("Stop generation")
                 .icon_color(Color::Error)
                 .style(ButtonStyle::Tinted(TintColor::Error))
                 .tooltip(move |_window, cx| {
@@ -6024,6 +6034,11 @@ impl ThreadView {
                 IconName::Send
             };
             IconButton::new("send-message", send_icon)
+                .aria_label(if is_generating {
+                    "Queue and send"
+                } else {
+                    "Send message"
+                })
                 .style(ButtonStyle::Filled)
                 .map(|this| {
                     if is_editor_empty && !is_generating {
@@ -6082,6 +6097,7 @@ impl ThreadView {
         PopoverMenu::new("add-context-menu")
             .trigger_with_tooltip(
                 IconButton::new("add-context", IconName::Plus)
+                    .aria_label("Add context")
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted),
                 {
@@ -6272,6 +6288,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         IconButton::new("jump-to-previous-prompt", IconName::UserArrowUp)
+            .aria_label("Jump to previous prompt")
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -6291,6 +6308,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         IconButton::new("jump-to-next-prompt", IconName::UserArrowDown)
+            .aria_label("Jump to next prompt")
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -6310,6 +6328,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         IconButton::new("jump-to-focused-prompt", IconName::Eye)
+            .aria_label("Jump to focused prompt")
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -6343,6 +6362,7 @@ impl ThreadView {
         };
 
         IconButton::new("follow-agent", IconName::Crosshair)
+            .aria_label(tooltip_label.clone())
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .toggle_state(following)

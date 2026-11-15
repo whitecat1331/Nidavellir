@@ -161,6 +161,16 @@ impl A11yDebug {
         });
         Some(serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()))
     }
+
+    /// The tree update captured at the end of the last frame.
+    pub(crate) fn last_update(&self) -> Option<&TreeUpdate> {
+        self.last_tree_update.as_ref()
+    }
+
+    /// The display scale factor used to build the last frame's tree.
+    pub(crate) fn last_scale_factor(&self) -> Option<f32> {
+        self.last_frame.as_ref().map(|frame| frame.scale_factor)
+    }
 }
 
 #[derive(Default)]

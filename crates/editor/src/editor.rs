@@ -12441,7 +12441,16 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        EditorElement::new(&cx.entity(), self.create_style(cx))
+        let editor = cx.entity();
+        let style = self.create_style(cx);
+        let label = self
+            .active_buffer(cx)
+            .and_then(|buffer| {
+                let buffer = buffer.read(cx);
+                buffer.file().map(|file| file.file_name(cx).to_string())
+            })
+            .unwrap_or_else(|| "Editor".to_string());
+        EditorElement::new(&editor, style).with_a11y_label(label)
     }
 }
 
