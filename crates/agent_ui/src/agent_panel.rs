@@ -9215,6 +9215,7 @@ mod tests {
                     &panel,
                     agent::WindowControlRequest {
                         operation: agent::WindowControlOperation::Snapshot,
+                        limit: Some(1000),
                         ..Default::default()
                     },
                     window,
@@ -9252,6 +9253,13 @@ mod tests {
         assert!(
             coverage["unlabelled"].as_u64().is_some(),
             "coverage reports an unlabelled-node count: {tree:?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["label"] == json!("Message editor")),
+            "the message editor node should be in the tree:\n{}",
+            tree["text"].as_str().unwrap_or_default()
         );
 
         let (x, y) = nodes
