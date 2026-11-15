@@ -13,9 +13,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::App;
-use language_model::{
-    LanguageModelRegistry, LanguageModelToolResultContent, LanguageModelToolUse,
-};
+use language_model::{LanguageModelRegistry, LanguageModelToolResultContent, LanguageModelToolUse};
 use regex::Regex;
 
 use crate::thread::{

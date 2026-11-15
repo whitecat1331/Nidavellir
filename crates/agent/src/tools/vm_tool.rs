@@ -411,14 +411,19 @@ pub async fn vm_node_statuses(
         futures.push(
             async move {
                 let mut status = base_node_status(&node, &target);
-                let request =
-                    match assemble_api_request(&target, VmOperation::NodeStatus, None, None, None) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            status.error = Some(error.to_string());
-                            return status;
-                        }
-                    };
+                let request = match assemble_api_request(
+                    &target,
+                    VmOperation::NodeStatus,
+                    None,
+                    None,
+                    None,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        status.error = Some(error.to_string());
+                        return status;
+                    }
+                };
                 let value =
                     match call_api(&http_client, &request, &token_id, &secret, &base_url).await {
                         Ok(value) => value,
