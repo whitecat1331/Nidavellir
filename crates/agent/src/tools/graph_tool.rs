@@ -1552,10 +1552,11 @@ mod tests {
         )
         .unwrap();
         for attempt in 0..(RETRY_BUDGET - 1) {
+            let artifact = format!("report-{attempt}");
             advance(
                 &mut state,
                 "verify",
-                format!("report-{attempt}"),
+                &artifact,
                 false,
                 true,
                 Some(distinct_failure(attempt)),
@@ -1793,10 +1794,11 @@ mod tests {
             step(&mut state, node);
         }
         for traversal in 0..2 {
+            let report = format!("report-{traversal}");
             advance(
                 &mut state,
                 "verify",
-                format!("report-{traversal}"),
+                &report,
                 false,
                 true,
                 Some(distinct_failure(traversal)),
@@ -1805,10 +1807,11 @@ mod tests {
                 None,
             )
             .unwrap();
+            let fix = format!("sha-fix-{traversal}");
             advance(
                 &mut state,
                 "implement",
-                format!("sha-fix-{traversal}"),
+                &fix,
                 false,
                 false,
                 None,
@@ -1900,10 +1903,11 @@ mod tests {
             step(&mut state, node);
         }
         for attempt in 0..GATE_FAILURE_STREAK {
+            let artifact = format!("report-{attempt}");
             advance(
                 &mut state,
                 "verify",
-                format!("report-{attempt}"),
+                &artifact,
                 false,
                 true,
                 Some(distinct_failure(attempt)),
