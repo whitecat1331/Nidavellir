@@ -4902,6 +4902,7 @@ impl ThreadView {
                                         .hover(|s| s.opacity(1.0))
                                         .child(
                                             IconButton::new("toggle-height", expand_icon)
+                                                .aria_label(expand_tooltip)
                                                 .icon_size(IconSize::Small)
                                                 .icon_color(Color::Muted)
                                                 .tooltip({
@@ -6279,6 +6280,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         IconButton::new("jump-to-previous-prompt", IconName::UserArrowUp)
+            .aria_label("Jump to previous prompt")
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -6298,6 +6300,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         IconButton::new("jump-to-next-prompt", IconName::UserArrowDown)
+            .aria_label("Jump to next prompt")
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -6317,6 +6320,7 @@ impl ThreadView {
         let focus_handle = self.message_editor.focus_handle(cx);
 
         IconButton::new("jump-to-focused-prompt", IconName::Eye)
+            .aria_label("Jump to focused prompt")
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(move |_window, cx| {
@@ -6350,6 +6354,7 @@ impl ThreadView {
         };
 
         IconButton::new("follow-agent", IconName::Crosshair)
+            .aria_label(tooltip_label.clone())
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .toggle_state(following)
