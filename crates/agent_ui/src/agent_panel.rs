@@ -6676,9 +6676,9 @@ fn window_control_assert_node(
     reference: &str,
     request: &agent::WindowControlRequest,
 ) -> Result<serde_json::Value> {
-    let visible = node
-        .bounds
-        .is_some_and(|bounds| bounds.size.width.0 > 0.0 && bounds.size.height.0 > 0.0);
+    let visible = node.bounds.is_some_and(|bounds| {
+        bounds.size.width.as_f32() > 0.0 && bounds.size.height.as_f32() > 0.0
+    });
     let mut passed = true;
     if let Some(expect_visible) = request.expect_visible {
         passed &= visible == expect_visible;
