@@ -164,9 +164,11 @@ pub struct Request {
 /// reaches the API's context limit.
 pub const COMPLETION_BUDGET_SAFETY_MARGIN: u64 = 16_384;
 
-/// The floor for `max_tokens` when headroom is nearly exhausted, so a doomed
-/// request still gets a positive completion budget and fails honestly rather
-/// than being sent with a nonsensical zero.
+/// The minimum completion budget a request needs to be worth sending. Below
+/// this headroom a request is doomed — a reasoning model burns the whole
+/// budget on `reasoning_content` — so `clamp_completion_budget` reports it as
+/// exhausted and the caller fails before send (except the summarisation
+/// carve-out).
 pub const MIN_COMPLETION_BUDGET: u64 = 1_024;
 
 /// Tokens charged for each image part. DeepSeek bills vision input per image
@@ -243,15 +245,27 @@ impl Request {
 /// Clamps the request's completion budget so `estimated_input + max_tokens`
 /// cannot exceed the model's context window: the DeepSeek API rejects a
 /// request whose messages plus reserved completion exceed its maximum context
-/// length even when the messages alone fit (live 400, 2026-10-18).
-pub fn clamp_completion_budget(request: &mut Request, context_window: u64) {
+/// length even when the messages alone fit (live 400, 2026-10-18). Returns
+/// `true` when the input already exhausts the window (headroom below
+/// [`MIN_COMPLETION_BUDGET`]) so the caller can fail honestly instead of
+/// sending a doomed request.
+pub fn clamp_completion_budget(request: &mut Request, context_window: u64) -> bool {
     let Some(max_tokens) = request.max_tokens else {
-        return;
+        return false;
     };
     let headroom = context_window
         .saturating_sub(request.estimated_input_tokens())
         .saturating_sub(COMPLETION_BUDGET_SAFETY_MARGIN);
-    request.max_tokens = Some(max_tokens.min(headroom).max(MIN_COMPLETION_BUDGET));
+
+    if headroom < MIN_COMPLETION_BUDGET {
+        // Keep a positive budget so the payload stays well-formed, but tell the
+        // caller the request can't meaningfully complete.
+        request.max_tokens = Some(MIN_COMPLETION_BUDGET);
+        return true;
+    }
+
+    request.max_tokens = Some(max_tokens.min(headroom));
+    false
 }
 
 #[derive(Debug, Serialize, Deserialize)]
