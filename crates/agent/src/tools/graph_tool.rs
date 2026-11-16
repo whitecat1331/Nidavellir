@@ -235,6 +235,14 @@ const BACK_EDGES: &[(&str, &str)] = &[
 ];
 
 /// Nodes that need a human decision. Automatic traversal halts before them.
+///
+/// `HUMAN_GATES` is the route-node subset of the fork's full human-gate list.
+/// The authoritative list — launch, laptop takeover, merge/rebuild of shared
+/// slots, release, plan completion — lives in plan 1.25
+/// (`FORK_OPERATING_KNOWLEDGE_FINAL_LAYER.md` in the zed-debugger-demo plans
+/// tree, "Testing & verification method" item 8); this table cites that plan
+/// rather than restating the list. The launch and laptop-takeover gates are
+/// operational (owned by `dev-flow` / `remote-compiler`), not route nodes.
 const HUMAN_GATES: &[&str] = &["merge", "release", "complete"];
 
 /// Attempt budget for a single node before it is declared exhausted (D12).
