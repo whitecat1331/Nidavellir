@@ -357,6 +357,13 @@ pub fn into_deepseek(
     if request.contains_custom_tool_input() {
         anyhow::bail!("DeepSeek does not support custom tools");
     }
+    // The summarisation request must be exempt from the honest clamp failure:
+    // a fully-oversized thread still has to be able to compact itself (the
+    // Phase 2 byte budget bounds its body instead).
+    let is_summarization = matches!(
+        request.intent,
+        Some(language_model::CompletionIntent::ThreadContextSummarization)
+    );
 
     let thinking = deepseek_thinking(model, request.thinking_allowed);
     let thinking_enabled = thinking
@@ -519,7 +526,13 @@ pub fn into_deepseek(
     // The DeepSeek API rejects a request whose messages plus reserved
     // completion exceed the model's context window even when the messages
     // alone fit, so shrink the completion budget to the remaining headroom.
-    deepseek::clamp_completion_budget(&mut request, model.max_token_count());
+    let headroom_exhausted =
+        deepseek::clamp_completion_budget(&mut request, model.max_token_count());
+    if headroom_exhausted && !is_summarization {
+        anyhow::bail!(
+            "This thread exceeds DeepSeek's context window. Run /compact or start a new thread to continue."
+        );
+    }
     Ok(request)
 }
 
@@ -821,13 +834,43 @@ mod tests {
         Ok(())
     }
 
+    /// An oversized non-summarisation request must fail before send with an
+    /// actionable error, not be sent with a floored budget that a reasoning
+    /// model burns entirely on `reasoning_content`.
     #[test]
-    fn completion_budget_floored_when_input_exhausts_window() -> Result<()> {
-        // ~4.4 MB of message text ≈ 1.1M estimated tokens — past the window,
-        // so the clamp floors the budget instead of sending zero.
+    fn oversized_input_errors_before_send() {
+        // ~4.4 MB of message text ≈ 1.1M estimated tokens — past V4Pro's
+        // 1,048,576 window.
+        let filler = "a".repeat(4_400_000);
+        let error = into_deepseek(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(filler)],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                ..Default::default()
+            },
+            &deepseek::Model::V4Pro,
+            Some(384_000),
+        )
+        .expect_err("an oversized request must be rejected before send");
+        assert!(
+            error.to_string().contains("context window"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The summarisation request is exempt from the hard failure so a
+    /// fully-oversized thread can still summarise itself (the chicken-and-egg
+    /// the Phase 2 byte budget already bounds on the body side).
+    #[test]
+    fn oversized_compaction_is_exempt() -> Result<()> {
         let filler = "a".repeat(4_400_000);
         let request = into_deepseek(
             LanguageModelRequest {
+                intent: Some(language_model::CompletionIntent::ThreadContextSummarization),
                 messages: vec![LanguageModelRequestMessage {
                     role: Role::User,
                     content: vec![MessageContent::Text(filler)],
