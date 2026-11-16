@@ -215,6 +215,8 @@ pub const COMPACT_COMMAND_NAME: &str = "compact";
 
 pub const CONTINUE_COMMAND_NAME: &str = "continue";
 
+pub const SALVAGE_COMMAND_NAME: &str = "salvage";
+
 /// Returns the set of MCP prompt names that must be server-qualified
 /// (`/<server>.<name>`) to stay unambiguous in the slash-command popup: names
 /// shared by more than one MCP prompt, or names colliding with a reserved
@@ -1698,6 +1700,14 @@ impl NativeAgent {
             acp_thread::CommandCategory::Native,
         ));
 
+        let salvage_command = acp_v1::AvailableCommand::new(
+            SALVAGE_COMMAND_NAME,
+            "Trim oversized tool results so the thread can be sent again (no model call)",
+        )
+        .meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Native,
+        ));
+
         let registry = state.context_server_registry.read(cx);
 
         // Reserve the built-in command names so same-named MCP prompts are
@@ -1705,7 +1715,11 @@ impl NativeAgent {
         // unqualified `/compact` or `/continue` always routes to the native
         // command.
         let ambiguous_prompt_names = ambiguous_mcp_prompt_names(
-            [COMPACT_COMMAND_NAME, CONTINUE_COMMAND_NAME],
+            [
+                COMPACT_COMMAND_NAME,
+                CONTINUE_COMMAND_NAME,
+                SALVAGE_COMMAND_NAME,
+            ],
             registry.prompts().map(|p| p.prompt.name.as_str()),
         );
 
@@ -1746,6 +1760,7 @@ impl NativeAgent {
 
         std::iter::once(compact_command)
             .chain(std::iter::once(continue_command))
+            .chain(std::iter::once(salvage_command))
             .chain(mcp_commands)
             .collect()
     }
@@ -2316,6 +2331,42 @@ impl NativeAgent {
             acp_thread.update(cx, |acp_thread, cx| {
                 acp_thread.update_token_usage(None, cx);
             });
+
+            let connection = this.upgrade().map(NativeAgentConnection);
+            cx.update(|cx| {
+                NativeAgentConnection::handle_thread_events(
+                    response_stream,
+                    acp_thread.downgrade(),
+                    connection,
+                    cx,
+                )
+            })
+            .await
+        })
+    }
+
+    /// Trim oversized stored tool results in place in response to the built-in
+    /// `/salvage` slash command — the no-model recovery that needs no model
+    /// call and so can never be blocked by an un-sendable thread.
+    fn send_salvage_command(
+        &self,
+        session_id: acp_v1::SessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<acp_v1::PromptResponse>> {
+        cx.spawn(async move |this, cx| {
+            let (acp_thread, thread) = this.update(cx, |this, _cx| {
+                let session = this
+                    .sessions
+                    .get(&session_id)
+                    .context("Failed to get session")?;
+                let acp_thread = session
+                    .acp_thread
+                    .upgrade()
+                    .context("Session was released")?;
+                anyhow::Ok((acp_thread, session.thread.clone()))
+            })??;
+
+            let response_stream = thread.update(cx, |thread, cx| thread.salvage(cx));
 
             let connection = this.upgrade().map(NativeAgentConnection);
             cx.update(|cx| {
@@ -3318,6 +3369,11 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
                 return self.0.update(cx, |agent, cx| {
                     agent.send_continue_command(session_id, goal, cx)
                 });
+            }
+            if parsed_command.is_unqualified(SALVAGE_COMMAND_NAME) {
+                return self
+                    .0
+                    .update(cx, |agent, cx| agent.send_salvage_command(session_id, cx));
             }
 
             // Skill scope qualifiers (`/:<name>` and

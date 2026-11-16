@@ -12362,8 +12362,7 @@ impl ThreadView {
     }
 
     fn render_prompt_too_large_error(&self, cx: &mut Context<Self>) -> Callout {
-        const MESSAGE: &str = "This conversation is too long for the model's context window. \
-            Start a new thread or remove some attached files to continue.";
+        const MESSAGE: &str = "This conversation is too large for the provider's request limit or context window. Run /salvage to trim oversized tool results, start a new thread, or remove some attached files to continue.";
 
         Callout::new()
             .severity(Severity::Error)
@@ -12969,9 +12968,9 @@ impl ThreadView {
         let can_fork = self.as_native_thread(cx).is_some();
 
         let description = if can_fork {
-            "To continue, run /compact, start a new thread and @-mention this one, or continue in a new thread (compresses this history)"
+            "To continue, run /compact, run /salvage to trim oversized tool results, start a new thread and @-mention this one, or continue in a new thread (compresses this history)"
         } else {
-            "To continue, run /compact or start a new thread and @-mention this one"
+            "To continue, run /compact, run /salvage to trim oversized tool results, or start a new thread and @-mention this one"
         };
 
         Some(
