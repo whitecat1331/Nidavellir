@@ -161,32 +161,79 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                 .collect::<Vec<_>>()
         });
 
-        if to_migrate.is_empty() {
-            return anyhow::Ok(());
+        let mut changed = false;
+
+        if !to_migrate.is_empty() {
+            // Migrated legacy threads are always archived. The sidebar only lists
+            // unarchived threads, so this deliberately keeps historical threads out
+            // of the main list; they remain reachable through the archive view.
+            //
+            // Do not add a rescue that unarchives the most recent threads per
+            // project: it produced an inconsistent partial state (a later
+            // migration batch was fully archived, and previously-migrated batches
+            // were never re-examined), which is exactly the drift this migration
+            // must not reintroduce.
+            log::info!("Migrating {} thread store entries", to_migrate.len());
+
+            // Manually save each entry to the database and call reload, otherwise
+            // we'll end up triggering lots of reloads after each save
+            for entry in to_migrate {
+                db.save(entry).await?;
+            }
+
+            log::info!("Finished migrating thread store entries");
+            changed = true;
         }
 
-        // Migrated legacy threads are always archived. The sidebar only lists
-        // unarchived threads, so this deliberately keeps historical threads out
-        // of the main list; they remain reachable through the archive view.
-        //
-        // Do not add a rescue that unarchives the most recent threads per
-        // project: it produced an inconsistent partial state (a later
-        // migration batch was fully archived, and previously-migrated batches
-        // were never re-examined), which is exactly the drift this migration
-        // must not reintroduce.
-        log::info!("Migrating {} thread store entries", to_migrate.len());
-
-        // Manually save each entry to the database and call reload, otherwise
-        // we'll end up triggering lots of reloads after each save
-        for entry in to_migrate {
-            db.save(entry).await?;
+        // An out-of-band `DELETE FROM threads` removes the content row but leaves
+        // the sidebar row pointing at a session that can never load. Prune those
+        // rows once the content store is known to be complete. A failed reload
+        // leaves an empty/stale cache and must not be treated as "no content".
+        if thread_store.read_with(cx, |store, _| store.last_reload_succeeded()) {
+            let live_session_ids =
+                thread_store.read_with(cx, |store, _| store.entry_ids().collect::<HashSet<_>>());
+            let pruned = prune_orphaned_thread_metadata(&db, &live_session_ids).await?;
+            if pruned > 0 {
+                log::info!("[THREAD] pruned {pruned} orphaned sidebar rows");
+                changed = true;
+            }
         }
 
-        log::info!("Finished migrating thread store entries");
-
-        let _ = store.update(cx, |store, cx| store.reload(cx));
+        if changed {
+            let _ = store.update(cx, |store, cx| store.reload(cx));
+        }
         anyhow::Ok(())
     })
+}
+
+/// Delete sidebar metadata rows whose session has no content in the native
+/// thread store. These rows are left behind by an out-of-band delete against
+/// `threads.db`; clicking one retries the load for `THREAD_LOAD_RETRY_ATTEMPTS`
+/// before failing, so they must not survive startup.
+///
+/// Conservative by construction: only native-agent rows carrying a session id,
+/// with no remote connection, and absent from the live content store are
+/// eligible. Drafts (`session_id IS NULL`), remote/collab rows, and rows owned
+/// by other agents are never touched — a stale row is better than data loss.
+async fn prune_orphaned_thread_metadata(
+    db: &ThreadMetadataDb,
+    live_session_ids: &HashSet<acp::SessionId>,
+) -> anyhow::Result<usize> {
+    let mut pruned = 0;
+    for row in db.list()? {
+        let Some(session_id) = row.session_id.as_ref() else {
+            continue;
+        };
+        if row.remote_connection.is_some()
+            || row.agent_id.as_ref() != ZED_AGENT_ID.as_ref()
+            || live_session_ids.contains(session_id)
+        {
+            continue;
+        }
+        db.delete(row.thread_id).await?;
+        pruned += 1;
+    }
+    Ok(pruned)
 }
 
 fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::Result<()>>) {
@@ -3137,6 +3184,165 @@ mod tests {
              ThreadStore::reload has not yet completed, but got {} entries",
             list.len()
         );
+    }
+
+    // ISSUE-0065: an out-of-band delete against `threads.db` leaves a sidebar
+    // row pointing at a session that can never load. The startup prune must
+    // remove it.
+    #[gpui::test]
+    async fn test_prune_orphaned_thread_metadata_removes_orphans(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let orphan = make_metadata(
+            "orphan-session",
+            "Orphaned Thread",
+            Utc::now(),
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| store.save(orphan, cx));
+        });
+        cx.run_until_parked();
+
+        run_store_migrations(cx);
+
+        let session_ids = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store
+                .read(cx)
+                .entries()
+                .filter_map(|metadata| metadata.session_id.as_ref().map(|s| s.0.to_string()))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            session_ids.is_empty(),
+            "orphaned sidebar row must be pruned, found {session_ids:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_prune_orphaned_thread_metadata_keeps_live_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("live-session");
+        let content_session_id = session_id.clone();
+        let save_task = cx.update(move |cx| {
+            let thread_store = ThreadStore::global(cx);
+            thread_store.update(cx, |store, cx| {
+                store.save_thread(
+                    content_session_id,
+                    make_db_thread("Live Thread", Utc::now()),
+                    PathList::new(&[Path::new("/project-a")]),
+                    cx,
+                )
+            })
+        });
+        save_task.await.unwrap();
+        cx.run_until_parked();
+
+        run_store_migrations(cx);
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            assert!(
+                store.read(cx).entry_by_session(&session_id).is_some(),
+                "a thread with local content must keep its sidebar row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_prune_orphaned_thread_metadata_keeps_remote_rows(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mut metadata = make_metadata(
+            "remote-session",
+            "Remote Thread",
+            Utc::now(),
+            PathList::new(&[Path::new("/remote-project")]),
+        );
+        metadata.archived = true;
+        metadata.remote_connection = Some(RemoteConnectionOptions::Wsl(WslConnectionOptions {
+            distro_name: "Ubuntu".to_string(),
+            user: Some("anth".to_string()),
+        }));
+        let thread_id = metadata.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| store.save(metadata, cx));
+        });
+        cx.run_until_parked();
+
+        run_store_migrations(cx);
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            assert!(
+                store.read(cx).entry(thread_id).is_some(),
+                "a remote row may legitimately have no local content and must be kept"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_prune_orphaned_thread_metadata_is_idempotent(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let live_session_id = acp::SessionId::new("live-session");
+        let content_session_id = live_session_id.clone();
+        let save_task = cx.update(move |cx| {
+            let thread_store = ThreadStore::global(cx);
+            thread_store.update(cx, |store, cx| {
+                store.save_thread(
+                    content_session_id,
+                    make_db_thread("Live Thread", Utc::now()),
+                    PathList::new(&[Path::new("/project-a")]),
+                    cx,
+                )
+            })
+        });
+        save_task.await.unwrap();
+        cx.run_until_parked();
+
+        let orphan = make_metadata(
+            "orphan-session",
+            "Orphaned Thread",
+            Utc::now(),
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| store.save(orphan, cx));
+        });
+        cx.run_until_parked();
+
+        run_store_migrations(cx);
+
+        let remaining_session_ids = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store
+                .read(cx)
+                .entries()
+                .map(|metadata| metadata.session_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(remaining_session_ids.len(), 1);
+        assert_eq!(remaining_session_ids[0].as_ref(), Some(&live_session_id));
+
+        // A second launch-equivalent pass must find nothing left to prune.
+        run_store_migrations(cx);
+        let remaining_session_ids = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store
+                .read(cx)
+                .entries()
+                .map(|metadata| metadata.session_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(remaining_session_ids.len(), 1, "pruning must be idempotent");
+        assert_eq!(remaining_session_ids[0].as_ref(), Some(&live_session_id));
     }
 
     #[gpui::test]
