@@ -5249,6 +5249,9 @@ impl Thread {
         if self.planning {
             system_prompt = format!("{}\n\n{system_prompt}", crate::plan_framing());
         }
+        if let Some(banner) = crate::plan_state_banner(&self.id().to_string()) {
+            system_prompt = format!("{banner}\n\n{system_prompt}");
+        }
         if self.rea_mode {
             system_prompt = format!("{}\n\n{system_prompt}", crate::rea_framing());
         }

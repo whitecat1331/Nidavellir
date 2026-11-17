@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
@@ -1205,6 +1205,34 @@ impl AgentTool for GraphTool {
     }
 }
 
+/// In-process plan-path registry (plan 1.31, Layer 1). `graph init` records the
+/// plan's `progress.json` for the calling thread; the request builder reads it
+/// to inject the forced PLAN STATE banner. In-process only in this slice —
+/// persistence across restarts is a follow-up.
+static PLAN_PATHS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn plan_paths() -> &'static Mutex<HashMap<String, String>> {
+    PLAN_PATHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_plan_path(executor: &str, path: &str) {
+    if let Ok(mut paths) = plan_paths().lock() {
+        paths.insert(executor.to_string(), path.to_string());
+    }
+}
+
+/// The forced-consultation banner for `executor`, derived from the plan's
+/// `progress.json`. `None` when the thread has no plan recorded or the state is
+/// unreadable — a banner must never fail a request.
+pub fn plan_state_banner(executor: &str) -> Option<String> {
+    let path = plan_paths().lock().ok()?.get(executor).cloned()?;
+    let state = load_state(Path::new(&path)).ok()?;
+    let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
+    let next = derive_next(&state);
+    let next = next.first().map(String::as_str).unwrap_or("unknown");
+    Some(crate::plan_state_framing(next, &done))
+}
+
 fn load_state(path: &Path) -> Result<GraphState, GraphToolOutput> {
     let content = std::fs::read_to_string(path).map_err(|error| GraphToolOutput::Error {
         error: format!("Failed to read {}: {error}", path.display()),
@@ -1258,6 +1286,9 @@ fn run_operation(
                 warnings: Vec::new(),
             };
             save_state(&path, &state)?;
+            if let Some(executor) = executor {
+                record_plan_path(executor, &path.to_string_lossy());
+            }
             Ok(GraphToolOutput::Success {
                 message: format!(
                     "Initialized dev-flow state: {}\nfast_path_threshold_tokens: {FAST_PATH_THRESHOLD_TOKENS}",
