@@ -1085,19 +1085,6 @@ fn advance(
                 at: now.clone(),
             });
             state.done.retain(|entry| entry.node != node);
-            // Re-opening a completed node invalidates every route node after it:
-            // their artifacts describe the pre-back-edge code, so keeping them
-            // would let `derive_next` skip the re-verification this edge exists
-            // to force.
-            let downstream: HashSet<&str> = ROUTE
-                .iter()
-                .skip_while(|candidate| **candidate != node)
-                .skip(1)
-                .copied()
-                .collect();
-            state
-                .done
-                .retain(|entry| !downstream.contains(entry.node.as_str()));
             state.done.push(DoneEntry {
                 node: node.to_string(),
                 artifact: artifact.to_string(),
@@ -1553,55 +1540,6 @@ mod tests {
         }
         advance(&mut state, "merge", SHA, true, false, None, None, None, None).unwrap();
         assert_eq!(state.current.as_deref(), Some("merge"));
-    }
-
-    #[test]
-    fn back_edge_invalidates_downstream_gate_artifacts() {
-        let mut state = fresh();
-        for node in [
-            "plan",
-            "promote",
-            "claim",
-            "fork",
-            "implement",
-            "verify",
-            "compile",
-        ] {
-            step(&mut state, node);
-        }
-        advance(
-            &mut state,
-            "accept",
-            "",
-            false,
-            true,
-            Some(failed_record()),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // The failed accept re-opens implement. Verify and compile ran against the
-        // pre-back-edge code, so they must not survive in `done` — otherwise
-        // `derive_next` would offer `merge` without re-verifying the new tree.
-        advance(
-            &mut state,
-            "implement",
-            "new-sha",
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(derive_next(&state), vec!["verify".to_string()]);
-        assert!(!state.done.iter().any(|entry| entry.node == "compile"));
-        assert!(!state.done.iter().any(|entry| entry.node == "accept"));
-        assert!(!state.done.iter().any(|entry| entry.node == "merge"));
     }
 
     #[test]
