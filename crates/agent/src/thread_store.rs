@@ -12,6 +12,11 @@ impl Global for GlobalThreadStore {}
 pub struct ThreadStore {
     threads: Vec<DbThreadMetadata>,
     reload_task: Shared<Task<()>>,
+    /// Whether the most recent reload completed successfully. `reload_task`
+    /// deliberately swallows load errors, so a failed reload leaves the
+    /// previous (or empty) cache in place. Callers that make destructive
+    /// decisions from `entries()` must treat that as unknown content.
+    last_reload_succeeded: bool,
 }
 
 impl ThreadStore {
@@ -33,6 +38,7 @@ impl ThreadStore {
         Self {
             threads: Vec::new(),
             reload_task,
+            last_reload_succeeded: false,
         }
     }
 
@@ -41,6 +47,16 @@ impl ThreadStore {
     /// empty state must await this before reading.
     pub fn reload_task(&self) -> Shared<Task<()>> {
         self.reload_task.clone()
+    }
+
+    /// Whether the most recent reload completed successfully.
+    ///
+    /// A failed reload leaves `entries()` at its previous value rather than
+    /// reporting an error, so callers that delete based on `entries()` (for
+    /// example, pruning sidebar metadata for sessions with no content) must
+    /// skip the work when this is `false`.
+    pub fn last_reload_succeeded(&self) -> bool {
+        self.last_reload_succeeded
     }
 
     pub fn thread_from_session_id(&self, session_id: &acp::SessionId) -> Option<&DbThreadMetadata> {
@@ -97,6 +113,7 @@ impl ThreadStore {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.last_reload_succeeded = false;
         self.reload_task = Self::spawn_reload(cx);
     }
 
@@ -117,6 +134,7 @@ impl ThreadStore {
                     }
                     this.threads.push(thread);
                 }
+                this.last_reload_succeeded = true;
                 cx.notify();
             })
             .ok();
