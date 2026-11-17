@@ -301,6 +301,7 @@ dependencies = [
  "settings",
  "shell_command_parser",
  "smallvec",
+ "smol",
  "sqlez",
  "streaming_diff",
  "strsim",
@@ -5063,6 +5064,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "devops_panel"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "editor",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "diagnostics"
 version = "0.1.0"
 dependencies = [
@@ -6491,6 +6506,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui",
+ "serde",
+ "serde_json",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7618,6 +7646,7 @@ dependencies = [
  "gpui_util",
  "gpui_wgpu",
  "http_client",
+ "image",
  "libc",
  "log",
  "notify-rust",
@@ -7773,6 +7802,7 @@ dependencies = [
  "etagere",
  "gpui",
  "gpui_util",
+ "image",
  "itertools 0.14.0",
  "log",
  "naga",
@@ -16119,6 +16149,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "secret_panel"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22675,6 +22718,7 @@ dependencies = [
  "debugger_tools",
  "debugger_ui",
  "dev_container",
+ "devops_panel",
  "diagnostics",
  "edit_prediction",
  "edit_prediction_ui",
@@ -22688,6 +22732,7 @@ dependencies = [
  "feature_flags",
  "feedback",
  "file_finder",
+ "fleet_panel",
  "fs",
  "futures 0.3.34",
  "git",
@@ -22753,6 +22798,7 @@ dependencies = [
  "rope",
  "sandbox",
  "search",
+ "secret_panel",
  "semver",
  "serde",
  "serde_json",
