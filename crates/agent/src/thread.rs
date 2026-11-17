@@ -1447,6 +1447,11 @@ pub struct Thread {
     /// the `rea` context server's tools are exposed regardless of the active
     /// profile's context-server settings, and REA framing is injected.
     rea_mode: bool,
+    /// The `progress.json` of the dev-flow plan this thread is executing, if
+    /// any. Persisted on the thread so a restarted instance re-injects the
+    /// forced plan-state banner, and inherited by subagents so a spawned
+    /// acceptor knows which plan it is executing too.
+    plan_path: Option<String>,
     /// The per-thread REA MCP server, spawned when `rea_mode` is turned on and
     /// stopped when it is turned off or the thread is dropped. Thread-scoped so
     /// two REA threads never share an MCP session.
@@ -1617,6 +1622,7 @@ impl Thread {
             profile_id,
             planning,
             rea_mode: Self::rea_mode_from_environment(),
+            plan_path: None,
             rea_server: None,
             rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace,
@@ -1666,6 +1672,7 @@ impl Thread {
         self.profile_id = parent.profile_id.clone();
         self.planning = parent.planning;
         self.rea_mode = parent.rea_mode;
+        self.plan_path = parent.plan_path.clone();
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -2016,6 +2023,7 @@ impl Thread {
             profile_id,
             planning,
             rea_mode,
+            plan_path: db_thread.plan_path,
             rea_server: None,
             rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace: false,
@@ -2137,6 +2145,7 @@ impl Thread {
             profile: Some(self.profile_id.clone()),
             planning: self.planning,
             rea_mode: self.rea_mode,
+            plan_path: self.plan_path.clone(),
             subagent_context: self.subagent_context.clone(),
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -2456,7 +2465,10 @@ impl Thread {
             code_action_store,
         ));
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
-        self.add_tool(GraphTool::new(self.id().to_string()));
+        self.add_tool(GraphTool::new(
+            self.id().to_string(),
+            cx.entity().downgrade(),
+        ));
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
@@ -2509,6 +2521,23 @@ impl Thread {
             return;
         }
         self.planning = planning;
+        cx.notify();
+    }
+
+    /// The dev-flow plan this thread is executing, if any.
+    pub fn plan_path(&self) -> Option<&str> {
+        self.plan_path.as_deref()
+    }
+
+    /// Records (or clears) the dev-flow plan this thread is executing, so the
+    /// request builder can inject the forced plan-state banner and a restart
+    /// can recover it. Notifies so the change persists via the save observer,
+    /// mirroring `set_planning`.
+    pub fn set_plan_path(&mut self, plan_path: Option<String>, cx: &mut Context<Self>) {
+        if self.plan_path == plan_path {
+            return;
+        }
+        self.plan_path = plan_path;
         cx.notify();
     }
 
@@ -5249,7 +5278,7 @@ impl Thread {
         if self.planning {
             system_prompt = format!("{}\n\n{system_prompt}", crate::plan_framing());
         }
-        if let Some(banner) = crate::plan_state_banner(&self.id().to_string()) {
+        if let Some(banner) = crate::plan_state_banner(self.plan_path.as_deref()) {
             system_prompt = format!("{banner}\n\n{system_prompt}");
         }
         if self.rea_mode {
