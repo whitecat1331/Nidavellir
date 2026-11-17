@@ -477,6 +477,19 @@ pub fn decide_permission_from_settings(
     )
 }
 
+/// The git worktree containing `path` (the nearest ancestor with a `.git`
+/// entry), if any. Worktrees are marked by a `.git` *file*, ordinary
+/// checkouts by a `.git` *directory*; both satisfy `exists()`.
+fn git_toplevel(path: &Path) -> Option<&Path> {
+    let mut current = if path.is_dir() { path } else { path.parent()? };
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Plan 1.31, Layer 2 — the tool-permission gate. While a thread is executing a
 /// plan and the ready node is an unadvanced gate (`verify`/`compile`/`accept`), a
 /// mutating tool is denied until `graph advance` records that node. Returns
@@ -494,6 +507,19 @@ pub fn plan_gate(
     }
     if !crate::gate_covers_tool(tool_name, inputs) {
         return None;
+    }
+    // Harness artifacts (the plan itself, its VERIFY reports) live in a
+    // different worktree from the code under test. Editing them is not a
+    // mutation of the gated repo, and at the accept node the agent must be
+    // able to author the acceptance report it is about to verify with.
+    if let Some(target) = inputs.first().filter(|value| !value.starts_with("operation:")) {
+        if let (Some(target_root), Some(plan_root)) =
+            (git_toplevel(Path::new(target)), git_toplevel(Path::new(plan_path)))
+        {
+            if target_root == plan_root {
+                return None;
+            }
+        }
     }
     let next = crate::next_plan_node(plan_path)?;
     matches!(next.as_str(), "verify" | "compile" | "accept").then(|| {
@@ -2445,5 +2471,65 @@ mod tests {
     fn decide_permission_for_path_denies_edit_file_traversal_to_dotenv() {
         let decision = path_perm(EditFileTool::NAME, "src/../.env", &["^\\.env"], &[], &[]);
         assert!(matches!(decision, ToolPermissionDecision::Deny(_)));
+    }
+
+    fn ready_at_verify_progress(worktree: &Path) -> String {
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let plan_dir = worktree.join("plans");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        let plan = plan_dir.join("progress.json");
+        let state = r#"{
+            "plan": "GATE_FIXTURE",
+            "repo": "zed",
+            "done": [
+                {"node": "plan", "artifact": "x", "at": ""},
+                {"node": "promote", "artifact": "x", "at": ""},
+                {"node": "claim", "artifact": "x", "at": ""},
+                {"node": "fork", "artifact": "x", "at": ""},
+                {"node": "implement", "artifact": "x", "at": ""}
+            ],
+            "current": "implement",
+            "next": ["verify"],
+            "blocker": null
+        }"#;
+        std::fs::write(&plan, state).unwrap();
+        plan.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn plan_gate_allows_edits_in_the_plan_worktree() {
+        let worktree = tempfile::tempdir().unwrap();
+        let plan_path = ready_at_verify_progress(worktree.path());
+        let target = worktree.path().join("plans").join("VERIFY_run-2026-11-17.md");
+        let inputs = vec![target.to_string_lossy().into_owned()];
+
+        assert!(plan_gate("write_file", &inputs, Some(&plan_path)).is_none());
+    }
+
+    #[test]
+    fn plan_gate_still_denies_edits_in_the_code_worktree() {
+        let plan_worktree = tempfile::tempdir().unwrap();
+        let code_worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(code_worktree.path().join(".git")).unwrap();
+        let plan_path = ready_at_verify_progress(plan_worktree.path());
+        let target = code_worktree.path().join("src").join("main.rs");
+        let inputs = vec![target.to_string_lossy().into_owned()];
+
+        assert!(matches!(
+            plan_gate("write_file", &inputs, Some(&plan_path)),
+            Some(ToolPermissionDecision::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn plan_gate_still_denies_git_operations() {
+        let worktree = tempfile::tempdir().unwrap();
+        let plan_path = ready_at_verify_progress(worktree.path());
+        let inputs = vec!["operation:commit protected:false".to_string()];
+
+        assert!(matches!(
+            plan_gate("git", &inputs, Some(&plan_path)),
+            Some(ToolPermissionDecision::Deny(_))
+        ));
     }
 }
