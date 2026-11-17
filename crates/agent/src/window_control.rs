@@ -177,6 +177,13 @@ pub struct WindowControlRequest {
     /// changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+
+    /// For `screenshot`: an absolute path to write the PNG to, instead of
+    /// returning it inline as base64. The image is written to disk and the
+    /// response carries only the path and byte count, so the image never
+    /// enters the model's context — OCR it from disk instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_path: Option<String>,
 }
 
 impl WindowControlRequest {
@@ -208,6 +215,7 @@ impl Default for WindowControlRequest {
             x: None,
             y: None,
             node: None,
+            save_path: None,
         }
     }
 }
