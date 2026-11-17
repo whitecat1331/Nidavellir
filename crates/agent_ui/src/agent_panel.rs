@@ -6328,6 +6328,18 @@ pub(crate) fn window_control_dispatch(
                 window.screenshot()?
             };
 
+            if let Some(path) = request.save_path.as_deref() {
+                std::fs::write(path, &png)
+                    .map_err(|error| anyhow!("failed to write screenshot to {path}: {error}"))?;
+                return Ok(serde_json::json!({
+                    "target": target,
+                    "node": node_reference.map(|reference| reference.to_string()),
+                    "saved": true,
+                    "path": path,
+                    "bytes": png.len(),
+                }));
+            }
+
             use base64::Engine as _;
             Ok(serde_json::json!({
                 "target": target,
