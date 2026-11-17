@@ -482,6 +482,7 @@ dependencies = [
  "component",
  "context_server",
  "db",
+ "devops_panel",
  "editor",
  "eval_utils",
  "extension",

@@ -6976,9 +6976,10 @@ fn window_control_action(name: &str) -> Result<Box<dyn Action>> {
         "agent::Chat" => Box::new(zed_actions::agent::Chat),
         "agent::TogglePlanMode" => Box::new(TogglePlanMode),
         "agent::ToggleReaMode" => Box::new(ToggleReaMode),
+        "devops::ToggleDevOpsPanel" => Box::new(devops_panel::ToggleDevOpsPanel),
         "workspace::SaveAll" => Box::new(workspace::SaveAll { save_intent: None }),
         other => bail!(
-            "Unsupported action {other:?}. Supported actions: agent::NewThread,              agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle,              agent::FocusAgent, agent::CopyThreadToClipboard,              agent::LoadThreadFromClipboard, agent::NewNativeAgentThreadFromTruncate,              agent::Chat, agent::TogglePlanMode, agent::ToggleReaMode, workspace::SaveAll."
+            "Unsupported action {other:?}. Supported actions: agent::NewThread,              agent::ExpandMessageEditor, agent::ToggleFocus, agent::Toggle,              agent::FocusAgent, agent::CopyThreadToClipboard,              agent::LoadThreadFromClipboard, agent::NewNativeAgentThreadFromTruncate,              agent::Chat, agent::TogglePlanMode, agent::ToggleReaMode,              devops::ToggleDevOpsPanel, workspace::SaveAll."
         ),
     };
     Ok(action)
@@ -9096,6 +9097,7 @@ mod tests {
             "agent::NewNativeAgentThreadFromTruncate",
             "agent::TogglePlanMode",
             "agent::ToggleReaMode",
+            "devops::ToggleDevOpsPanel",
             "workspace::SaveAll",
         ] {
             assert!(
