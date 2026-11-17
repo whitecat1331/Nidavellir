@@ -6964,8 +6964,8 @@ impl<T: DeserializeOwned> ToolInput<T> {
     /// Wait for the final deserialized input, ignoring all partial updates.
     /// Non-streaming tools can use this to wait until the whole input is available.
     pub async fn recv(mut self) -> Result<T> {
-        while let Ok(value) = self.next().await {
-            match value {
+        loop {
+            match self.next().await? {
                 ToolInputPayload::Full(value) => return Ok(value),
                 ToolInputPayload::Partial(_) => {}
                 ToolInputPayload::InvalidJson { error_message } => {
@@ -6973,7 +6973,6 @@ impl<T: DeserializeOwned> ToolInput<T> {
                 }
             }
         }
-        Err(anyhow!("tool input was not fully received"))
     }
 
     pub async fn next(&mut self) -> Result<ToolInputPayload<T>> {
@@ -8906,6 +8905,25 @@ mod tests {
     use serde_json::json;
     use settings::LanguageModelProviderSetting;
     use std::sync::Arc;
+
+    #[gpui::test]
+    async fn test_tool_input_recv_surfaces_deserialization_error(_cx: &mut TestAppContext) {
+        #[derive(serde::Deserialize)]
+        struct InputWithRequiredField {
+            #[allow(dead_code)]
+            required: String,
+        }
+
+        let input = ToolInput::<InputWithRequiredField>::ready(json!({}));
+        let error_message = match input.recv().await {
+            Ok(_) => String::new(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error_message.contains("missing field"),
+            "expected the deserialization error to surface, got: {error_message}"
+        );
+    }
 
     // A message must never serialize an unpaired tool call or result. A result
     // whose call landed in a different message (see `late_tool_result_lands_on_
