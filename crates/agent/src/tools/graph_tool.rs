@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext as _, SharedString, Task};
+use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,14 @@ const BACK_EDGES: &[(&str, &str)] = &[
 ];
 
 /// Nodes that need a human decision. Automatic traversal halts before them.
+///
+/// `HUMAN_GATES` is the route-node subset of the fork's full human-gate list.
+/// The authoritative list — launch, laptop takeover, merge/rebuild of shared
+/// slots, release, plan completion — lives in plan 1.25
+/// (`FORK_OPERATING_KNOWLEDGE_FINAL_LAYER.md` in the zed-debugger-demo plans
+/// tree, "Testing & verification method" item 8); this table cites that plan
+/// rather than restating the list. The launch and laptop-takeover gates are
+/// operational (owned by `dev-flow` / `remote-compiler`), not route nodes.
 const HUMAN_GATES: &[&str] = &["merge", "release", "complete"];
 
 /// Attempt budget for a single node before it is declared exhausted (D12).
@@ -1135,11 +1143,15 @@ pub struct GraphTool {
     /// Reading the `Thread` entity inside `run` would panic: the tool is
     /// dispatched while the thread is already being updated.
     executor: String,
+    /// The owning thread, so a successful operation can record the plan it is
+    /// executing. It is only touched from a deferred foreground task, never
+    /// from `run`'s synchronous body (see `executor`).
+    thread: WeakEntity<Thread>,
 }
 
 impl GraphTool {
-    pub fn new(executor: String) -> Self {
-        Self { executor }
+    pub fn new(executor: String, thread: WeakEntity<Thread>) -> Self {
+        Self { executor, thread }
     }
 }
 
@@ -1187,14 +1199,76 @@ impl AgentTool for GraphTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         let executor = self.executor.clone();
-        cx.background_spawn(async move {
+        let thread = self.thread.clone();
+        cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|error| GraphToolOutput::Error {
                 error: format!("Failed to receive graph tool input: {error}"),
             })?;
             let path = PathBuf::from(&input.path);
-            run_operation(input, path, Some(executor.as_str()))
+            let path_string = path.to_string_lossy().into_owned();
+            let output = cx
+                .background_spawn(async move { run_operation(input, path, Some(executor.as_str())) })
+                .await;
+            if output.is_ok() {
+                if let Err(error) = thread.update(cx, |thread, cx| {
+                    thread.set_plan_path(Some(path_string), cx);
+                }) {
+                    log::error!("[GRAPH] failed to record plan path on thread: {error:#}");
+                }
+            }
+            output
         })
     }
+}
+
+/// The forced-consultation banner for the plan at `path`. `None` when the
+/// thread is not executing a plan, the state is unreadable, or the plan has no
+/// node left to run — a banner must never fail a request, and a completed plan
+/// must not tell the agent to assume an implementation role.
+pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
+    let state = load_state(Path::new(path?)).ok()?;
+    let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
+    let next = derive_next(&state);
+    let next = next.first()?;
+    Some(crate::plan_state_framing(next, &done))
+}
+
+/// The next ready node for a plan's `progress.json`, or `None` when the state is
+/// unreadable. Used by the Layer 2 tool-permission gate (plan 1.31).
+pub fn next_plan_node(plan_path: &str) -> Option<String> {
+    let state = load_state(Path::new(plan_path)).ok()?;
+    derive_next(&state).into_iter().next()
+}
+
+/// Tools that mutate source or working-tree state. The plan gate blocks these
+/// while a gate node is ready and unadvanced. `git` is matched by operation
+/// instead, because its read-only operations must stay available.
+const PLAN_GATED_TOOLS: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "create_directory",
+    "delete_path",
+    "copy_path",
+    "move_path",
+    "rename_symbol",
+    "apply_code_action",
+];
+
+const PLAN_GATED_GIT_OPERATIONS: &[&str] = &["commit", "merge", "push"];
+
+/// Whether this tool call is a mutation the plan gate covers.
+pub fn gate_covers_tool(tool_name: &str, input_values: &[String]) -> bool {
+    if PLAN_GATED_TOOLS.contains(&tool_name) {
+        return true;
+    }
+    tool_name == "git"
+        && input_values.first().is_some_and(|value| {
+            value.strip_prefix("operation:").is_some_and(|operation| {
+                PLAN_GATED_GIT_OPERATIONS
+                    .iter()
+                    .any(|gated| operation.starts_with(gated))
+            })
+        })
 }
 
 fn load_state(path: &Path) -> Result<GraphState, GraphToolOutput> {
@@ -1532,6 +1606,88 @@ mod tests {
             cost: None,
         }];
         assert_eq!(derive_next(&state), vec!["promote".to_string()]);
+    }
+
+    fn done_entry(node: &str) -> DoneEntry {
+        DoneEntry {
+            node: node.to_string(),
+            artifact: String::new(),
+            at: String::new(),
+            failed: false,
+            attempts: Vec::new(),
+            cost: None,
+        }
+    }
+
+    #[test]
+    fn plan_state_banner_names_the_next_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        state.done = ["plan", "promote", "claim", "fork"]
+            .into_iter()
+            .map(done_entry)
+            .collect();
+        save_state(&path, &state).unwrap();
+
+        let banner = plan_state_banner(path.to_str()).expect("banner for an active plan");
+        assert!(banner.contains("Next node: `implement`"));
+        assert!(banner.contains("Role to assume: implementer"));
+    }
+
+    #[test]
+    fn completed_plan_yields_no_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        state.done = ROUTE.iter().map(|node| done_entry(node)).collect();
+        save_state(&path, &state).unwrap();
+
+        assert!(plan_state_banner(path.to_str()).is_none());
+    }
+
+    #[test]
+    fn plan_gate_covers_mutations_only() {
+        let input = |value: &str| vec![value.to_string()];
+
+        assert!(gate_covers_tool("write_file", &[]));
+        assert!(gate_covers_tool("edit_file", &[]));
+        assert!(gate_covers_tool("delete_path", &[]));
+        assert!(gate_covers_tool("git", &input("operation:commit protected:false")));
+        assert!(gate_covers_tool("git", &input("operation:merge ref:feature")));
+        assert!(gate_covers_tool("git", &input("operation:push")));
+
+        assert!(!gate_covers_tool("git", &input("operation:status")));
+        assert!(!gate_covers_tool("git", &input("operation:diff")));
+        assert!(!gate_covers_tool("read_file", &[]));
+        assert!(!gate_covers_tool("terminal", &[]));
+    }
+
+    #[test]
+    fn next_plan_node_tracks_ready_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        state.done = ["plan", "promote", "claim", "fork", "implement"]
+            .into_iter()
+            .map(done_entry)
+            .collect();
+        save_state(&path, &state).unwrap();
+        let plan_path = path.to_string_lossy().into_owned();
+
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("verify"));
+
+        state.done.push(done_entry("verify"));
+        save_state(&path, &state).unwrap();
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("compile"));
+
+        state.done.push(done_entry("compile"));
+        save_state(&path, &state).unwrap();
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("accept"));
+
+        state.done.push(done_entry("accept"));
+        save_state(&path, &state).unwrap();
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("merge"));
     }
 
     #[test]

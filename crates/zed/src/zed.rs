@@ -27,6 +27,7 @@ use collections::VecDeque;
 use debugger_ui::debugger_panel::DebugPanel;
 use debugger_ui::network_panel::NetworkPanel;
 use devops_panel::DevOpsPanel;
+use fleet_panel::FleetPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
@@ -787,6 +788,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let network_panel = NetworkPanel::load(workspace_handle.clone(), cx);
         let devops_panel = DevOpsPanel::load(workspace_handle.clone(), cx);
+        let fleet_panel = FleetPanel::load(workspace_handle.clone(), cx);
         let secret_panel = SecretPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -813,6 +815,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(network_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(devops_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(fleet_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(secret_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
