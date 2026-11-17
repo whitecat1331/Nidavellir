@@ -1233,6 +1233,44 @@ pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
     Some(crate::plan_state_framing(next, &done))
 }
 
+/// The next ready node for a plan's `progress.json`, or `None` when the state is
+/// unreadable. Used by the Layer 2 tool-permission gate (plan 1.31).
+pub fn next_plan_node(plan_path: &str) -> Option<String> {
+    let state = load_state(Path::new(plan_path)).ok()?;
+    derive_next(&state).into_iter().next()
+}
+
+/// Tools that mutate source or working-tree state. The plan gate blocks these
+/// while a gate node is ready and unadvanced. `git` is matched by operation
+/// instead, because its read-only operations must stay available.
+const PLAN_GATED_TOOLS: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "create_directory",
+    "delete_path",
+    "copy_path",
+    "move_path",
+    "rename_symbol",
+    "apply_code_action",
+];
+
+const PLAN_GATED_GIT_OPERATIONS: &[&str] = &["commit", "merge", "push"];
+
+/// Whether this tool call is a mutation the plan gate covers.
+pub fn gate_covers_tool(tool_name: &str, input_values: &[String]) -> bool {
+    if PLAN_GATED_TOOLS.contains(&tool_name) {
+        return true;
+    }
+    tool_name == "git"
+        && input_values.first().is_some_and(|value| {
+            value.strip_prefix("operation:").is_some_and(|operation| {
+                PLAN_GATED_GIT_OPERATIONS
+                    .iter()
+                    .any(|gated| operation.starts_with(gated))
+            })
+        })
+}
+
 fn load_state(path: &Path) -> Result<GraphState, GraphToolOutput> {
     let content = std::fs::read_to_string(path).map_err(|error| GraphToolOutput::Error {
         error: format!("Failed to read {}: {error}", path.display()),
@@ -1606,6 +1644,50 @@ mod tests {
         save_state(&path, &state).unwrap();
 
         assert!(plan_state_banner(path.to_str()).is_none());
+    }
+
+    #[test]
+    fn plan_gate_covers_mutations_only() {
+        let input = |value: &str| vec![value.to_string()];
+
+        assert!(gate_covers_tool("write_file", &[]));
+        assert!(gate_covers_tool("edit_file", &[]));
+        assert!(gate_covers_tool("delete_path", &[]));
+        assert!(gate_covers_tool("git", &input("operation:commit protected:false")));
+        assert!(gate_covers_tool("git", &input("operation:merge ref:feature")));
+        assert!(gate_covers_tool("git", &input("operation:push")));
+
+        assert!(!gate_covers_tool("git", &input("operation:status")));
+        assert!(!gate_covers_tool("git", &input("operation:diff")));
+        assert!(!gate_covers_tool("read_file", &[]));
+        assert!(!gate_covers_tool("terminal", &[]));
+    }
+
+    #[test]
+    fn next_plan_node_tracks_ready_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        state.done = ["plan", "promote", "claim", "fork", "implement"]
+            .into_iter()
+            .map(done_entry)
+            .collect();
+        save_state(&path, &state).unwrap();
+        let plan_path = path.to_string_lossy().into_owned();
+
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("verify"));
+
+        state.done.push(done_entry("verify"));
+        save_state(&path, &state).unwrap();
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("compile"));
+
+        state.done.push(done_entry("compile"));
+        save_state(&path, &state).unwrap();
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("accept"));
+
+        state.done.push(done_entry("accept"));
+        save_state(&path, &state).unwrap();
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("merge"));
     }
 
     #[test]

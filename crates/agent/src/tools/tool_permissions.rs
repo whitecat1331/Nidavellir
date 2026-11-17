@@ -633,6 +633,15 @@ pub fn authorize_file_edit(
 ) -> Task<Result<()>> {
     let path_str = path.to_string_lossy();
 
+    // Plan 1.31 Layer 2 — apply the plan gate before the path-based Allow
+    // shortcut, so a mutating edit is refused while a verification gate is the
+    // unadvanced ready node.
+    if let Some(ToolPermissionDecision::Deny(reason)) =
+        crate::plan_gate(tool_name, &[path_str.to_string()], event_stream.plan_path())
+    {
+        return Task::ready(Err(anyhow!("{}", reason)));
+    }
+
     let settings = agent_settings::AgentSettings::get_global(cx);
     let decision = decide_permission_for_path(tool_name, &path_str, settings);
 
