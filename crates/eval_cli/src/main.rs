@@ -715,7 +715,10 @@ async fn run_agent(
         // is listed explicitly here. `ZED_EVAL_DISABLE_TOOLS` strips tools from
         // that set (e.g. `fetch`/`search_web` on air-gapped benchmarks). Keep
         // WRITE_TOOLS in sync with the "write" profile in
-        // assets/settings/default.json.
+        // assets/settings/default.json, minus the tools that need
+        // headless-incompatible infrastructure (`browser`/`network` need Chromium,
+        // `window_control` needs a live window, `container`/`vm`/`secret-tool`/
+        // `debugger` need config or sessions).
         let profile_field = {
             let raw = std::env::var("ZED_EVAL_DISABLE_TOOLS").unwrap_or_default();
             let disabled = raw
@@ -724,9 +727,14 @@ async fn run_agent(
                 .filter(|name| !name.is_empty())
                 .collect::<std::collections::HashSet<String>>();
             const WRITE_TOOLS: &[&str] = &[
+                "memory",
+                "graph",
+                "thread_search",
+                "wait_for_report",
                 "copy_path",
                 "create_directory",
                 "create_thread",
+                "git",
                 "delete_path",
                 "diagnostics",
                 "apply_code_action",
