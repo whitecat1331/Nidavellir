@@ -1447,6 +1447,11 @@ pub struct Thread {
     /// the `rea` context server's tools are exposed regardless of the active
     /// profile's context-server settings, and REA framing is injected.
     rea_mode: bool,
+    /// The `progress.json` of the dev-flow plan this thread is executing, if
+    /// any. Persisted on the thread so a restarted instance re-injects the
+    /// forced plan-state banner, and inherited by subagents so a spawned
+    /// acceptor knows which plan it is executing too.
+    plan_path: Option<String>,
     /// The per-thread REA MCP server, spawned when `rea_mode` is turned on and
     /// stopped when it is turned off or the thread is dropped. Thread-scoped so
     /// two REA threads never share an MCP session.
@@ -1617,6 +1622,7 @@ impl Thread {
             profile_id,
             planning,
             rea_mode: Self::rea_mode_from_environment(),
+            plan_path: None,
             rea_server: None,
             rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace,
@@ -1666,6 +1672,7 @@ impl Thread {
         self.profile_id = parent.profile_id.clone();
         self.planning = parent.planning;
         self.rea_mode = parent.rea_mode;
+        self.plan_path = parent.plan_path.clone();
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -1881,6 +1888,7 @@ impl Thread {
                 cancellation_rx,
                 self.sandbox_grants.clone(),
                 Some(cx.weak_entity()),
+                self.plan_path.clone(),
             );
             tool.replay(input, output, tool_event_stream, cx).log_err();
         }
@@ -2016,6 +2024,7 @@ impl Thread {
             profile_id,
             planning,
             rea_mode,
+            plan_path: db_thread.plan_path,
             rea_server: None,
             rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace: false,
@@ -2137,6 +2146,7 @@ impl Thread {
             profile: Some(self.profile_id.clone()),
             planning: self.planning,
             rea_mode: self.rea_mode,
+            plan_path: self.plan_path.clone(),
             subagent_context: self.subagent_context.clone(),
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -2456,7 +2466,10 @@ impl Thread {
             code_action_store,
         ));
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
-        self.add_tool(GraphTool::new(self.id().to_string()));
+        self.add_tool(GraphTool::new(
+            self.id().to_string(),
+            cx.entity().downgrade(),
+        ));
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
@@ -2509,6 +2522,23 @@ impl Thread {
             return;
         }
         self.planning = planning;
+        cx.notify();
+    }
+
+    /// The dev-flow plan this thread is executing, if any.
+    pub fn plan_path(&self) -> Option<&str> {
+        self.plan_path.as_deref()
+    }
+
+    /// Records (or clears) the dev-flow plan this thread is executing, so the
+    /// request builder can inject the forced plan-state banner and a restart
+    /// can recover it. Notifies so the change persists via the save observer,
+    /// mirroring `set_planning`.
+    pub fn set_plan_path(&mut self, plan_path: Option<String>, cx: &mut Context<Self>) {
+        if self.plan_path == plan_path {
+            return;
+        }
+        self.plan_path = plan_path;
         cx.notify();
     }
 
@@ -4430,6 +4460,21 @@ impl Thread {
             ));
         }
 
+        if let Some(ToolPermissionDecision::Deny(reason)) =
+            crate::plan_gate(tool_name.as_ref(), &[], self.plan_path.as_deref())
+        {
+            return Task::ready((
+                owning_message_ix,
+                LanguageModelToolResult {
+                    tool_use_id,
+                    tool_name,
+                    is_error: true,
+                    content: vec![LanguageModelToolResultContent::Text(Arc::from(reason))],
+                    output: None,
+                },
+            ));
+        }
+
         let fs = self.project.read(cx).fs().clone();
         let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use_id);
         let tool_event_stream = ToolCallEventStream::new(
@@ -4440,6 +4485,7 @@ impl Thread {
             cancellation_rx,
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
+            self.plan_path.clone(),
         );
         tool_event_stream.update_fields(
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
@@ -5248,6 +5294,9 @@ impl Thread {
         }
         if self.planning {
             system_prompt = format!("{}\n\n{system_prompt}", crate::plan_framing());
+        }
+        if let Some(banner) = crate::plan_state_banner(self.plan_path.as_deref()) {
+            system_prompt = format!("{banner}\n\n{system_prompt}");
         }
         if self.rea_mode {
             system_prompt = format!("{}\n\n{system_prompt}", crate::rea_framing());
@@ -7445,6 +7494,9 @@ pub struct ToolCallEventStream {
     /// sandbox grant is recorded so it survives reopening. `None` in tests and
     /// for streams not tied to a live thread.
     thread: Option<WeakEntity<Thread>>,
+    /// The dev-flow plan this thread is executing (plan 1.31 Layer 2), captured
+    /// at construction so the authorization path never re-enters the thread.
+    plan_path: Option<String>,
 }
 
 impl ToolCallEventStream {
@@ -7476,6 +7528,7 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             None,
+            None,
         );
 
         (stream, ToolCallEventStreamReceiver(events_rx))
@@ -7496,6 +7549,7 @@ impl ToolCallEventStream {
             None,
             cancellation_rx,
             Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            None,
             None,
         );
 
@@ -7520,6 +7574,7 @@ impl ToolCallEventStream {
         cancellation_rx: watch::Receiver<bool>,
         sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
         thread: Option<WeakEntity<Thread>>,
+        plan_path: Option<String>,
     ) -> Self {
         Self {
             tool_use_id,
@@ -7529,7 +7584,14 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             thread,
+            plan_path,
         }
+    }
+
+    /// The plan this thread is executing, if any (plan 1.31 Layer 2). Read by the
+    /// authorization paths without re-entering the thread.
+    pub(crate) fn plan_path(&self) -> Option<&str> {
+        self.plan_path.as_deref()
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
@@ -7704,12 +7766,25 @@ impl ToolCallEventStream {
         cx: &mut App,
     ) -> Task<Result<()>> {
         let title = title.into();
+        if let Some(ToolPermissionDecision::Deny(reason)) = crate::plan_gate(
+            &context.tool_name,
+            &context.input_values,
+            self.plan_path.as_deref(),
+        ) {
+            return Task::ready(Err(anyhow!(reason)));
+        }
         let options = context.build_permission_options();
 
         let tool_name = context.tool_name.clone();
         let input_values = context.input_values.clone();
+        let plan_path = self.plan_path.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
+                if let Some(decision) =
+                    crate::plan_gate(&tool_name, &input_values, plan_path.as_deref())
+                {
+                    return decision;
+                }
                 decide_permission_from_settings(
                     &tool_name,
                     &input_values,

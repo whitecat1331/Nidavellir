@@ -477,6 +477,33 @@ pub fn decide_permission_from_settings(
     )
 }
 
+/// Plan 1.31, Layer 2 — the tool-permission gate. While a thread is executing a
+/// plan and the ready node is an unadvanced gate (`verify`/`compile`/`accept`), a
+/// mutating tool is denied until `graph advance` records that node. Returns
+/// `Some(Deny(..))` to block and `None` to fall through to the normal rule.
+///
+/// Kill switch (D3): `ZED_PLAN_GATE=off` disables the gate.
+pub fn plan_gate(
+    tool_name: &str,
+    inputs: &[String],
+    plan_path: Option<&str>,
+) -> Option<ToolPermissionDecision> {
+    let plan_path = plan_path?;
+    if matches!(std::env::var("ZED_PLAN_GATE"), Ok(value) if value.eq_ignore_ascii_case("off")) {
+        return None;
+    }
+    if !crate::gate_covers_tool(tool_name, inputs) {
+        return None;
+    }
+    let next = crate::next_plan_node(plan_path)?;
+    matches!(next.as_str(), "verify" | "compile" | "accept").then(|| {
+        ToolPermissionDecision::Deny(format!(
+            "The dev-flow graph says the next step is `{next}`. Record it with `graph advance` \
+             (or advance `implement` first for a fix) before changing files or git state."
+        ))
+    })
+}
+
 /// Normalizes a path by collapsing `.` and `..` segments without touching the filesystem.
 pub fn normalize_path(raw: &str) -> String {
     let is_absolute = Path::new(raw).has_root();

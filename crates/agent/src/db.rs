@@ -74,6 +74,11 @@ pub struct DbThread {
     pub planning: bool,
     #[serde(default)]
     pub rea_mode: bool,
+    /// The `progress.json` of the dev-flow plan this thread is executing, if
+    /// any. Persisted so a restarted instance can re-inject the forced
+    /// plan-state banner instead of losing the thread's role.
+    #[serde(default)]
+    pub plan_path: Option<String>,
     #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
     #[serde(default)]
@@ -170,6 +175,7 @@ impl SharedThread {
             profile: None,
             planning: false,
             rea_mode: false,
+            plan_path: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -208,6 +214,7 @@ struct DbThreadContentProjection<'a> {
     profile: &'a Option<AgentProfileId>,
     planning: bool,
     rea_mode: bool,
+    plan_path: &'a Option<String>,
     subagent_context: &'a Option<crate::SubagentContext>,
     speed: &'a Option<Speed>,
     thinking_enabled: bool,
@@ -264,6 +271,7 @@ impl DbThread {
             profile: &self.profile,
             planning: self.planning,
             rea_mode: self.rea_mode,
+            plan_path: &self.plan_path,
             subagent_context: &self.subagent_context,
             speed: &self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -452,6 +460,7 @@ impl DbThread {
             profile: thread.profile,
             planning: false,
             rea_mode: false,
+            plan_path: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -1893,6 +1902,7 @@ mod tests {
             profile: None,
             planning: false,
             rea_mode: false,
+            plan_path: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,

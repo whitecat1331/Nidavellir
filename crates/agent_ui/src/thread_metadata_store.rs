@@ -2146,6 +2146,7 @@ mod tests {
             profile: None,
             planning: false,
             rea_mode: false,
+            plan_path: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
