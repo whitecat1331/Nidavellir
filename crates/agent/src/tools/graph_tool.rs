@@ -6,7 +6,7 @@ use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext as _, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext as _, AsyncApp, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1204,7 +1204,7 @@ impl AgentTool for GraphTool {
             let input = input.recv().await.map_err(|error| GraphToolOutput::Error {
                 error: format!("Failed to receive graph tool input: {error}"),
             })?;
-            let path = PathBuf::from(&input.path);
+            let path = resolve_graph_path(&thread, &input.path, cx);
             let path_string = path.to_string_lossy().into_owned();
             let output = cx
                 .background_spawn(async move { run_operation(input, path, Some(executor.as_str())) })
@@ -1219,6 +1219,30 @@ impl AgentTool for GraphTool {
             output
         })
     }
+}
+
+/// Resolve the graph tool's `path`. Absolute paths pass through unchanged; a
+/// relative path is joined onto the worktree root whose name matches its first
+/// component (mirroring the file tools), because a bare relative path would
+/// otherwise resolve against the process CWD — one level above the workspace
+/// the model's file tools see. Headless/eval contexts with no matching root
+/// fall back to the process CWD, preserving the previous behavior.
+fn resolve_graph_path(thread: &WeakEntity<Thread>, raw: &str, cx: &mut AsyncApp) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let resolved = thread
+        .update(cx, |thread, cx| {
+            thread.project.read_with(cx, |project, cx| {
+                project
+                    .find_project_path(path, cx)
+                    .and_then(|project_path| project.absolute_path(&project_path, cx))
+            })
+        })
+        .ok()
+        .flatten();
+    resolved.unwrap_or_else(|| path.to_path_buf())
 }
 
 /// The forced-consultation banner for the plan at `path`. `None` when the
