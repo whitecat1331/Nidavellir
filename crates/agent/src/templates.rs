@@ -133,6 +133,44 @@ pub fn plan_framing() -> &'static str {
      protected refs."
 }
 
+/// The role a dev-flow node requires (1.23's taxonomy, consumed by 1.31's forced
+/// consultation). `promote`/`claim`/`fork` run as the orchestrator/implementer.
+pub fn role_for_node(node: &str) -> &'static str {
+    match node {
+        "plan" => "researcher",
+        "verify" | "compile" => "deterministic-verifier",
+        "accept" => "agent-verifier",
+        "merge" | "release" | "complete" => "human-in-the-loop",
+        _ => "implementer",
+    }
+}
+
+/// The forced-consultation overlay (plan 1.31, Layer 1). When a thread is
+/// executing a plan the harness computes `graph coordinate` and injects this
+/// banner into every request, so the next node and the role it requires are
+/// always in context and cannot be overlooked.
+pub fn plan_state_framing(next_node: &str, done: &[String]) -> String {
+    let done = if done.is_empty() {
+        "none".to_string()
+    } else {
+        done.join(", ")
+    };
+    format!(
+        "## Plan state (forced)\n\n\
+         You are executing a plan through the dev-flow graph. The graph is the \
+         source of truth for the next step — do not ask the user what to do next \
+         between agent-run nodes.\n\n\
+         - Done: {done}\n\
+         - Next node: `{next_node}`\n\
+         - Role to assume: {}\n\n\
+         Before any non-read tool, call `graph coordinate` on the plan's \
+         `progress.json`. Assume the role the node names, then `graph advance` \
+         with the artifact. Pause only at a human gate (`merge`/`release`/`complete`) \
+         or a `pause`/`stop` from `coordinate`.",
+        role_for_node(next_node)
+    )
+}
+
 /// The REA (reverse-engineering) overlay. Unlike plan mode (framing-only),
 /// the `rea_mode` toggle also exposes the `rea` context server's tools; this
 /// text only tells the model how to use them.
@@ -210,6 +248,21 @@ mod tests {
         assert!(mode_framing(builtin_profiles::MINIMAL).is_none());
         assert!(plan_framing().contains("plan-manager"));
         assert!(plan_framing().contains("base-mode permissions"));
+    }
+
+    #[test]
+    fn test_plan_state_framing_and_roles() {
+        assert_eq!(role_for_node("plan"), "researcher");
+        assert_eq!(role_for_node("verify"), "deterministic-verifier");
+        assert_eq!(role_for_node("compile"), "deterministic-verifier");
+        assert_eq!(role_for_node("accept"), "agent-verifier");
+        assert_eq!(role_for_node("merge"), "human-in-the-loop");
+        assert_eq!(role_for_node("implement"), "implementer");
+
+        let framing = plan_state_framing("accept", &["plan".to_string(), "implement".to_string()]);
+        assert!(framing.contains("Next node: `accept`"));
+        assert!(framing.contains("Role to assume: agent-verifier"));
+        assert!(framing.contains("plan, implement"));
     }
 
     #[test]
