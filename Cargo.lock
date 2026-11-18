@@ -22823,6 +22823,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "roadmap_panel",
  "rope",
  "sandbox",
  "search",
