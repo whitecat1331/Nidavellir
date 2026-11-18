@@ -134,10 +134,13 @@ pub fn plan_framing() -> &'static str {
 }
 
 /// The role a dev-flow node requires (1.23's taxonomy, consumed by 1.31's forced
-/// consultation). `promote`/`claim`/`fork` run as the orchestrator/implementer.
+/// consultation). `promote` runs as the orchestrator; `claim`/`fork` as the
+/// thread-coordinator.
 pub fn role_for_node(node: &str) -> &'static str {
     match node {
         "plan" => "researcher",
+        "promote" => "orchestrator",
+        "claim" | "fork" => "thread-coordinator",
         "verify" | "compile" => "deterministic-verifier",
         "accept" => "agent-verifier",
         "merge" | "release" | "complete" => "human-in-the-loop",
@@ -149,12 +152,15 @@ pub fn role_for_node(node: &str) -> &'static str {
 /// executing a plan the harness computes `graph coordinate` and injects this
 /// banner into every request, so the next node and the role it requires are
 /// always in context and cannot be overlooked.
-pub fn plan_state_framing(next_node: &str, done: &[String]) -> String {
+pub fn plan_state_framing(next_node: &str, done: &[String], status: Option<&str>) -> String {
     let done = if done.is_empty() {
         "none".to_string()
     } else {
         done.join(", ")
     };
+    let status_line = status
+        .map(|status| format!("- Status: {status}\n"))
+        .unwrap_or_default();
     format!(
         "## Plan state (forced)\n\n\
          You are executing a plan through the dev-flow graph. The graph is the \
@@ -162,12 +168,13 @@ pub fn plan_state_framing(next_node: &str, done: &[String]) -> String {
          between agent-run nodes.\n\n\
          - Done: {done}\n\
          - Next node: `{next_node}`\n\
-         - Role to assume: {}\n\n\
+         - Role to assume: {role}\n\
+         {status_line}\n\
          Before any non-read tool, call `graph coordinate` on the plan's \
          `progress.json`. Assume the role the node names, then `graph advance` \
          with the artifact. Pause only at a human gate (`merge`/`release`/`complete`) \
          or a `pause`/`stop` from `coordinate`.",
-        role_for_node(next_node)
+        role = role_for_node(next_node),
     )
 }
 
@@ -253,16 +260,23 @@ mod tests {
     #[test]
     fn test_plan_state_framing_and_roles() {
         assert_eq!(role_for_node("plan"), "researcher");
+        assert_eq!(role_for_node("promote"), "orchestrator");
+        assert_eq!(role_for_node("claim"), "thread-coordinator");
+        assert_eq!(role_for_node("fork"), "thread-coordinator");
         assert_eq!(role_for_node("verify"), "deterministic-verifier");
         assert_eq!(role_for_node("compile"), "deterministic-verifier");
         assert_eq!(role_for_node("accept"), "agent-verifier");
         assert_eq!(role_for_node("merge"), "human-in-the-loop");
         assert_eq!(role_for_node("implement"), "implementer");
 
-        let framing = plan_state_framing("accept", &["plan".to_string(), "implement".to_string()]);
+        let framing = plan_state_framing("accept", &["plan".to_string(), "implement".to_string()], None);
         assert!(framing.contains("Next node: `accept`"));
         assert!(framing.contains("Role to assume: agent-verifier"));
         assert!(framing.contains("plan, implement"));
+        assert!(!framing.contains("- Status:"));
+
+        let with_status = plan_state_framing("accept", &["plan".to_string()], Some("retry it"));
+        assert!(with_status.contains("- Status: retry it"));
     }
 
     #[test]

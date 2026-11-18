@@ -45,7 +45,7 @@ impl AgentTool for ApplyCodeActionTool {
     const NAME: &'static str = "apply_code_action";
 
     fn kind() -> acp::ToolKind {
-        acp::ToolKind::Other
+        acp::ToolKind::Edit
     }
 
     fn initial_title(

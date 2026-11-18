@@ -305,7 +305,9 @@ enum ArtifactContract {
 fn artifact_contract(node: &str) -> ArtifactContract {
     match node {
         // A claim produces a workstream id; a fork produces a branch name.
-        "claim" | "fork" => ArtifactContract::NonEmpty,
+        // Accept produces an evidence reference (a VERIFY report + live call),
+        // never an empty "I ran it" claim.
+        "claim" | "fork" | "accept" => ArtifactContract::NonEmpty,
         // Compile/merge/release produce a build, merge, or release commit sha.
         "compile" | "merge" | "release" => ArtifactContract::CommitSha,
         _ => ArtifactContract::Any,
@@ -372,6 +374,19 @@ struct Blocker {
     spent_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_failure: Option<FailureRecord>,
+    /// Which human gate is blocked, when `edge == "human_gate"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+}
+
+/// A one-shot authorization for a human gate: minted by `resume` when a human
+/// approves a blocked gate, and consumed by `advance`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthorizedGate {
+    node: String,
+    /// The human's approval, recorded for the trace (e.g. "approved in thread N").
+    artifact: String,
+    at: String,
 }
 
 /// The node currently being executed. Its active window is the interval from
@@ -412,6 +427,8 @@ struct GraphState {
     back_edges: Vec<BackEdgeTraversal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<BurnWarning>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorized: Option<AuthorizedGate>,
 }
 
 /// The decision `coordinate` returns. `dispatch` and `continue` advance the
@@ -459,6 +476,23 @@ fn retry_candidate(state: &GraphState) -> Option<String> {
                 .any(|entry| entry.node == **node && entry.failed)
         })
         .map(|node| (*node).to_string())
+}
+
+/// The node `coordinate` would act on next, computed without its side effects
+/// (`coordinate` persists a blocker when it pauses). Mirrors `coordinate`'s
+/// precedence — a blocked human gate, then an active node, then a
+/// recorded-but-failed node to retry, then the first ready node — so the banner
+/// and the tool gate can never disagree with `coordinate`.
+fn next_decision_node(state: &GraphState) -> Option<String> {
+    if let Some(blocker) = &state.blocker {
+        if let Some(node) = &blocker.node {
+            return Some(node.clone());
+        }
+    }
+    if let Some(active) = &state.active {
+        return Some(active.node.clone());
+    }
+    retry_candidate(state).or_else(|| derive_next(state).into_iter().next())
 }
 
 fn transitive_prereqs(node: &str, out: &mut Vec<&'static str>) {
@@ -743,10 +777,16 @@ fn brief_for(node: &str, plan: &str, retrying: bool) -> String {
     } else {
         ""
     };
+    let accept_note = if node == "accept" {
+        " `accept` requires a live launch of the artifact plus a real exercise of the feature — \
+         a headless verifier verdict alone is not acceptance."
+    } else {
+        ""
+    };
     format!(
         "Dispatch {node} for {plan} to a fresh executor. It must act on external evidence, \
          return the node's declared artifact, and record its cost from usage deltas — never a \
-         self-report.{retry_note}"
+         self-report.{retry_note}{accept_note}"
     )
 }
 
@@ -773,6 +813,15 @@ fn pause_decision(
 /// A stop is persisted as a resumable blocker; only `resume` clears it.
 fn coordinate(state: &mut GraphState, ask: bool, now: DateTime<Utc>) -> Decision {
     if let Some(blocker) = &state.blocker {
+        // A human gate stays a pause, not a stop: it is a decision, not a break.
+        if blocker.edge == "human_gate" {
+            return pause_decision(
+                state,
+                blocker.node.clone(),
+                Some("human_gate"),
+                blocker.reason.clone(),
+            );
+        }
         return Decision {
             action: "stop".to_string(),
             node: None,
@@ -791,6 +840,7 @@ fn coordinate(state: &mut GraphState, ask: bool, now: DateTime<Utc>) -> Decision
             reason: decision.reason.clone(),
             spent_tokens: decision.spent_tokens,
             last_failure: decision.last_failure.clone(),
+            node: None,
         });
         state.next.clear();
         return decision;
@@ -856,11 +906,23 @@ fn coordinate(state: &mut GraphState, ask: bool, now: DateTime<Utc>) -> Decision
     };
 
     if HUMAN_GATES.contains(&node.as_str()) {
+        let spent = spent_tokens(state);
+        state.blocker = Some(Blocker {
+            edge: "human_gate".to_string(),
+            reason: format!(
+                "{node} is a human gate — automatic traversal halts until a human authorizes it via `resume`"
+            ),
+            spent_tokens: spent,
+            last_failure: None,
+            node: Some(node.to_string()),
+        });
         return pause_decision(
             state,
-            Some(node.clone()),
+            Some(node.to_string()),
             Some("human_gate"),
-            format!("{node} is a human gate — automatic traversal halts"),
+            format!(
+                "{node} is a human gate — automatic traversal halts; authorize it via `resume`"
+            ),
         );
     }
 
@@ -926,7 +988,7 @@ fn heartbeat(state: &mut GraphState, now: DateTime<Utc>) -> Result<(), String> {
     Ok(())
 }
 
-fn resume(state: &mut GraphState, artifact: &str) -> Result<String, String> {
+fn resume(state: &mut GraphState, artifact: &str, now: DateTime<Utc>) -> Result<String, String> {
     if artifact.trim().is_empty() {
         return Err(
             "resuming a stopped plan needs a non-empty artifact naming the human decision"
@@ -947,12 +1009,46 @@ fn resume(state: &mut GraphState, artifact: &str) -> Result<String, String> {
         ),
         None => String::new(),
     };
+
+    // A human gate's resume is the human's authorization: mint a one-shot token
+    // that `advance` consumes, so the gate cannot be auto-advanced.
+    if blocker.edge == "human_gate" {
+        let node = blocker.node.unwrap_or_default();
+        state.authorized = Some(AuthorizedGate {
+            node: node.clone(),
+            artifact: artifact.to_string(),
+            at: now.to_rfc3339(),
+        });
+        return Ok(format!(
+            "authorized {node} ({artifact}); a single `advance {node}` may now proceed — {reset}next: {}",
+            state.next.join(", ")
+        ));
+    }
+
     Ok(format!(
         "resumed after {:?} — spent {} tokens; {reset}next: {}",
         blocker.edge,
         blocker.spent_tokens,
         state.next.join(", ")
     ))
+}
+
+/// Refuse to complete a human gate that has not been authorized by a prior
+/// `resume`; consume the one-shot authorization on success.
+fn authorize_human_gate(state: &mut GraphState, node: &str) -> Result<(), String> {
+    if !HUMAN_GATES.contains(&node) {
+        return Ok(());
+    }
+    match state.authorized.take() {
+        Some(authorized) if authorized.node.as_str() == node => Ok(()),
+        Some(authorized) => Err(format!(
+            "{node} is a human gate but {other} was authorized — authorize {node} via `resume` first",
+            other = authorized.node
+        )),
+        None => Err(format!(
+            "{node} is a human gate — `coordinate` pauses there; the human must authorize it via `resume` before `advance`"
+        )),
+    }
 }
 
 /// The edge guard: a transition is refused unless every transitive prerequisite
@@ -1131,6 +1227,10 @@ fn advance(
         });
     }
 
+    // A human gate is the one transition the coordinator pauses at; `advance`
+    // must not complete it unless a prior `resume` authorized it (one-shot).
+    authorize_human_gate(state, node)?;
+
     state.active = None;
     state.warnings.extend(warnings);
     state.current = Some(node.to_string());
@@ -1206,12 +1306,19 @@ impl AgentTool for GraphTool {
             })?;
             let path = resolve_graph_path(&thread, &input.path, cx);
             let path_string = path.to_string_lossy().into_owned();
+            let consulted = matches!(
+                input.operation,
+                GraphOperation::Read | GraphOperation::Coordinate
+            );
             let output = cx
                 .background_spawn(async move { run_operation(input, path, Some(executor.as_str())) })
                 .await;
             if output.is_ok() {
                 if let Err(error) = thread.update(cx, |thread, cx| {
                     thread.set_plan_path(Some(path_string), cx);
+                    if consulted {
+                        thread.record_graph_consulted();
+                    }
                 }) {
                     log::error!("[GRAPH] failed to record plan path on thread: {error:#}");
                 }
@@ -1250,39 +1357,61 @@ fn resolve_graph_path(thread: &WeakEntity<Thread>, raw: &str, cx: &mut AsyncApp)
 /// node left to run — a banner must never fail a request, and a completed plan
 /// must not tell the agent to assume an implementation role.
 pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
-    let state = load_state(Path::new(path?)).ok()?;
+    let Some(path) = path else {
+        return None;
+    };
+    let state = match load_state(Path::new(path)) {
+        Ok(state) => state,
+        // Degrade, don't vanish: a recorded-but-unreadable plan still tells the
+        // agent to consult the graph instead of silently dropping the banner.
+        Err(_) => {
+            return Some(
+                "## Plan state (forced)\n\n\
+                 You are executing a plan through the dev-flow graph, but the plan's \
+                 `progress.json` could not be read. Run `graph read` on it before making \
+                 any change."
+                    .to_string(),
+            );
+        }
+    };
     let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
-    let next = derive_next(&state);
-    let next = next.first()?;
-    Some(crate::plan_state_framing(next, &done))
+    let next = next_decision_node(&state)?;
+    let status = if let Some(blocker) = &state.blocker {
+        if blocker.edge == "human_gate" {
+            Some("a human gate is waiting for authorization — pause and ask, then `graph resume`")
+        } else {
+            Some("blocked — `graph resume` with the human's decision")
+        }
+    } else if state.active.is_some() {
+        Some("a node is active — `graph coordinate` returns `continue`")
+    } else if retry_candidate(&state).is_some() {
+        Some("a gate failed on a previous attempt — retry it before advancing")
+    } else {
+        None
+    };
+    Some(crate::plan_state_framing(&next, &done, status))
 }
 
 /// The next ready node for a plan's `progress.json`, or `None` when the state is
 /// unreadable. Used by the Layer 2 tool-permission gate (plan 1.31).
 pub fn next_plan_node(plan_path: &str) -> Option<String> {
     let state = load_state(Path::new(plan_path)).ok()?;
-    derive_next(&state).into_iter().next()
+    next_decision_node(&state)
 }
 
 /// Tools that mutate source or working-tree state. The plan gate blocks these
 /// while a gate node is ready and unadvanced. `git` is matched by operation
 /// instead, because its read-only operations must stay available.
-const PLAN_GATED_TOOLS: &[&str] = &[
-    "write_file",
-    "edit_file",
-    "create_directory",
-    "delete_path",
-    "copy_path",
-    "move_path",
-    "rename_symbol",
-    "apply_code_action",
-];
-
 const PLAN_GATED_GIT_OPERATIONS: &[&str] = &["commit", "merge", "push"];
 
-/// Whether this tool call is a mutation the plan gate covers.
-pub fn gate_covers_tool(tool_name: &str, input_values: &[String]) -> bool {
-    if PLAN_GATED_TOOLS.contains(&tool_name) {
+/// Whether this tool call is a mutation the plan gate covers. Source-mutating
+/// tools are caught by their `ToolKind` (`Edit`/`Delete`/`Move`); git is caught
+/// by operation because its kind is `Execute` regardless of read vs write.
+pub fn gate_covers_tool(tool_name: &str, kind: acp::ToolKind, input_values: &[String]) -> bool {
+    if matches!(
+        kind,
+        acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move
+    ) {
         return true;
     }
     tool_name == "git"
@@ -1346,6 +1475,7 @@ fn run_operation(
                 active: None,
                 back_edges: Vec::new(),
                 warnings: Vec::new(),
+                authorized: None,
             };
             save_state(&path, &state)?;
             Ok(GraphToolOutput::Success {
@@ -1424,8 +1554,8 @@ fn run_operation(
         GraphOperation::Resume => {
             let artifact = input.artifact.unwrap_or_default();
             let mut state = load_state(&path)?;
-            let message =
-                resume(&mut state, &artifact).map_err(|error| GraphToolOutput::Error { error })?;
+            let message = resume(&mut state, &artifact, Utc::now())
+                .map_err(|error| GraphToolOutput::Error { error })?;
             save_state(&path, &state)?;
             Ok(GraphToolOutput::Success {
                 message: format!("{message}\nstate: {}", state_json(&state)),
@@ -1480,6 +1610,7 @@ mod tests {
             active: None,
             back_edges: Vec::new(),
             warnings: Vec::new(),
+            authorized: None,
         }
     }
 
@@ -1499,10 +1630,32 @@ mod tests {
             + chrono::Duration::seconds(seconds)
     }
 
+    /// Drive the human-gate pause → resume → authorize sequence a test needs
+    /// before advancing `merge`/`release`/`complete`.
+    fn mint_authorization(state: &mut GraphState, node: &str) {
+        coordinate(state, false, at(0));
+        resume(state, "approved in test", at(1)).unwrap();
+        assert_eq!(state.authorized.as_ref().map(|a| a.node.as_str()), Some(node));
+    }
+
+    /// Set a gate authorization directly, for tests that exercise the D17 edge
+    /// guard (where the coordinator would prefer a retry over pausing at the
+    /// gate), so the authorization path is not what is under test.
+    fn force_authorization(state: &mut GraphState, node: &str) {
+        state.authorized = Some(AuthorizedGate {
+            node: node.to_string(),
+            artifact: "approved in test".to_string(),
+            at: at(1).to_rfc3339(),
+        });
+    }
+
     #[test]
     fn happy_path_walks_the_route() {
         let mut state = fresh();
         for node in ROUTE {
+            if HUMAN_GATES.contains(node) {
+                mint_authorization(&mut state, node);
+            }
             advance(&mut state, node, SHA, false, false, None, None, None, None).unwrap();
         }
         assert_eq!(state.current.as_deref(), Some("complete"));
@@ -1562,6 +1715,7 @@ mod tests {
         ] {
             step(&mut state, node);
         }
+        mint_authorization(&mut state, "merge");
         advance(&mut state, "merge", SHA, true, false, None, None, None, None).unwrap();
         assert_eq!(state.current.as_deref(), Some("merge"));
     }
@@ -1586,6 +1740,7 @@ mod tests {
         .unwrap();
         step(&mut state, "compile");
         step(&mut state, "accept");
+        force_authorization(&mut state, "merge");
         advance(&mut state, "merge", SHA, false, false, None, None, None, None).unwrap();
         assert_eq!(state.current.as_deref(), Some("merge"));
     }
@@ -1674,17 +1829,19 @@ mod tests {
     fn plan_gate_covers_mutations_only() {
         let input = |value: &str| vec![value.to_string()];
 
-        assert!(gate_covers_tool("write_file", &[]));
-        assert!(gate_covers_tool("edit_file", &[]));
-        assert!(gate_covers_tool("delete_path", &[]));
-        assert!(gate_covers_tool("git", &input("operation:commit protected:false")));
-        assert!(gate_covers_tool("git", &input("operation:merge ref:feature")));
-        assert!(gate_covers_tool("git", &input("operation:push")));
+        assert!(gate_covers_tool("write_file", acp::ToolKind::Edit, &[]));
+        assert!(gate_covers_tool("edit_file", acp::ToolKind::Edit, &[]));
+        assert!(gate_covers_tool("delete_path", acp::ToolKind::Delete, &[]));
+        // A mutating kind is refused even for a tool not on any name list.
+        assert!(gate_covers_tool("some_future_tool", acp::ToolKind::Move, &[]));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:commit protected:false")));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:merge ref:feature")));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:push")));
 
-        assert!(!gate_covers_tool("git", &input("operation:status")));
-        assert!(!gate_covers_tool("git", &input("operation:diff")));
-        assert!(!gate_covers_tool("read_file", &[]));
-        assert!(!gate_covers_tool("terminal", &[]));
+        assert!(!gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:status")));
+        assert!(!gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:diff")));
+        assert!(!gate_covers_tool("read_file", acp::ToolKind::Read, &[]));
+        assert!(!gate_covers_tool("terminal", acp::ToolKind::Execute, &[]));
     }
 
     #[test]
@@ -1712,6 +1869,63 @@ mod tests {
         state.done.push(done_entry("accept"));
         save_state(&path, &state).unwrap();
         assert_eq!(next_plan_node(&plan_path).as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn failed_gate_names_the_retry_not_the_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+            step(&mut state, node);
+        }
+        advance(
+            &mut state,
+            "accept",
+            "failed accept",
+            false,
+            true,
+            Some(failed_record()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        save_state(&path, &state).unwrap();
+        let plan_path = path.to_string_lossy().into_owned();
+
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("accept"));
+
+        let banner = plan_state_banner(path.to_str()).expect("banner for a retrying plan");
+        assert!(banner.contains("Next node: `accept`"));
+        assert!(!banner.contains("Next node: `merge`"));
+        assert!(banner.contains("retry it before advancing"));
+    }
+
+    #[test]
+    fn accept_brief_names_the_live_launch_requirement() {
+        assert!(brief_for("accept", "PLAN", false).contains("live launch"));
+    }
+
+    #[test]
+    fn accept_refuses_an_empty_artifact() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+            step(&mut state, node);
+        }
+        let error = advance(&mut state, "accept", "", false, false, None, None, None, None)
+            .unwrap_err();
+        assert!(error.contains("non-empty artifact"));
+    }
+
+    #[test]
+    fn unreadable_plan_yields_a_degraded_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let banner = plan_state_banner(path.to_str()).expect("a degraded banner, not None");
+        assert!(banner.contains("could not be read"));
+        assert!(banner.contains("graph read"));
     }
 
     #[test]
@@ -1926,6 +2140,65 @@ mod tests {
         assert_eq!(decision.node.as_deref(), Some("merge"));
         assert_eq!(decision.predicate.as_deref(), Some("human_gate"));
         assert!(!decision.fresh_executor);
+    }
+
+    #[test]
+    fn coordinate_persists_a_human_gate_blocker() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept"]
+        {
+            step(&mut state, node);
+        }
+        let decision = coordinate(&mut state, false, at(0));
+        assert_eq!(decision.action, "pause");
+        assert_eq!(decision.node.as_deref(), Some("merge"));
+        let blocker = state.blocker.as_ref().expect("human gate persists a blocker");
+        assert_eq!(blocker.edge, "human_gate");
+        assert_eq!(blocker.node.as_deref(), Some("merge"));
+        // A repeat coordinate keeps pausing — a gate is a decision, not a break.
+        let again = coordinate(&mut state, false, at(1));
+        assert_eq!(again.action, "pause");
+        assert_eq!(again.predicate.as_deref(), Some("human_gate"));
+    }
+
+    #[test]
+    fn advance_refuses_human_gate_without_authorization() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept"]
+        {
+            step(&mut state, node);
+        }
+        let error =
+            advance(&mut state, "merge", SHA, false, false, None, None, None, None).unwrap_err();
+        assert!(error.contains("human gate"), "error was: {error}");
+        assert!(error.contains("resume"), "error was: {error}");
+    }
+
+    #[test]
+    fn resume_authorizes_then_advance_consumes_one_shot() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept"]
+        {
+            step(&mut state, node);
+        }
+        mint_authorization(&mut state, "merge");
+        advance(&mut state, "merge", SHA, false, false, None, None, None, None).unwrap();
+        assert_eq!(state.current.as_deref(), Some("merge"));
+        assert!(state.authorized.is_none(), "the authorization is one-shot");
+        // The next gate is not authorized.
+        let error =
+            advance(&mut state, "release", SHA, false, false, None, None, None, None).unwrap_err();
+        assert!(error.contains("human gate"), "error was: {error}");
+    }
+
+    #[test]
+    fn stop_resume_does_not_mint_a_gate_authorization() {
+        let mut state = fresh();
+        begin(&mut state, "plan", "thread-7", at(0)).unwrap();
+        coordinate(&mut state, false, at(STALL_SECONDS + 1));
+        assert!(state.blocker.is_some());
+        resume(&mut state, "human reviewed the stall", at(0)).unwrap();
+        assert!(state.authorized.is_none(), "a stop resume must not authorize a gate");
     }
 
     #[test]
@@ -2240,7 +2513,7 @@ mod tests {
         assert!(state.blocker.is_some());
         let resume_error = coordinate(&mut state, false, at(STALL_SECONDS + 2));
         assert_eq!(resume_error.action, "stop");
-        resume(&mut state, "human reviewed the stall").unwrap();
+        resume(&mut state, "human reviewed the stall", at(0)).unwrap();
         let decision = coordinate(&mut state, false, at(STALL_SECONDS + 3));
         assert_eq!(decision.action, "dispatch");
     }
@@ -2438,9 +2711,9 @@ mod tests {
         let mut state = fresh();
         begin(&mut state, "plan", "thread-7", at(0)).unwrap();
         coordinate(&mut state, false, at(STALL_SECONDS + 1));
-        assert!(resume(&mut state, "  ").is_err());
+        assert!(resume(&mut state, "  ", at(0)).is_err());
         assert!(state.blocker.is_some());
-        resume(&mut state, "human decision").unwrap();
+        resume(&mut state, "human decision", at(0)).unwrap();
         assert!(state.blocker.is_none());
     }
 
