@@ -637,7 +637,7 @@ pub fn authorize_file_edit(
     // shortcut, so a mutating edit is refused while a verification gate is the
     // unadvanced ready node.
     if let Some(ToolPermissionDecision::Deny(reason)) =
-        crate::plan_gate(tool_name, &[path_str.to_string()], event_stream.plan_path())
+        crate::plan_gate(tool_name, acp::ToolKind::Edit, &[path_str.to_string()], event_stream.plan_path())
     {
         return Task::ready(Err(anyhow!("{}", reason)));
     }

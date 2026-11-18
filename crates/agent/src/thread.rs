@@ -1452,6 +1452,9 @@ pub struct Thread {
     /// forced plan-state banner, and inherited by subagents so a spawned
     /// acceptor knows which plan it is executing too.
     plan_path: Option<String>,
+    /// Whether `graph coordinate`/`read` has run this turn, satisfying the
+    /// mutation turnstile (plan 1.33 Phase 6). Reset at the start of each turn.
+    graph_consulted_this_turn: bool,
     /// The per-thread REA MCP server, spawned when `rea_mode` is turned on and
     /// stopped when it is turned off or the thread is dropped. Thread-scoped so
     /// two REA threads never share an MCP session.
@@ -1623,6 +1626,7 @@ impl Thread {
             planning,
             rea_mode: Self::rea_mode_from_environment(),
             plan_path: None,
+            graph_consulted_this_turn: false,
             rea_server: None,
             rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace,
@@ -2025,6 +2029,7 @@ impl Thread {
             planning,
             rea_mode,
             plan_path: db_thread.plan_path,
+            graph_consulted_this_turn: false,
             rea_server: None,
             rea_tools: BTreeMap::default(),
             profile_downgraded_for_restricted_workspace: false,
@@ -2540,6 +2545,12 @@ impl Thread {
         }
         self.plan_path = plan_path;
         cx.notify();
+    }
+
+    /// Records that the graph was consulted (`graph read`/`coordinate`) this
+    /// turn, satisfying the mutation turnstile (plan 1.33 Phase 6).
+    pub fn record_graph_consulted(&mut self) {
+        self.graph_consulted_this_turn = true;
     }
 
     /// Whether REA mode is on for this thread.
@@ -3226,6 +3237,8 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        // A new turn must consult the graph again before mutating.
+        self.graph_consulted_this_turn = false;
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
@@ -4460,8 +4473,32 @@ impl Thread {
             ));
         }
 
+        // Phase 6 mutation turnstile: while a plan is active, the first
+        // source-mutating tool of a turn is refused until `graph coordinate`/
+        // `read` has run this turn.
+        if self.plan_path.is_some()
+            && !self.graph_consulted_this_turn
+            && matches!(
+                tool.kind(),
+                acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move
+            )
+        {
+            return Task::ready((
+                owning_message_ix,
+                LanguageModelToolResult {
+                    tool_use_id,
+                    tool_name,
+                    is_error: true,
+                    content: vec![LanguageModelToolResultContent::Text(Arc::from(
+                        "consult `graph coordinate` on the plan's `progress.json` before mutating",
+                    ))],
+                    output: None,
+                },
+            ));
+        }
+
         if let Some(ToolPermissionDecision::Deny(reason)) =
-            crate::plan_gate(tool_name.as_ref(), &[], self.plan_path.as_deref())
+            crate::plan_gate(tool_name.as_ref(), tool.kind(), &[], self.plan_path.as_deref())
         {
             return Task::ready((
                 owning_message_ix,
@@ -7767,6 +7804,7 @@ impl ToolCallEventStream {
         let title = title.into();
         if let Some(ToolPermissionDecision::Deny(reason)) = crate::plan_gate(
             &context.tool_name,
+            acp::ToolKind::Other,
             &context.input_values,
             self.plan_path.as_deref(),
         ) {
@@ -7779,8 +7817,12 @@ impl ToolCallEventStream {
         let plan_path = self.plan_path.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                if let Some(decision) =
-                    crate::plan_gate(&tool_name, &input_values, plan_path.as_deref())
+                if let Some(decision) = crate::plan_gate(
+                    &tool_name,
+                    acp::ToolKind::Other,
+                    &input_values,
+                    plan_path.as_deref(),
+                )
                 {
                     return decision;
                 }

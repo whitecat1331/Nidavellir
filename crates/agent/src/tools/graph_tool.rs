@@ -305,7 +305,9 @@ enum ArtifactContract {
 fn artifact_contract(node: &str) -> ArtifactContract {
     match node {
         // A claim produces a workstream id; a fork produces a branch name.
-        "claim" | "fork" => ArtifactContract::NonEmpty,
+        // Accept produces an evidence reference (a VERIFY report + live call),
+        // never an empty "I ran it" claim.
+        "claim" | "fork" | "accept" => ArtifactContract::NonEmpty,
         // Compile/merge/release produce a build, merge, or release commit sha.
         "compile" | "merge" | "release" => ArtifactContract::CommitSha,
         _ => ArtifactContract::Any,
@@ -474,6 +476,23 @@ fn retry_candidate(state: &GraphState) -> Option<String> {
                 .any(|entry| entry.node == **node && entry.failed)
         })
         .map(|node| (*node).to_string())
+}
+
+/// The node `coordinate` would act on next, computed without its side effects
+/// (`coordinate` persists a blocker when it pauses). Mirrors `coordinate`'s
+/// precedence — a blocked human gate, then an active node, then a
+/// recorded-but-failed node to retry, then the first ready node — so the banner
+/// and the tool gate can never disagree with `coordinate`.
+fn next_decision_node(state: &GraphState) -> Option<String> {
+    if let Some(blocker) = &state.blocker {
+        if let Some(node) = &blocker.node {
+            return Some(node.clone());
+        }
+    }
+    if let Some(active) = &state.active {
+        return Some(active.node.clone());
+    }
+    retry_candidate(state).or_else(|| derive_next(state).into_iter().next())
 }
 
 fn transitive_prereqs(node: &str, out: &mut Vec<&'static str>) {
@@ -758,10 +777,16 @@ fn brief_for(node: &str, plan: &str, retrying: bool) -> String {
     } else {
         ""
     };
+    let accept_note = if node == "accept" {
+        " `accept` requires a live launch of the artifact plus a real exercise of the feature — \
+         a headless verifier verdict alone is not acceptance."
+    } else {
+        ""
+    };
     format!(
         "Dispatch {node} for {plan} to a fresh executor. It must act on external evidence, \
          return the node's declared artifact, and record its cost from usage deltas — never a \
-         self-report.{retry_note}"
+         self-report.{retry_note}{accept_note}"
     )
 }
 
@@ -1281,12 +1306,19 @@ impl AgentTool for GraphTool {
             })?;
             let path = resolve_graph_path(&thread, &input.path, cx);
             let path_string = path.to_string_lossy().into_owned();
+            let consulted = matches!(
+                input.operation,
+                GraphOperation::Read | GraphOperation::Coordinate
+            );
             let output = cx
                 .background_spawn(async move { run_operation(input, path, Some(executor.as_str())) })
                 .await;
             if output.is_ok() {
                 if let Err(error) = thread.update(cx, |thread, cx| {
                     thread.set_plan_path(Some(path_string), cx);
+                    if consulted {
+                        thread.record_graph_consulted();
+                    }
                 }) {
                     log::error!("[GRAPH] failed to record plan path on thread: {error:#}");
                 }
@@ -1325,39 +1357,61 @@ fn resolve_graph_path(thread: &WeakEntity<Thread>, raw: &str, cx: &mut AsyncApp)
 /// node left to run — a banner must never fail a request, and a completed plan
 /// must not tell the agent to assume an implementation role.
 pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
-    let state = load_state(Path::new(path?)).ok()?;
+    let Some(path) = path else {
+        return None;
+    };
+    let state = match load_state(Path::new(path)) {
+        Ok(state) => state,
+        // Degrade, don't vanish: a recorded-but-unreadable plan still tells the
+        // agent to consult the graph instead of silently dropping the banner.
+        Err(_) => {
+            return Some(
+                "## Plan state (forced)\n\n\
+                 You are executing a plan through the dev-flow graph, but the plan's \
+                 `progress.json` could not be read. Run `graph read` on it before making \
+                 any change."
+                    .to_string(),
+            );
+        }
+    };
     let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
-    let next = derive_next(&state);
-    let next = next.first()?;
-    Some(crate::plan_state_framing(next, &done))
+    let next = next_decision_node(&state)?;
+    let status = if let Some(blocker) = &state.blocker {
+        if blocker.edge == "human_gate" {
+            Some("a human gate is waiting for authorization — pause and ask, then `graph resume`")
+        } else {
+            Some("blocked — `graph resume` with the human's decision")
+        }
+    } else if state.active.is_some() {
+        Some("a node is active — `graph coordinate` returns `continue`")
+    } else if retry_candidate(&state).is_some() {
+        Some("a gate failed on a previous attempt — retry it before advancing")
+    } else {
+        None
+    };
+    Some(crate::plan_state_framing(&next, &done, status))
 }
 
 /// The next ready node for a plan's `progress.json`, or `None` when the state is
 /// unreadable. Used by the Layer 2 tool-permission gate (plan 1.31).
 pub fn next_plan_node(plan_path: &str) -> Option<String> {
     let state = load_state(Path::new(plan_path)).ok()?;
-    derive_next(&state).into_iter().next()
+    next_decision_node(&state)
 }
 
 /// Tools that mutate source or working-tree state. The plan gate blocks these
 /// while a gate node is ready and unadvanced. `git` is matched by operation
 /// instead, because its read-only operations must stay available.
-const PLAN_GATED_TOOLS: &[&str] = &[
-    "write_file",
-    "edit_file",
-    "create_directory",
-    "delete_path",
-    "copy_path",
-    "move_path",
-    "rename_symbol",
-    "apply_code_action",
-];
-
 const PLAN_GATED_GIT_OPERATIONS: &[&str] = &["commit", "merge", "push"];
 
-/// Whether this tool call is a mutation the plan gate covers.
-pub fn gate_covers_tool(tool_name: &str, input_values: &[String]) -> bool {
-    if PLAN_GATED_TOOLS.contains(&tool_name) {
+/// Whether this tool call is a mutation the plan gate covers. Source-mutating
+/// tools are caught by their `ToolKind` (`Edit`/`Delete`/`Move`); git is caught
+/// by operation because its kind is `Execute` regardless of read vs write.
+pub fn gate_covers_tool(tool_name: &str, kind: acp::ToolKind, input_values: &[String]) -> bool {
+    if matches!(
+        kind,
+        acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move
+    ) {
         return true;
     }
     tool_name == "git"
@@ -1775,17 +1829,19 @@ mod tests {
     fn plan_gate_covers_mutations_only() {
         let input = |value: &str| vec![value.to_string()];
 
-        assert!(gate_covers_tool("write_file", &[]));
-        assert!(gate_covers_tool("edit_file", &[]));
-        assert!(gate_covers_tool("delete_path", &[]));
-        assert!(gate_covers_tool("git", &input("operation:commit protected:false")));
-        assert!(gate_covers_tool("git", &input("operation:merge ref:feature")));
-        assert!(gate_covers_tool("git", &input("operation:push")));
+        assert!(gate_covers_tool("write_file", acp::ToolKind::Edit, &[]));
+        assert!(gate_covers_tool("edit_file", acp::ToolKind::Edit, &[]));
+        assert!(gate_covers_tool("delete_path", acp::ToolKind::Delete, &[]));
+        // A mutating kind is refused even for a tool not on any name list.
+        assert!(gate_covers_tool("some_future_tool", acp::ToolKind::Move, &[]));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:commit protected:false")));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:merge ref:feature")));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:push")));
 
-        assert!(!gate_covers_tool("git", &input("operation:status")));
-        assert!(!gate_covers_tool("git", &input("operation:diff")));
-        assert!(!gate_covers_tool("read_file", &[]));
-        assert!(!gate_covers_tool("terminal", &[]));
+        assert!(!gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:status")));
+        assert!(!gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:diff")));
+        assert!(!gate_covers_tool("read_file", acp::ToolKind::Read, &[]));
+        assert!(!gate_covers_tool("terminal", acp::ToolKind::Execute, &[]));
     }
 
     #[test]
@@ -1813,6 +1869,63 @@ mod tests {
         state.done.push(done_entry("accept"));
         save_state(&path, &state).unwrap();
         assert_eq!(next_plan_node(&plan_path).as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn failed_gate_names_the_retry_not_the_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+            step(&mut state, node);
+        }
+        advance(
+            &mut state,
+            "accept",
+            "failed accept",
+            false,
+            true,
+            Some(failed_record()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        save_state(&path, &state).unwrap();
+        let plan_path = path.to_string_lossy().into_owned();
+
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("accept"));
+
+        let banner = plan_state_banner(path.to_str()).expect("banner for a retrying plan");
+        assert!(banner.contains("Next node: `accept`"));
+        assert!(!banner.contains("Next node: `merge`"));
+        assert!(banner.contains("retry it before advancing"));
+    }
+
+    #[test]
+    fn accept_brief_names_the_live_launch_requirement() {
+        assert!(brief_for("accept", "PLAN", false).contains("live launch"));
+    }
+
+    #[test]
+    fn accept_refuses_an_empty_artifact() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+            step(&mut state, node);
+        }
+        let error = advance(&mut state, "accept", "", false, false, None, None, None, None)
+            .unwrap_err();
+        assert!(error.contains("non-empty artifact"));
+    }
+
+    #[test]
+    fn unreadable_plan_yields_a_degraded_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let banner = plan_state_banner(path.to_str()).expect("a degraded banner, not None");
+        assert!(banner.contains("could not be read"));
+        assert!(banner.contains("graph read"));
     }
 
     #[test]
