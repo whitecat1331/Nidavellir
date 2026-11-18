@@ -305,7 +305,9 @@ enum ArtifactContract {
 fn artifact_contract(node: &str) -> ArtifactContract {
     match node {
         // A claim produces a workstream id; a fork produces a branch name.
-        "claim" | "fork" => ArtifactContract::NonEmpty,
+        // Accept produces an evidence reference (a VERIFY report + live call),
+        // never an empty "I ran it" claim.
+        "claim" | "fork" | "accept" => ArtifactContract::NonEmpty,
         // Compile/merge/release produce a build, merge, or release commit sha.
         "compile" | "merge" | "release" => ArtifactContract::CommitSha,
         _ => ArtifactContract::Any,
@@ -775,10 +777,16 @@ fn brief_for(node: &str, plan: &str, retrying: bool) -> String {
     } else {
         ""
     };
+    let accept_note = if node == "accept" {
+        " `accept` requires a live launch of the artifact plus a real exercise of the feature — \
+         a headless verifier verdict alone is not acceptance."
+    } else {
+        ""
+    };
     format!(
         "Dispatch {node} for {plan} to a fresh executor. It must act on external evidence, \
          return the node's declared artifact, and record its cost from usage deltas — never a \
-         self-report.{retry_note}"
+         self-report.{retry_note}{accept_note}"
     )
 }
 
@@ -1342,7 +1350,23 @@ fn resolve_graph_path(thread: &WeakEntity<Thread>, raw: &str, cx: &mut AsyncApp)
 /// node left to run — a banner must never fail a request, and a completed plan
 /// must not tell the agent to assume an implementation role.
 pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
-    let state = load_state(Path::new(path?)).ok()?;
+    let Some(path) = path else {
+        return None;
+    };
+    let state = match load_state(Path::new(path)) {
+        Ok(state) => state,
+        // Degrade, don't vanish: a recorded-but-unreadable plan still tells the
+        // agent to consult the graph instead of silently dropping the banner.
+        Err(_) => {
+            return Some(
+                "## Plan state (forced)\n\n\
+                 You are executing a plan through the dev-flow graph, but the plan's \
+                 `progress.json` could not be read. Run `graph read` on it before making \
+                 any change."
+                    .to_string(),
+            );
+        }
+    };
     let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
     let next = next_decision_node(&state)?;
     let status = if let Some(blocker) = &state.blocker {
@@ -1873,6 +1897,32 @@ mod tests {
         assert!(banner.contains("Next node: `accept`"));
         assert!(!banner.contains("Next node: `merge`"));
         assert!(banner.contains("retry it before advancing"));
+    }
+
+    #[test]
+    fn accept_brief_names_the_live_launch_requirement() {
+        assert!(brief_for("accept", "PLAN", false).contains("live launch"));
+    }
+
+    #[test]
+    fn accept_refuses_an_empty_artifact() {
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+            step(&mut state, node);
+        }
+        let error = advance(&mut state, "accept", "", false, false, None, None, None, None)
+            .unwrap_err();
+        assert!(error.contains("non-empty artifact"));
+    }
+
+    #[test]
+    fn unreadable_plan_yields_a_degraded_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let banner = plan_state_banner(path.to_str()).expect("a degraded banner, not None");
+        assert!(banner.contains("could not be read"));
+        assert!(banner.contains("graph read"));
     }
 
     #[test]

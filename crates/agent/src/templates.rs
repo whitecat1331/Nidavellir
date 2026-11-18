@@ -134,10 +134,13 @@ pub fn plan_framing() -> &'static str {
 }
 
 /// The role a dev-flow node requires (1.23's taxonomy, consumed by 1.31's forced
-/// consultation). `promote`/`claim`/`fork` run as the orchestrator/implementer.
+/// consultation). `promote` runs as the orchestrator; `claim`/`fork` as the
+/// thread-coordinator.
 pub fn role_for_node(node: &str) -> &'static str {
     match node {
         "plan" => "researcher",
+        "promote" => "orchestrator",
+        "claim" | "fork" => "thread-coordinator",
         "verify" | "compile" => "deterministic-verifier",
         "accept" => "agent-verifier",
         "merge" | "release" | "complete" => "human-in-the-loop",
@@ -257,6 +260,9 @@ mod tests {
     #[test]
     fn test_plan_state_framing_and_roles() {
         assert_eq!(role_for_node("plan"), "researcher");
+        assert_eq!(role_for_node("promote"), "orchestrator");
+        assert_eq!(role_for_node("claim"), "thread-coordinator");
+        assert_eq!(role_for_node("fork"), "thread-coordinator");
         assert_eq!(role_for_node("verify"), "deterministic-verifier");
         assert_eq!(role_for_node("compile"), "deterministic-verifier");
         assert_eq!(role_for_node("accept"), "agent-verifier");
