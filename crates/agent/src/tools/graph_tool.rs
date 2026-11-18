@@ -476,6 +476,23 @@ fn retry_candidate(state: &GraphState) -> Option<String> {
         .map(|node| (*node).to_string())
 }
 
+/// The node `coordinate` would act on next, computed without its side effects
+/// (`coordinate` persists a blocker when it pauses). Mirrors `coordinate`'s
+/// precedence — a blocked human gate, then an active node, then a
+/// recorded-but-failed node to retry, then the first ready node — so the banner
+/// and the tool gate can never disagree with `coordinate`.
+fn next_decision_node(state: &GraphState) -> Option<String> {
+    if let Some(blocker) = &state.blocker {
+        if let Some(node) = &blocker.node {
+            return Some(node.clone());
+        }
+    }
+    if let Some(active) = &state.active {
+        return Some(active.node.clone());
+    }
+    retry_candidate(state).or_else(|| derive_next(state).into_iter().next())
+}
+
 fn transitive_prereqs(node: &str, out: &mut Vec<&'static str>) {
     for prereq in prereqs(node) {
         out.push(prereq);
@@ -1327,16 +1344,28 @@ fn resolve_graph_path(thread: &WeakEntity<Thread>, raw: &str, cx: &mut AsyncApp)
 pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
     let state = load_state(Path::new(path?)).ok()?;
     let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
-    let next = derive_next(&state);
-    let next = next.first()?;
-    Some(crate::plan_state_framing(next, &done))
+    let next = next_decision_node(&state)?;
+    let status = if let Some(blocker) = &state.blocker {
+        if blocker.edge == "human_gate" {
+            Some("a human gate is waiting for authorization — pause and ask, then `graph resume`")
+        } else {
+            Some("blocked — `graph resume` with the human's decision")
+        }
+    } else if state.active.is_some() {
+        Some("a node is active — `graph coordinate` returns `continue`")
+    } else if retry_candidate(&state).is_some() {
+        Some("a gate failed on a previous attempt — retry it before advancing")
+    } else {
+        None
+    };
+    Some(crate::plan_state_framing(&next, &done, status))
 }
 
 /// The next ready node for a plan's `progress.json`, or `None` when the state is
 /// unreadable. Used by the Layer 2 tool-permission gate (plan 1.31).
 pub fn next_plan_node(plan_path: &str) -> Option<String> {
     let state = load_state(Path::new(plan_path)).ok()?;
-    derive_next(&state).into_iter().next()
+    next_decision_node(&state)
 }
 
 /// Tools that mutate source or working-tree state. The plan gate blocks these
@@ -1813,6 +1842,37 @@ mod tests {
         state.done.push(done_entry("accept"));
         save_state(&path, &state).unwrap();
         assert_eq!(next_plan_node(&plan_path).as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn failed_gate_names_the_retry_not_the_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut state = fresh();
+        for node in ["plan", "promote", "claim", "fork", "implement", "verify", "compile"] {
+            step(&mut state, node);
+        }
+        advance(
+            &mut state,
+            "accept",
+            "failed accept",
+            false,
+            true,
+            Some(failed_record()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        save_state(&path, &state).unwrap();
+        let plan_path = path.to_string_lossy().into_owned();
+
+        assert_eq!(next_plan_node(&plan_path).as_deref(), Some("accept"));
+
+        let banner = plan_state_banner(path.to_str()).expect("banner for a retrying plan");
+        assert!(banner.contains("Next node: `accept`"));
+        assert!(!banner.contains("Next node: `merge`"));
+        assert!(banner.contains("retry it before advancing"));
     }
 
     #[test]
