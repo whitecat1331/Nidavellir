@@ -52,6 +52,7 @@ language_models.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
+plan_store.workspace = true
 project.workspace = true
 prompt_store.workspace = true
 quick-xml.workspace = true

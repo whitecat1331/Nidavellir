@@ -1,0 +1,21 @@
+[package]
+name = "plan_store"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/plan_store.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+indoc.workspace = true
+paths.workspace = true
+sqlez.workspace = true
+zed_env_vars.workspace = true
