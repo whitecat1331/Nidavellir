@@ -1,13 +1,14 @@
 //! Read-only bottom-dock panel that renders the dev-flow "fleet": every plan
-//! with a `progress.json` traversal and every active workstream claim, joined
-//! into one "where is everything now" view.
+//! in the SQLite plan store and every active workstream claim, joined into one
+//! "where is everything now" view.
 //!
-//! It reads the harness files live — `WORKSTREAMS.json` and
-//! `plans/**/*.progress.json` — from the first open workspace root that
-//! contains `WORKSTREAMS.json`, so it needs no configuration and stores nothing
-//! (the projection is derived, never a second copy). "Stuck" is derived from a
-//! heartbeat/stall check, not a status string: the panel observes, it does not
-//! drive, so the Layer-C stop predicates stay in the 1.23d coordinator.
+//! Plan state and evidence are read from the `plan_store` SQLite store (the
+//! state-of-record the graph tool co-writes on every mutation) — not re-parsed
+//! from `progress.json` / plan prose. Claims (the "agents" view) are synced from
+//! `WORKSTREAMS.json` on refresh, because that file remains the harness's
+//! authoritative claim ledger. "Stuck" is derived from a heartbeat/stall check,
+//! not a status string: the panel observes, it does not drive, so the Layer-C
+//! stop predicates stay in the 1.23d coordinator.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use gpui::{
     actions, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render,
     Task, WeakEntity, Window,
 };
+use plan_store::{ClaimRow, FleetPlanRow, PlanStore};
 use ui::{Button, ButtonSize, IconName, Label, LabelSize, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -39,7 +41,7 @@ const STALL_SECONDS: i64 = 15 * 60;
 /// `ledger.WIP_STALE_HOURS` in the harness).
 const STALE_CLAIM_HOURS: f64 = 24.0;
 
-// ---- file schemas. Every field defaults, so a partial file still parses. ----
+// ---- `WORKSTREAMS.json` schema (the claims sync source only). ----
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
@@ -57,52 +59,6 @@ struct Claim {
     heartbeat: Option<String>,
     status: String,
     note: Option<String>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct ProgressFile {
-    plan: Option<String>,
-    repo: Option<String>,
-    current: Option<String>,
-    done: Vec<DoneEntry>,
-    active: Option<ActiveNode>,
-    blocker: Option<Blocker>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct DoneEntry {
-    node: String,
-    attempts: Vec<Attempt>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct Attempt {
-    cost: Option<NodeCost>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct NodeCost {
-    input_tokens: u64,
-    output_tokens: u64,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct ActiveNode {
-    node: Option<String>,
-    executor: Option<String>,
-    started_at: Option<String>,
-    last_activity_at: Option<String>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct Blocker {
-    reason: Option<String>,
 }
 
 // ---- derived rows ----
@@ -155,39 +111,22 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|parsed| parsed.with_timezone(&Utc))
 }
 
-fn next_ready(progress: &ProgressFile) -> Option<&'static str> {
-    let done: HashSet<&str> = progress
-        .done
-        .iter()
-        .map(|entry| entry.node.as_str())
-        .collect();
-    ROUTE
-        .iter()
-        .copied()
-        .find(|node| !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p)))
-}
-
-fn spent_tokens(progress: &ProgressFile) -> u64 {
-    progress
-        .done
-        .iter()
-        .flat_map(|entry| &entry.attempts)
-        .filter_map(|attempt| attempt.cost.as_ref())
-        .map(|cost| cost.input_tokens + cost.output_tokens)
-        .sum()
+fn next_ready(done: &HashSet<&str>) -> Option<&'static str> {
+    ROUTE.iter().copied().find(|node| {
+        !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p))
+    })
 }
 
 /// (state label, blocked_on_you, breaker). The breaker maps to the Ralph
 /// circuit-breaker taxonomy: closed (moving/ready/done), half-open (waiting on
 /// a human), open (stalled or blocked). A completed plan is closed — the
 /// circuit finished, it did not open.
-fn derive_state(progress: &ProgressFile, now: DateTime<Utc>) -> (String, bool, String) {
-    if progress.current.as_deref() == Some("complete") {
+fn derive_state(plan: &FleetPlanRow, done_nodes: &[String], now: DateTime<Utc>) -> (String, bool, String) {
+    if plan.current_node.as_deref() == Some("complete") {
         return ("complete".to_string(), false, "closed".to_string());
     }
 
-    if let Some(blocker) = &progress.blocker {
-        let reason = blocker.reason.as_deref().unwrap_or("unknown");
+    if let Some(reason) = &plan.blocked_reason {
         return (
             format!("blocked on you (resume — {reason})"),
             true,
@@ -195,23 +134,21 @@ fn derive_state(progress: &ProgressFile, now: DateTime<Utc>) -> (String, bool, S
         );
     }
 
-    if let Some(active) = &progress.active {
-        let last = active
-            .last_activity_at
+    if let Some(active) = &plan.active_node {
+        let idle = plan
+            .heartbeat
             .as_deref()
-            .or(active.started_at.as_deref());
-        let node = active.node.as_deref().unwrap_or("active");
-        let idle = last
             .and_then(parse_time)
             .map(|time| (now - time).num_seconds())
             .unwrap_or(i64::MAX);
         if idle > STALL_SECONDS {
-            return (format!("stuck (stalled — {node})"), false, "open".to_string());
+            return (format!("stuck (stalled — {active})"), false, "open".to_string());
         }
-        return (format!("moving ({node})"), false, "closed".to_string());
+        return (format!("moving ({active})"), false, "closed".to_string());
     }
 
-    match next_ready(progress) {
+    let done: HashSet<&str> = done_nodes.iter().map(|node| node.as_str()).collect();
+    match next_ready(&done) {
         Some(node) if is_human_gate(node) => (
             format!("blocked on you (approve {node})"),
             true,
@@ -222,8 +159,8 @@ fn derive_state(progress: &ProgressFile, now: DateTime<Utc>) -> (String, bool, S
     }
 }
 
-fn claim_liveness(claim: &Claim, now: DateTime<Utc>) -> (String, Option<f64>) {
-    match claim.heartbeat.as_deref().and_then(parse_time) {
+fn claim_liveness(heartbeat: Option<&str>, now: DateTime<Utc>) -> (String, Option<f64>) {
+    match heartbeat.and_then(parse_time) {
         None => ("missing-heartbeat".to_string(), None),
         Some(heartbeat) => {
             let age = (now - heartbeat).num_seconds() as f64;
@@ -238,49 +175,21 @@ fn claim_liveness(claim: &Claim, now: DateTime<Utc>) -> (String, Option<f64>) {
 
 // ---- loading ----
 
-fn collect_progress_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_progress_files(&path, out);
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".progress.json"))
-        {
-            out.push(path);
-        }
-    }
-}
-
-fn load_plans(root: &Path, now: DateTime<Utc>) -> Vec<PlanRow> {
-    let mut paths = Vec::new();
-    collect_progress_files(&root.join("plans"), &mut paths);
-    paths.sort();
-
-    let mut rows: Vec<PlanRow> = paths
+fn load_plans(store: &PlanStore, now: DateTime<Utc>) -> Vec<PlanRow> {
+    let mut rows: Vec<PlanRow> = store
+        .fleet_plans()
+        .unwrap_or_default()
         .into_iter()
-        .filter_map(|path| {
-            let contents = std::fs::read_to_string(&path).ok()?;
-            let progress: ProgressFile = serde_json::from_str(&contents).ok()?;
-            Some(progress)
-        })
-        .map(|progress| {
-            let (state, blocked_on_you, breaker) = derive_state(&progress, now);
-            let agent = progress
-                .active
-                .as_ref()
-                .and_then(|active| active.executor.clone());
+        .map(|plan| {
+            let done_nodes = store.done_nodes(&plan.id).unwrap_or_default();
+            let (state, blocked_on_you, breaker) = derive_state(&plan, &done_nodes, now);
             PlanRow {
-                plan: progress.plan.clone().unwrap_or_else(|| "?".to_string()),
-                phase: progress.current.clone().unwrap_or_else(|| "—".to_string()),
+                plan: plan.name,
+                phase: plan.current_node.unwrap_or_else(|| "—".to_string()),
                 state,
                 breaker,
-                spent_tokens: spent_tokens(&progress),
-                agent,
+                spent_tokens: plan.spent_tokens,
+                agent: plan.holder,
                 blocked_on_you,
             }
         })
@@ -301,21 +210,16 @@ fn load_plans(root: &Path, now: DateTime<Utc>) -> Vec<PlanRow> {
     rows
 }
 
-fn load_agents(root: &Path, now: DateTime<Utc>) -> Vec<AgentRow> {
-    let Ok(contents) = std::fs::read_to_string(root.join("WORKSTREAMS.json")) else {
-        return Vec::new();
-    };
-    let Ok(file) = serde_json::from_str::<WorkstreamsFile>(&contents) else {
-        return Vec::new();
-    };
-    file.claims
+fn load_agents(store: &PlanStore, now: DateTime<Utc>) -> Vec<AgentRow> {
+    store
+        .claims()
+        .unwrap_or_default()
         .into_iter()
-        .filter(|claim| claim.status == "active")
         .map(|claim| {
-            let (liveness, age_seconds) = claim_liveness(&claim, now);
+            let (liveness, age_seconds) = claim_liveness(claim.heartbeat.as_deref(), now);
             AgentRow {
                 holder: claim.holder,
-                repo: claim.repo,
+                repo: claim.repo.unwrap_or_default(),
                 branch: claim.branch,
                 liveness,
                 age_seconds,
@@ -323,6 +227,35 @@ fn load_agents(root: &Path, now: DateTime<Utc>) -> Vec<AgentRow> {
             }
         })
         .collect()
+}
+
+/// Mirror the active `WORKSTREAMS.json` claims into the store. Best-effort:
+/// `WORKSTREAMS.json` remains the authoritative claim ledger, and a failed upsert
+/// only means the agents view is missing a row until the next refresh.
+fn sync_claims(root: &Path, store: &PlanStore) {
+    let Ok(contents) = std::fs::read_to_string(root.join("WORKSTREAMS.json")) else {
+        return;
+    };
+    let Ok(file) = serde_json::from_str::<WorkstreamsFile>(&contents) else {
+        return;
+    };
+    for claim in file.claims {
+        if claim.status != "active" {
+            continue;
+        }
+        let id = claim.id;
+        let result = store.upsert_claim(&ClaimRow {
+            id,
+            holder: claim.holder,
+            repo: Some(claim.repo),
+            branch: claim.branch,
+            heartbeat: claim.heartbeat,
+            note: claim.note,
+        });
+        if let Err(error) = result {
+            log::error!("[FLEET] failed to sync claim to the store: {error:#}");
+        }
+    }
 }
 
 fn discover_harness_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
@@ -386,19 +319,22 @@ impl FleetPanel {
     }
 
     fn refresh(&mut self) {
-        let Some(root) = self.harness_root.clone() else {
-            self.plans.clear();
-            self.agents.clear();
-            self.last_error = Some(
-                "No harness root found — open the zed-debugger-demo folder \
-                 (it contains WORKSTREAMS.json) as a workspace root."
-                    .to_string(),
-            );
-            return;
+        let store = match PlanStore::open_default() {
+            Ok(store) => store,
+            Err(error) => {
+                self.plans.clear();
+                self.agents.clear();
+                self.last_error = Some(format!("Failed to open the plan store: {error:#}"));
+                return;
+            }
         };
+
         let now = Utc::now();
-        self.plans = load_plans(&root, now);
-        self.agents = load_agents(&root, now);
+        if let Some(root) = self.harness_root.clone() {
+            sync_claims(&root, &store);
+        }
+        self.plans = load_plans(&store, now);
+        self.agents = load_agents(&store, now);
         self.last_error = None;
     }
 }
@@ -553,38 +489,51 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn attempt(input: u64, output: u64) -> Attempt {
-        Attempt {
-            cost: Some(NodeCost {
-                input_tokens: input,
-                output_tokens: output,
-            }),
-        }
+    fn store() -> PlanStore {
+        PlanStore::open_in_memory().expect("open in-memory store")
     }
 
-    fn done_entry(node: &str, attempts: Vec<Attempt>) -> DoneEntry {
-        DoneEntry {
-            node: node.to_string(),
-            attempts,
-        }
-    }
-
-    fn active_node(node: &str, last_activity_at: DateTime<Utc>) -> ActiveNode {
-        ActiveNode {
-            node: Some(node.to_string()),
-            executor: Some("executor-a".to_string()),
-            started_at: None,
-            last_activity_at: Some(last_activity_at.to_rfc3339()),
+    fn snapshot(
+        name: &str,
+        current: Option<&str>,
+        active: Option<&str>,
+        heartbeat: Option<&str>,
+        blocked: Option<&str>,
+        done: &[&str],
+        spent: u64,
+    ) -> plan_store::GraphSnapshot {
+        plan_store::GraphSnapshot {
+            plan_id: name.to_string(),
+            name: name.to_string(),
+            repo: Some("zed".to_string()),
+            current_node: current.map(|s| s.to_string()),
+            active_node: active.map(|s| s.to_string()),
+            holder: None,
+            heartbeat: heartbeat.map(|s| s.to_string()),
+            blocked_reason: blocked.map(|s| s.to_string()),
+            spent_tokens: spent,
+            done_nodes: done.iter().map(|node| node.to_string()).collect(),
+            evidence: Vec::new(),
         }
     }
 
     #[test]
     fn complete_plan_is_closed() {
-        let progress = ProgressFile {
-            current: Some("complete".to_string()),
-            ..Default::default()
-        };
-        let (state, blocked, breaker) = derive_state(&progress, now());
+        let (state, blocked, breaker) = derive_state(
+            &FleetPlanRow {
+                id: "P".to_string(),
+                name: "P".to_string(),
+                repo: None,
+                current_node: Some("complete".to_string()),
+                active_node: None,
+                holder: None,
+                heartbeat: None,
+                blocked_reason: None,
+                spent_tokens: 0,
+            },
+            &[],
+            now(),
+        );
         assert_eq!(state, "complete");
         assert!(!blocked);
         assert_eq!(breaker, "closed");
@@ -592,12 +541,22 @@ mod tests {
 
     #[test]
     fn active_plan_moves() {
-        let progress = ProgressFile {
-            current: Some("implement".to_string()),
-            active: Some(active_node("implement", now() - chrono::Duration::minutes(1))),
-            ..Default::default()
-        };
-        let (state, blocked, breaker) = derive_state(&progress, now());
+        let heartbeat = (now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let (state, blocked, breaker) = derive_state(
+            &FleetPlanRow {
+                id: "P".to_string(),
+                name: "P".to_string(),
+                repo: None,
+                current_node: Some("implement".to_string()),
+                active_node: Some("implement".to_string()),
+                holder: None,
+                heartbeat: Some(heartbeat),
+                blocked_reason: None,
+                spent_tokens: 0,
+            },
+            &[],
+            now(),
+        );
         assert_eq!(state, "moving (implement)");
         assert!(!blocked);
         assert_eq!(breaker, "closed");
@@ -605,12 +564,22 @@ mod tests {
 
     #[test]
     fn stalled_plan_is_open() {
-        let progress = ProgressFile {
-            current: Some("implement".to_string()),
-            active: Some(active_node("implement", now() - chrono::Duration::minutes(16))),
-            ..Default::default()
-        };
-        let (state, blocked, breaker) = derive_state(&progress, now());
+        let heartbeat = (now() - chrono::Duration::minutes(16)).to_rfc3339();
+        let (state, blocked, breaker) = derive_state(
+            &FleetPlanRow {
+                id: "P".to_string(),
+                name: "P".to_string(),
+                repo: None,
+                current_node: Some("implement".to_string()),
+                active_node: Some("implement".to_string()),
+                holder: None,
+                heartbeat: Some(heartbeat),
+                blocked_reason: None,
+                spent_tokens: 0,
+            },
+            &[],
+            now(),
+        );
         assert_eq!(state, "stuck (stalled — implement)");
         assert!(!blocked);
         assert_eq!(breaker, "open");
@@ -618,19 +587,24 @@ mod tests {
 
     #[test]
     fn human_gate_blocks_on_you() {
-        let nodes = [
+        let done = [
             "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept",
         ];
-        let done: Vec<DoneEntry> = nodes
-            .iter()
-            .map(|node| done_entry(node, vec![attempt(0, 0)]))
-            .collect();
-        let progress = ProgressFile {
-            current: Some("accept".to_string()),
-            done,
-            ..Default::default()
-        };
-        let (state, blocked, breaker) = derive_state(&progress, now());
+        let (state, blocked, breaker) = derive_state(
+            &FleetPlanRow {
+                id: "P".to_string(),
+                name: "P".to_string(),
+                repo: None,
+                current_node: Some("accept".to_string()),
+                active_node: None,
+                holder: None,
+                heartbeat: None,
+                blocked_reason: None,
+                spent_tokens: 0,
+            },
+            &done.map(str::to_string),
+            now(),
+        );
         assert_eq!(state, "blocked on you (approve merge)");
         assert!(blocked);
         assert_eq!(breaker, "half-open");
@@ -638,47 +612,71 @@ mod tests {
 
     #[test]
     fn blocker_blocks_on_you() {
-        let progress = ProgressFile {
-            current: Some("implement".to_string()),
-            blocker: Some(Blocker {
-                reason: Some("waiting on secret rotation".to_string()),
-            }),
-            ..Default::default()
-        };
-        let (state, blocked, breaker) = derive_state(&progress, now());
+        let (state, blocked, breaker) = derive_state(
+            &FleetPlanRow {
+                id: "P".to_string(),
+                name: "P".to_string(),
+                repo: None,
+                current_node: Some("implement".to_string()),
+                active_node: None,
+                holder: None,
+                heartbeat: None,
+                blocked_reason: Some("waiting on secret rotation".to_string()),
+                spent_tokens: 0,
+            },
+            &[],
+            now(),
+        );
         assert!(blocked);
         assert!(state.contains("resume"));
         assert_eq!(breaker, "open");
     }
 
     #[test]
-    fn spent_tokens_sums_cost() {
-        let progress = ProgressFile {
-            done: vec![done_entry("implement", vec![attempt(100, 50), attempt(20, 5)])],
-            ..Default::default()
-        };
-        assert_eq!(spent_tokens(&progress), 175);
+    fn claim_liveness_fresh_stale_missing() {
+        let at = now();
+        let fresh = (at - chrono::Duration::minutes(1)).to_rfc3339();
+        assert_eq!(claim_liveness(Some(&fresh), at).0, "fresh");
+
+        let stale = (at - chrono::Duration::hours(25)).to_rfc3339();
+        assert_eq!(claim_liveness(Some(&stale), at).0, "stale");
+
+        assert_eq!(claim_liveness(None, at).0, "missing-heartbeat");
     }
 
     #[test]
-    fn claim_liveness_fresh_stale_missing() {
-        let at = now();
-        let fresh = Claim {
-            heartbeat: Some((at - chrono::Duration::minutes(1)).to_rfc3339()),
-            ..Default::default()
-        };
-        assert_eq!(claim_liveness(&fresh, at).0, "fresh");
+    fn a_plan_is_frozen_or_moving_distinctly_from_the_store() {
+        let store = store();
 
-        let stale = Claim {
-            heartbeat: Some((at - chrono::Duration::hours(25)).to_rfc3339()),
-            ..Default::default()
-        };
-        assert_eq!(claim_liveness(&stale, at).0, "stale");
+        let moving_heartbeat = (now() - chrono::Duration::minutes(1)).to_rfc3339();
+        store
+            .apply_graph_snapshot(&snapshot(
+                "MOVING",
+                Some("verify"),
+                Some("verify"),
+                Some(&moving_heartbeat),
+                None,
+                &["plan", "promote", "claim", "fork", "implement"],
+                42,
+            ))
+            .unwrap();
+        store
+            .apply_graph_snapshot(&snapshot(
+                "FROZEN",
+                Some("verify"),
+                None,
+                None,
+                Some("human gate"),
+                &["plan", "promote", "claim", "fork", "implement"],
+                7,
+            ))
+            .unwrap();
 
-        let missing = Claim {
-            heartbeat: None,
-            ..Default::default()
-        };
-        assert_eq!(claim_liveness(&missing, at).0, "missing-heartbeat");
+        let rows = load_plans(&store, now());
+        let by_name = |name: &str| rows.iter().find(|row| row.plan == name).unwrap();
+        assert_eq!(by_name("MOVING").state, "moving (verify)");
+        assert_eq!(by_name("FROZEN").state, "blocked on you (resume — human gate)");
+        assert_eq!(by_name("MOVING").spent_tokens, 42);
+        assert_eq!(by_name("FROZEN").spent_tokens, 7);
     }
 }
