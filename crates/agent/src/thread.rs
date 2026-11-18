@@ -4461,7 +4461,7 @@ impl Thread {
         }
 
         if let Some(ToolPermissionDecision::Deny(reason)) =
-            crate::plan_gate(tool_name.as_ref(), &[], self.plan_path.as_deref())
+            crate::plan_gate(tool_name.as_ref(), tool.kind(), &[], self.plan_path.as_deref())
         {
             return Task::ready((
                 owning_message_ix,
@@ -7767,6 +7767,7 @@ impl ToolCallEventStream {
         let title = title.into();
         if let Some(ToolPermissionDecision::Deny(reason)) = crate::plan_gate(
             &context.tool_name,
+            acp::ToolKind::Other,
             &context.input_values,
             self.plan_path.as_deref(),
         ) {
@@ -7779,8 +7780,12 @@ impl ToolCallEventStream {
         let plan_path = self.plan_path.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                if let Some(decision) =
-                    crate::plan_gate(&tool_name, &input_values, plan_path.as_deref())
+                if let Some(decision) = crate::plan_gate(
+                    &tool_name,
+                    acp::ToolKind::Other,
+                    &input_values,
+                    plan_path.as_deref(),
+                )
                 {
                     return decision;
                 }

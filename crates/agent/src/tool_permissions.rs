@@ -1,5 +1,6 @@
 use crate::AgentTool;
 use crate::tools::TerminalTool;
+use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{AgentSettings, CompiledRegex, ToolPermissions, ToolRules};
 use settings::ToolPermissionMode;
 use shell_command_parser::{
@@ -498,6 +499,7 @@ fn git_toplevel(path: &Path) -> Option<&Path> {
 /// Kill switch (D3): `ZED_PLAN_GATE=off` disables the gate.
 pub fn plan_gate(
     tool_name: &str,
+    kind: acp::ToolKind,
     inputs: &[String],
     plan_path: Option<&str>,
 ) -> Option<ToolPermissionDecision> {
@@ -505,7 +507,7 @@ pub fn plan_gate(
     if matches!(std::env::var("ZED_PLAN_GATE"), Ok(value) if value.eq_ignore_ascii_case("off")) {
         return None;
     }
-    if !crate::gate_covers_tool(tool_name, inputs) {
+    if !crate::gate_covers_tool(tool_name, kind, inputs) {
         return None;
     }
     // Harness artifacts (the plan itself, its VERIFY reports) live in a
@@ -2503,7 +2505,7 @@ mod tests {
         let target = worktree.path().join("plans").join("VERIFY_run-2026-11-17.md");
         let inputs = vec![target.to_string_lossy().into_owned()];
 
-        assert!(plan_gate("write_file", &inputs, Some(&plan_path)).is_none());
+        assert!(plan_gate("write_file", acp::ToolKind::Edit, &inputs, Some(&plan_path)).is_none());
     }
 
     #[test]
@@ -2516,7 +2518,7 @@ mod tests {
         let inputs = vec![target.to_string_lossy().into_owned()];
 
         assert!(matches!(
-            plan_gate("write_file", &inputs, Some(&plan_path)),
+            plan_gate("write_file", acp::ToolKind::Edit, &inputs, Some(&plan_path)),
             Some(ToolPermissionDecision::Deny(_))
         ));
     }
@@ -2528,7 +2530,7 @@ mod tests {
         let inputs = vec!["operation:commit protected:false".to_string()];
 
         assert!(matches!(
-            plan_gate("git", &inputs, Some(&plan_path)),
+            plan_gate("git", acp::ToolKind::Execute, &inputs, Some(&plan_path)),
             Some(ToolPermissionDecision::Deny(_))
         ));
     }

@@ -42,7 +42,7 @@ impl AgentTool for RenameTool {
     const NAME: &'static str = "rename_symbol";
 
     fn kind() -> acp::ToolKind {
-        acp::ToolKind::Other
+        acp::ToolKind::Edit
     }
 
     fn initial_title(

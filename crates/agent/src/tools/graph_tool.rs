@@ -1395,22 +1395,16 @@ pub fn next_plan_node(plan_path: &str) -> Option<String> {
 /// Tools that mutate source or working-tree state. The plan gate blocks these
 /// while a gate node is ready and unadvanced. `git` is matched by operation
 /// instead, because its read-only operations must stay available.
-const PLAN_GATED_TOOLS: &[&str] = &[
-    "write_file",
-    "edit_file",
-    "create_directory",
-    "delete_path",
-    "copy_path",
-    "move_path",
-    "rename_symbol",
-    "apply_code_action",
-];
-
 const PLAN_GATED_GIT_OPERATIONS: &[&str] = &["commit", "merge", "push"];
 
-/// Whether this tool call is a mutation the plan gate covers.
-pub fn gate_covers_tool(tool_name: &str, input_values: &[String]) -> bool {
-    if PLAN_GATED_TOOLS.contains(&tool_name) {
+/// Whether this tool call is a mutation the plan gate covers. Source-mutating
+/// tools are caught by their `ToolKind` (`Edit`/`Delete`/`Move`); git is caught
+/// by operation because its kind is `Execute` regardless of read vs write.
+pub fn gate_covers_tool(tool_name: &str, kind: acp::ToolKind, input_values: &[String]) -> bool {
+    if matches!(
+        kind,
+        acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move
+    ) {
         return true;
     }
     tool_name == "git"
@@ -1828,17 +1822,19 @@ mod tests {
     fn plan_gate_covers_mutations_only() {
         let input = |value: &str| vec![value.to_string()];
 
-        assert!(gate_covers_tool("write_file", &[]));
-        assert!(gate_covers_tool("edit_file", &[]));
-        assert!(gate_covers_tool("delete_path", &[]));
-        assert!(gate_covers_tool("git", &input("operation:commit protected:false")));
-        assert!(gate_covers_tool("git", &input("operation:merge ref:feature")));
-        assert!(gate_covers_tool("git", &input("operation:push")));
+        assert!(gate_covers_tool("write_file", acp::ToolKind::Edit, &[]));
+        assert!(gate_covers_tool("edit_file", acp::ToolKind::Edit, &[]));
+        assert!(gate_covers_tool("delete_path", acp::ToolKind::Delete, &[]));
+        // A mutating kind is refused even for a tool not on any name list.
+        assert!(gate_covers_tool("some_future_tool", acp::ToolKind::Move, &[]));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:commit protected:false")));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:merge ref:feature")));
+        assert!(gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:push")));
 
-        assert!(!gate_covers_tool("git", &input("operation:status")));
-        assert!(!gate_covers_tool("git", &input("operation:diff")));
-        assert!(!gate_covers_tool("read_file", &[]));
-        assert!(!gate_covers_tool("terminal", &[]));
+        assert!(!gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:status")));
+        assert!(!gate_covers_tool("git", acp::ToolKind::Execute, &input("operation:diff")));
+        assert!(!gate_covers_tool("read_file", acp::ToolKind::Read, &[]));
+        assert!(!gate_covers_tool("terminal", acp::ToolKind::Execute, &[]));
     }
 
     #[test]
