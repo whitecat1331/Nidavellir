@@ -92,7 +92,7 @@ impl PlanStore {
 
     /// Open an in-memory store (tests, stateless contexts).
     pub fn open_in_memory() -> Result<Self> {
-        let connection = Connection::open_memory(Some("PLAN_STORE"));
+        let connection = Connection::open_memory(None);
         Self::init(connection)
     }
 
