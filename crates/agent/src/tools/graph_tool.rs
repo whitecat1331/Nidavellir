@@ -1444,8 +1444,63 @@ fn save_state(path: &Path, state: &GraphState) -> Result<(), GraphToolOutput> {
     })?;
     std::fs::write(path, content).map_err(|error| GraphToolOutput::Error {
         error: format!("Failed to write {}: {error}", path.display()),
-    })
+    })?;
+    persist_to_store(state);
+    Ok(())
 }
+
+/// Project the in-memory graph state into the store's snapshot shape. This is
+/// the state-of-record write: co-persisted at save time from the same
+/// `GraphState` that writes `progress.json`, never re-ingested from it later.
+fn graph_snapshot(state: &GraphState) -> plan_store::GraphSnapshot {
+    plan_store::GraphSnapshot {
+        plan_id: state.plan.clone(),
+        name: state.plan.clone(),
+        repo: Some(state.repo.clone()),
+        current_node: state.current.clone(),
+        active_node: state.active.as_ref().map(|active| active.node.clone()),
+        holder: state.active.as_ref().map(|active| active.executor.clone()),
+        heartbeat: state.active.as_ref().map(|active| {
+            if !active.last_activity_at.is_empty() {
+                active.last_activity_at.clone()
+            } else {
+                active.started_at.clone()
+            }
+        }),
+        blocked_reason: state.blocker.as_ref().map(|blocker| blocker.reason.clone()),
+        spent_tokens: spent_tokens(state),
+        done_nodes: state.done.iter().map(|entry| entry.node.clone()).collect(),
+        evidence: state
+            .done
+            .iter()
+            .map(|entry| plan_store::EvidenceRow {
+                plan_id: state.plan.clone(),
+                node: entry.node.clone(),
+                artifact_sha: Some(entry.artifact.clone()),
+                gate_exit_code: Some(i64::from(entry.failed)),
+                report_path: None,
+                falsifying_condition: None,
+                negative_control: None,
+            })
+            .collect(),
+    }
+}
+
+/// Write the snapshot to the SQLite plan store. Best-effort: `progress.json`
+/// remains the hard truth for the traversal, so a store write failure must not
+/// fail the graph operation — it is logged and the next save retries.
+#[cfg(not(test))]
+fn persist_to_store(state: &GraphState) {
+    let snapshot = graph_snapshot(state);
+    if let Err(error) = (|| -> Result<()> {
+        plan_store::PlanStore::open_default()?.apply_graph_snapshot(&snapshot)
+    })() {
+        log::error!("[GRAPH] failed to persist plan state to the store: {error:#}");
+    }
+}
+
+#[cfg(test)]
+fn persist_to_store(_state: &GraphState) {}
 
 fn state_json(state: &GraphState) -> String {
     serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string())
@@ -2742,5 +2797,27 @@ mod tests {
         assert!(state.warnings.is_empty());
         assert!(state.back_edges.is_empty());
         assert_eq!(spent_tokens(&state), 15);
+    }
+
+    #[test]
+    fn graph_snapshot_projects_state_and_evidence() {
+        let mut state = fresh();
+        step(&mut state, "plan");
+        step(&mut state, "promote");
+
+        let snapshot = graph_snapshot(&state);
+        assert_eq!(snapshot.plan_id, "TRIVIAL");
+        assert_eq!(snapshot.name, "TRIVIAL");
+        assert_eq!(snapshot.repo.as_deref(), Some("zed"));
+        assert_eq!(snapshot.done_nodes, vec!["plan", "promote"]);
+        assert_eq!(snapshot.spent_tokens, spent_tokens(&state));
+
+        // Evidence carries `gate_exit_code` — a column `progress.json` does not
+        // carry — proving the store is a richer co-record, not a re-ingest.
+        assert_eq!(snapshot.evidence.len(), 2);
+        let plan_evidence = &snapshot.evidence[0];
+        assert_eq!(plan_evidence.node, "plan");
+        assert_eq!(plan_evidence.artifact_sha.as_deref(), Some("artifact"));
+        assert_eq!(plan_evidence.gate_exit_code, Some(0));
     }
 }
