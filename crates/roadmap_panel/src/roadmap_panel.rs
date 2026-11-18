@@ -16,7 +16,7 @@ use gpui::{
     actions, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render,
     Task, WeakEntity, Window,
 };
-use plan_store::{PlanStore, RoadmapPlanRow};
+use plan_store::PlanStore;
 use ui::{prelude::*, Button, ButtonSize, IconName, Label, LabelSize};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
