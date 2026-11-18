@@ -1306,12 +1306,19 @@ impl AgentTool for GraphTool {
             })?;
             let path = resolve_graph_path(&thread, &input.path, cx);
             let path_string = path.to_string_lossy().into_owned();
+            let consulted = matches!(
+                input.operation,
+                GraphOperation::Read | GraphOperation::Coordinate
+            );
             let output = cx
                 .background_spawn(async move { run_operation(input, path, Some(executor.as_str())) })
                 .await;
             if output.is_ok() {
                 if let Err(error) = thread.update(cx, |thread, cx| {
                     thread.set_plan_path(Some(path_string), cx);
+                    if consulted {
+                        thread.record_graph_consulted();
+                    }
                 }) {
                     log::error!("[GRAPH] failed to record plan path on thread: {error:#}");
                 }
