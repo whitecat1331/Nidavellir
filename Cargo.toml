@@ -54,6 +54,7 @@ members = [
     "crates/debugger_ui",
     "crates/devops_panel",
     "crates/fleet_panel",
+    "crates/roadmap_panel",
     "crates/secret_panel",
     "crates/deepseek",
     "crates/dev_container",
@@ -336,6 +337,7 @@ debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
 devops_panel = { path = "crates/devops_panel" }
 fleet_panel = { path = "crates/fleet_panel" }
+roadmap_panel = { path = "crates/roadmap_panel" }
 secret_panel = { path = "crates/secret_panel" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
