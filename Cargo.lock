@@ -284,6 +284,7 @@ dependencies = [
  "lsp",
  "parking_lot",
  "paths",
+ "plan_store",
  "pretty_assertions",
  "project",
  "prompt_store",
@@ -6513,6 +6514,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "gpui",
+ "log",
+ "plan_store",
  "serde",
  "serde_json",
  "ui",
@@ -13529,6 +13532,18 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "plan_store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "indoc",
+ "paths",
+ "sqlez",
+ "zed_env_vars",
+]
 
 [[package]]
 name = "platform_title_bar"
