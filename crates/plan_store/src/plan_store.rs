@@ -7,7 +7,7 @@
 //! the same in-memory `GraphState` that writes `progress.json` — not re-ingested
 //! from `progress.json` later, so it is a richer co-record, not a second copy.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use indoc::indoc;
