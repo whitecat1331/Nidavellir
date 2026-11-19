@@ -4,16 +4,16 @@
 //! `Item` that renders the plan DAG from the `plan_store` (graph-state plans +
 //! `edges`) as a layered node graph: a plan is a **node**, its `Blocked by` /
 //! `Related` relations are **edges**, and build progress is a **color/shape**
-//! with a legend — never a text waterfall. The pure projection
-//! (`derive_node_state` / `node_color` / `node_shape` / `tooltip_text`) is the
-//! testable core; the render only positions what it projects.
+//! with a legend — never a text waterfall. Clicking a node zooms into that
+//! plan's 11-node dev-flow, where a done node renders green only when its
+//! evidence is complete (1.28) — a vacuous-green node is visibly incomplete.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, Window, actions};
-use plan_store::{EdgeRow, FleetPlanRow, PlanStore};
-use ui::{Label, LabelSize, prelude::*};
+use gpui::{App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, Window, actions};
+use plan_store::{EdgeRow, EvidenceRow, FleetPlanRow, PlanStore};
+use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
 use workspace::item::Item;
 
@@ -75,13 +75,13 @@ pub fn node_shape(state: NodeState) -> &'static str {
 /// The color a state renders as. Uses the theme's semantic colors (not fixed
 /// hues) so it adapts to light/dark themes; each state maps to a distinct
 /// semantic role.
-pub fn node_color(state: NodeState) -> ui::Color {
+pub fn node_color(state: NodeState) -> Color {
     match state {
-        NodeState::Moving => ui::Color::Success,
-        NodeState::Stuck => ui::Color::Warning,
-        NodeState::Blocked => ui::Color::Error,
-        NodeState::Done => ui::Color::Info,
-        NodeState::Pending => ui::Color::Muted,
+        NodeState::Moving => Color::Success,
+        NodeState::Stuck => Color::Warning,
+        NodeState::Blocked => Color::Error,
+        NodeState::Done => Color::Info,
+        NodeState::Pending => Color::Muted,
     }
 }
 
@@ -227,6 +227,88 @@ pub fn tooltip_text(node: &GraphNode) -> String {
     )
 }
 
+/// One node of a plan's dev-flow, as the drill-down renders it.
+pub struct DevFlowNode {
+    pub node: String,
+    pub done: bool,
+    /// A done node is `complete` (green) only when its evidence is present —
+    /// the 1.28 invariant. A done node whose evidence is missing any of the
+    /// three fields is `vacuous` (`complete == false`).
+    pub complete: bool,
+    pub is_human_gate: bool,
+    pub evidence: Option<EvidenceRow>,
+}
+
+/// A done node's evidence is complete iff the falsifying condition, the
+/// negative-control flag, and the artifact are all present (1.28 D2).
+pub fn evidence_complete(evidence: &EvidenceRow) -> bool {
+    evidence
+        .artifact_sha
+        .as_deref()
+        .is_some_and(|sha| !sha.is_empty())
+        && evidence
+            .falsifying_condition
+            .as_deref()
+            .is_some_and(|condition| !condition.is_empty())
+        && evidence.negative_control.is_some()
+}
+
+/// Project one plan's 11-node dev-flow from the store, with per-node evidence.
+pub fn project_dev_flow(store: &PlanStore, plan_id: &str) -> Vec<DevFlowNode> {
+    let done = store.done_nodes(plan_id).unwrap_or_default();
+    let evidence = store.evidence_for(plan_id).unwrap_or_default();
+
+    let done_set: HashSet<&str> = done.iter().map(|node| node.as_str()).collect();
+    let evidence_by_node: HashMap<String, EvidenceRow> = evidence
+        .into_iter()
+        .map(|row| (row.node.clone(), row))
+        .collect();
+
+    ROUTE
+        .iter()
+        .map(|&node| {
+            let done = done_set.contains(node);
+            let evidence = evidence_by_node.get(node).cloned();
+            let complete = done && evidence.as_ref().is_some_and(evidence_complete);
+            DevFlowNode {
+                node: node.to_string(),
+                done,
+                complete,
+                is_human_gate: is_human_gate(node),
+                evidence,
+            }
+        })
+        .collect()
+}
+
+/// The glyph + color a dev-flow node renders as, so a vacuous-green node is
+/// visibly distinct from an evidenced-green one.
+pub fn dev_flow_visual(node: &DevFlowNode) -> (&'static str, Color) {
+    if node.done && node.complete {
+        ("●", Color::Success)
+    } else if node.done {
+        ("◐", Color::Warning)
+    } else if node.is_human_gate {
+        ("⏸", Color::Error)
+    } else {
+        ("○", Color::Muted)
+    }
+}
+
+fn evidence_summary(evidence: &EvidenceRow) -> String {
+    let negative = if evidence.negative_control.is_some() {
+        "neg-control ✓"
+    } else {
+        "neg-control ✗"
+    };
+    format!(
+        "falsifies: {} · {} · artifact {}",
+        evidence.falsifying_condition.as_deref().unwrap_or("—"),
+        negative,
+        evidence.artifact_sha.as_deref().unwrap_or("—"),
+    )
+}
+
 /// One layer of the layout: a phase (route node) and the plans currently at it.
 fn phase_order(phase: &str) -> usize {
     ROUTE.iter().position(|p| *p == phase).unwrap_or(ROUTE.len())
@@ -255,28 +337,45 @@ pub struct PlanGraph {
     focus_handle: FocusHandle,
     nodes: Vec<GraphNode>,
     edges: Vec<EdgeRow>,
+    selected_plan: Option<String>,
+    dev_flow: Vec<DevFlowNode>,
 }
 
 impl PlanGraph {
     fn new(cx: &mut Context<Self>) -> Self {
-        let store = PlanStore::open_default()
-            .or_else(|_| PlanStore::open_in_memory())
-            .expect("plan store (on-disk or in-memory)");
+        let store = Self::open_store();
         let (nodes, edges) = project_graph(&store, Utc::now());
         Self {
             focus_handle: cx.focus_handle(),
             nodes,
             edges,
+            selected_plan: None,
+            dev_flow: Vec::new(),
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        let store = PlanStore::open_default()
+    fn open_store() -> PlanStore {
+        PlanStore::open_default()
             .or_else(|_| PlanStore::open_in_memory())
-            .expect("plan store (on-disk or in-memory)");
-        let (nodes, edges) = project_graph(&store, Utc::now());
+            .expect("plan store (on-disk or in-memory)")
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let (nodes, edges) = project_graph(&Self::open_store(), Utc::now());
         self.nodes = nodes;
         self.edges = edges;
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, plan_id: String, cx: &mut Context<Self>) {
+        self.dev_flow = project_dev_flow(&Self::open_store(), &plan_id);
+        self.selected_plan = Some(plan_id);
+        cx.notify();
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.selected_plan = None;
+        self.dev_flow.clear();
         cx.notify();
     }
 
@@ -301,16 +400,87 @@ impl PlanGraph {
             }))
     }
 
-    fn render_node(node: &GraphNode) -> impl IntoElement {
+    fn render_overview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = group_by_phase(&self.nodes);
+
+        v_flex()
+            .gap_4()
+            .child(Label::new("Plan graph"))
+            .child(Self::render_legend())
+            .child(
+                v_flex().gap_2().children(groups.into_iter().map(|(phase, nodes)| {
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            Label::new(phase)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .w_24(),
+                        )
+                        .child(
+                            h_flex().gap_1().flex_wrap().children(
+                                nodes.into_iter().map(|node| self.render_node(node, cx)),
+                            ),
+                        )
+                })),
+            )
+    }
+
+    fn render_node(&self, node: &GraphNode, cx: &mut Context<Self>) -> impl IntoElement {
+        let plan_id = node.id.clone();
         h_flex()
+            .id(("plan-node", node.id.clone()))
             .gap_1()
             .items_center()
             .px_2()
             .py_1()
             .rounded_md()
             .border_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this: &mut PlanGraph, _: &ClickEvent, _, cx| {
+                this.zoom_in(plan_id.clone(), cx);
+            }))
             .child(Label::new(node_shape(node.state)).color(node_color(node.state)))
             .child(Label::new(node.name.clone()).size(LabelSize::Small))
+    }
+
+    fn render_dev_flow(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                Button::new("graph-back", "Back to graph").on_click(
+                    cx.listener(|this: &mut PlanGraph, _: &ClickEvent, _, cx| this.zoom_out(cx)),
+                ),
+            )
+            .child(
+                Label::new(self.selected_plan.clone().unwrap_or_default())
+                    .color(Color::Muted)
+                    .size(LabelSize::Small),
+            )
+            .child(
+                v_flex().gap_1().children(
+                    self.dev_flow
+                        .iter()
+                        .map(|node| Self::render_dev_flow_node(node)),
+                ),
+            )
+    }
+
+    fn render_dev_flow_node(node: &DevFlowNode) -> impl IntoElement {
+        let (glyph, color) = dev_flow_visual(node);
+        h_flex()
+            .gap_1()
+            .items_start()
+            .child(Label::new(glyph).color(color))
+            .child(Label::new(node.node.clone()).size(LabelSize::Small))
+            .when_some(node.evidence.as_ref(), |this, evidence| {
+                this.child(
+                    Label::new(evidence_summary(evidence))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
     }
 }
 
@@ -323,31 +493,12 @@ impl Focusable for PlanGraph {
 impl EventEmitter<()> for PlanGraph {}
 
 impl Render for PlanGraph {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = group_by_phase(&self.nodes);
-
-        v_flex()
-            .size_full()
-            .p_4()
-            .gap_4()
-            .child(Label::new("Plan graph"))
-            .child(Self::render_legend())
-            .child(
-                v_flex().gap_2().children(groups.into_iter().map(|(phase, nodes)| {
-                    h_flex()
-                        .gap_2()
-                        .items_start()
-                        .child(
-                            Label::new(phase)
-                                .size(LabelSize::Small)
-                                .color(ui::Color::Muted)
-                                .w_24(),
-                        )
-                        .child(h_flex().gap_1().flex_wrap().children(
-                            nodes.into_iter().map(Self::render_node),
-                        ))
-                })),
-            )
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.selected_plan.is_some() {
+            self.render_dev_flow(cx).into_any_element()
+        } else {
+            self.render_overview(cx).into_any_element()
+        }
     }
 }
 
@@ -398,6 +549,34 @@ mod tests {
         "2026-11-19T12:00:00Z".parse().unwrap()
     }
 
+    fn snapshot(name: &str, current: &str) -> plan_store::GraphSnapshot {
+        plan_store::GraphSnapshot {
+            plan_id: name.to_string(),
+            name: name.to_string(),
+            repo: Some("zed".to_string()),
+            current_node: Some(current.to_string()),
+            active_node: None,
+            holder: None,
+            heartbeat: None,
+            blocked_reason: None,
+            spent_tokens: 0,
+            done_nodes: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    fn evidence(sha: Option<&str>, condition: Option<&str>, negative: Option<i64>) -> EvidenceRow {
+        EvidenceRow {
+            plan_id: "P".to_string(),
+            node: "plan".to_string(),
+            artifact_sha: sha.map(str::to_string),
+            gate_exit_code: Some(0),
+            report_path: None,
+            falsifying_condition: condition.map(str::to_string),
+            negative_control: negative,
+        }
+    }
+
     #[test]
     fn states_derive_from_graph_state() {
         let n = now();
@@ -442,7 +621,6 @@ mod tests {
             ),
             NodeState::Stuck
         );
-        // Ready at a human gate (everything done through accept) blocks on you.
         assert_eq!(
             derive_node_state(
                 &row("H", Some("merge"), None, None, None),
@@ -510,20 +688,8 @@ mod tests {
     #[test]
     fn project_graph_reads_nodes_and_edges_from_the_store() {
         let store = PlanStore::open_in_memory().expect("in-memory store");
-        let mut snapshot = plan_store::GraphSnapshot {
-            plan_id: "P".to_string(),
-            name: "P".to_string(),
-            repo: Some("zed".to_string()),
-            current_node: Some("complete".to_string()),
-            active_node: None,
-            holder: None,
-            heartbeat: None,
-            blocked_reason: None,
-            spent_tokens: 0,
-            done_nodes: ROUTE.iter().map(|node| node.to_string()).collect(),
-            evidence: vec![],
-        };
-        snapshot.evidence = vec![];
+        let mut snapshot = snapshot("P", "complete");
+        snapshot.done_nodes = ROUTE.iter().map(|node| node.to_string()).collect();
         store.apply_graph_snapshot(&snapshot).unwrap();
         store
             .upsert_edge(&plan_store::EdgeRow {
@@ -540,5 +706,49 @@ mod tests {
         assert_eq!(nodes[0].done_count, ROUTE.len());
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].kind, "blocked_by");
+    }
+
+    #[test]
+    fn evidence_complete_requires_sha_condition_and_negative_control() {
+        assert!(evidence_complete(&evidence(
+            Some("abc"),
+            Some("still broken"),
+            Some(1)
+        )));
+        assert!(!evidence_complete(&evidence(
+            None,
+            Some("still broken"),
+            Some(1)
+        )));
+        assert!(!evidence_complete(&evidence(Some("abc"), None, Some(1))));
+        assert!(!evidence_complete(&evidence(
+            Some("abc"),
+            Some("still broken"),
+            None
+        )));
+    }
+
+    #[test]
+    fn dev_flow_marks_done_complete_vacuous_and_human_gates() {
+        let store = PlanStore::open_in_memory().expect("in-memory store");
+        let mut snapshot = snapshot("P", "implement");
+        snapshot.done_nodes = vec!["plan".to_string(), "promote".to_string()];
+        snapshot.evidence = vec![evidence(Some("abc"), Some("still broken"), Some(1))];
+        store.apply_graph_snapshot(&snapshot).unwrap();
+
+        let flow = project_dev_flow(&store, "P");
+        assert_eq!(flow.len(), ROUTE.len());
+
+        let by_name = |name: &str| flow.iter().find(|node| node.node == name).unwrap();
+
+        // `plan` is done and its evidence row is complete.
+        assert!(by_name("plan").done);
+        assert!(by_name("plan").complete);
+        // `promote` is done but has no evidence row — vacuous, not green.
+        assert!(by_name("promote").done);
+        assert!(!by_name("promote").complete);
+        // `merge` is a human gate stop-point.
+        assert!(by_name("merge").is_human_gate);
+        assert!(!by_name("merge").done);
     }
 }
