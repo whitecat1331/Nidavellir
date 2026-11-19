@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use gpui::{App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, Render, Window, actions};
+use gpui::{App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable, Render, Window, actions};
 use plan_store::{EdgeRow, EvidenceRow, FleetPlanRow, PlanStore};
 use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
@@ -449,7 +449,7 @@ impl PlanGraph {
     fn render_node(&self, node: &GraphNode, cx: &mut Context<Self>) -> impl IntoElement {
         let plan_id = node.id.clone();
         h_flex()
-            .id(node.id.as_str())
+            .id(ElementId::Name(node.id.clone().into()))
             .gap_1()
             .items_center()
             .px_2()
