@@ -207,7 +207,8 @@ impl Render for RoadmapPanel {
                     ),
             )
             .child(
-                v_flex()
+                div()
+                    .flex_col()
                     .size_full()
                     .overflow_y_scroll()
                     .px_2()
