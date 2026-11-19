@@ -47,6 +47,18 @@ pub struct EdgeRow {
     pub order_rank: Option<i64>,
 }
 
+/// The roadmap view's plan row: the priority tier (`order_rank`) and lifecycle
+/// stage/status the roadmap panel groups by, plus the plan's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoadmapPlanRow {
+    pub id: String,
+    pub name: String,
+    pub repo: Option<String>,
+    pub stage: Option<String>,
+    pub status: Option<String>,
+    pub order_rank: Option<i64>,
+}
+
 /// Per-node evidence — the 1.28 ledger slice the plan view renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRow {
@@ -273,6 +285,32 @@ impl PlanStore {
             .collect())
     }
 
+    pub fn roadmap_plans(&self) -> Result<Vec<RoadmapPlanRow>> {
+        let mut select = self.connection.select_bound::<(), (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        )>(indoc! {"
+            SELECT id, name, repo, stage, status, order_rank FROM plans
+            ORDER BY order_rank, name
+        "})?;
+        let rows = select(())?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, repo, stage, status, order_rank)| RoadmapPlanRow {
+                id,
+                name,
+                repo,
+                stage,
+                status,
+                order_rank,
+            })
+            .collect())
+    }
+
     pub fn evidence_for(&self, plan_id: &str) -> Result<Vec<EvidenceRow>> {
         let mut select = self.connection.select_bound::<String, (
             String,
@@ -456,6 +494,44 @@ impl PlanStore {
         ))
     }
 
+    /// Write the roadmap metadata columns (`name`/`repo`/`stage`/`status`/
+    /// `order_rank`). This is the fork-side contract for those columns — the
+    /// harness roadmap writer (`zed-tools/roadmap/`) writes the same columns
+    /// through SQLite directly — and the test seam the roadmap panel's read
+    /// path is exercised through. `apply_graph_snapshot` deliberately leaves
+    /// these columns untouched so this metadata writer owns them.
+    pub fn upsert_plan_metadata(&self, plan: &RoadmapPlanRow) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut upsert = self.connection.exec_bound::<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            String,
+        )>(indoc! {"
+            INSERT INTO plans (id, name, repo, stage, status, order_rank, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                repo = excluded.repo,
+                stage = excluded.stage,
+                status = excluded.status,
+                order_rank = excluded.order_rank,
+                updated_at = excluded.updated_at
+        "})?;
+        upsert((
+            plan.id.clone(),
+            plan.name.clone(),
+            plan.repo.clone(),
+            plan.stage.clone(),
+            plan.status.clone(),
+            plan.order_rank,
+            now,
+        ))
+    }
+
     pub fn upsert_edge(&self, edge: &EdgeRow) -> Result<()> {
         let mut upsert = self.connection.exec_bound::<(
             String,
@@ -614,5 +690,32 @@ mod tests {
         assert_eq!(edges[0].from_plan, "A");
         assert_eq!(edges[0].to_plan, "B");
         assert_eq!(edges[0].kind, "blocked_by");
+    }
+
+    #[test]
+    fn roadmap_plans_returns_tier_stage_and_rank() {
+        let store = store();
+        let plan = |id: &str, stage: &str, rank: i64| RoadmapPlanRow {
+            id: id.to_string(),
+            name: id.to_string(),
+            repo: Some("zed".to_string()),
+            stage: Some(stage.to_string()),
+            status: Some("in progress".to_string()),
+            order_rank: Some(rank),
+        };
+
+        store.upsert_plan_metadata(&plan("P1", "plan", 200)).unwrap();
+        store.upsert_plan_metadata(&plan("P3H", "draft", 600)).unwrap();
+        store.upsert_plan_metadata(&plan("DEFERRED", "plan", 9999)).unwrap();
+
+        // Ordered by order_rank, then name — so the roadmap panel reads
+        // "what's next" (lowest rank) off the top of this list.
+        let rows = store.roadmap_plans().unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["P1", "P3H", "DEFERRED"]
+        );
+        assert_eq!(rows[0].stage.as_deref(), Some("plan"));
+        assert_eq!(rows[2].order_rank, Some(9999));
     }
 }

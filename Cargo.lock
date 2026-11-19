@@ -15399,6 +15399,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roadmap_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "log",
+ "plan_store",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "rodio"
 version = "0.21.1"
 source = "git+https://github.com/RustAudio/rodio?rev=e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a#e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a"
@@ -22811,6 +22823,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "roadmap_panel",
  "rope",
  "sandbox",
  "search",

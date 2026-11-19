@@ -109,6 +109,7 @@ debugger_tools.workspace = true
 debugger_ui.workspace = true
 devops_panel.workspace = true
 fleet_panel.workspace = true
+roadmap_panel.workspace = true
 secret_panel.workspace = true
 dev_container.workspace = true
 diagnostics.workspace = true
