@@ -331,7 +331,7 @@ impl Render for PlanViewPanel {
                         let select = cx.listener({
                             let id = plan.id.clone();
                             move |this: &mut PlanViewPanel, _, _, cx| {
-                                this.select(id);
+                                this.select(id.clone());
                                 cx.notify();
                             }
                         });
