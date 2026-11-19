@@ -284,6 +284,7 @@ dependencies = [
  "lsp",
  "parking_lot",
  "paths",
+ "plan_store",
  "pretty_assertions",
  "project",
  "prompt_store",
@@ -6513,6 +6514,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "gpui",
+ "log",
+ "plan_store",
  "serde",
  "serde_json",
  "ui",
@@ -13531,6 +13534,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plan_store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "indoc",
+ "paths",
+ "sqlez",
+ "zed_env_vars",
+]
+
+[[package]]
 name = "platform_title_bar"
 version = "0.1.0"
 dependencies = [
@@ -15381,6 +15396,18 @@ checksum = "58450723cd9ee93273ce44a20b6ec4efe17f8ed2e3631474387bfdecf18bb2a9"
 dependencies = [
  "num-traits",
  "rmp",
+]
+
+[[package]]
+name = "roadmap_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "log",
+ "plan_store",
+ "ui",
+ "workspace",
 ]
 
 [[package]]
@@ -22796,6 +22823,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "roadmap_panel",
  "rope",
  "sandbox",
  "search",

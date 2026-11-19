@@ -3079,6 +3079,32 @@ impl GitRepository for RealGitRepository {
                         git.run(&["commit-tree", &tree, "-m", "Checkpoint"]).await?
                     };
 
+                    // Pin the checkpoint behind a local ref so recovery survives
+                    // `git gc`. Successive checkpoints are sibling commits, so the
+                    // reflog is the rollback-deeper-than-1 path: each force-update
+                    // appends an entry retained for `gc.reflogExpireUnreachable`.
+                    let checkpoint_ref = "refs/zed/checkpoints/latest";
+                    let previous_value = git
+                        .run(&["rev-parse", "--verify", "--quiet", checkpoint_ref])
+                        .await
+                        .ok()
+                        .unwrap_or_default();
+                    let previous_value = if previous_value.is_empty() {
+                        "0000000000000000000000000000000000000000".to_string()
+                    } else {
+                        previous_value
+                    };
+                    let update_args: Vec<String> = vec![
+                        "update-ref".to_string(),
+                        "--create-reflog".to_string(),
+                        "-m".to_string(),
+                        "checkpoint".to_string(),
+                        checkpoint_ref.to_string(),
+                        checkpoint_sha.clone(),
+                        previous_value,
+                    ];
+                    git.run(&update_args).await?;
+
                     Ok(GitRepositoryCheckpoint {
                         commit_sha: checkpoint_sha.parse()?,
                     })
@@ -5728,6 +5754,141 @@ mod tests {
         // );
     }
 
+    #[gpui::test]
+    async fn test_checkpoint_pins_ref(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        smol::fs::write(repo_dir.path().join("file"), "initial").await.unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        repo.stage_paths(vec![repo_path("file")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "Initial commit".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+        )
+        .await
+        .unwrap();
+
+        smol::fs::write(repo_dir.path().join("file"), "modified").await.unwrap();
+        let checkpoint = repo.checkpoint().await.unwrap();
+
+        let git = repo.test_git_binary();
+        let pinned = git
+            .run(&["rev-parse", "--verify", "--quiet", "refs/zed/checkpoints/latest"])
+            .await
+            .unwrap();
+        assert_eq!(pinned, checkpoint.commit_sha.to_string());
+    }
+
+    #[gpui::test]
+    async fn test_checkpoint_survives_gc(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        smol::fs::write(repo_dir.path().join("file"), "initial").await.unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        repo.stage_paths(vec![repo_path("file")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "Initial commit".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+        )
+        .await
+        .unwrap();
+
+        smol::fs::write(repo_dir.path().join("file"), "modified").await.unwrap();
+        let checkpoint = repo.checkpoint().await.unwrap();
+
+        repo.gc_prune_now().await.unwrap();
+
+        let git = repo.test_git_binary();
+        let pinned = git
+            .run(&["rev-parse", "--verify", "--quiet", "refs/zed/checkpoints/latest"])
+            .await
+            .unwrap();
+        assert_eq!(pinned, checkpoint.commit_sha.to_string());
+
+        let checkpoint_sha = checkpoint.commit_sha.to_string();
+        git.run(&["cat-file", "-e", checkpoint_sha.as_str()]).await.unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_checkpoint_ref_reflog(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let file_path = repo_dir.path().join("file");
+        smol::fs::write(&file_path, "initial").await.unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        repo.stage_paths(vec![repo_path("file")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "Initial commit".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+        )
+        .await
+        .unwrap();
+
+        smol::fs::write(&file_path, "first edit").await.unwrap();
+        let first = repo.checkpoint().await.unwrap();
+
+        smol::fs::write(&file_path, "second edit").await.unwrap();
+        let second = repo.checkpoint().await.unwrap();
+
+        let git = repo.test_git_binary();
+        let latest = git
+            .run(&["rev-parse", "--verify", "--quiet", "refs/zed/checkpoints/latest"])
+            .await
+            .unwrap();
+        assert_eq!(latest, second.commit_sha.to_string());
+
+        let previous = git
+            .run(&["rev-parse", "--verify", "--quiet", "refs/zed/checkpoints/latest@{1}"])
+            .await
+            .unwrap();
+        assert_eq!(previous, first.commit_sha.to_string());
+    }
+
     #[cfg(unix)]
     #[gpui::test]
     async fn test_commit_runs_git_hooks(cx: &mut TestAppContext) {
@@ -6864,6 +7025,16 @@ mod tests {
     }
 
     impl RealGitRepository {
+        fn test_git_binary(&self) -> GitBinary {
+            GitBinary::new(
+                self.any_git_binary_path.clone(),
+                self.command_directory(),
+                self.path(),
+                self.executor.clone(),
+                true,
+            )
+        }
+
         /// Force a Git garbage collection on the repository.
         fn gc(&self) -> BoxFuture<'_, Result<()>> {
             let working_directory = self.command_directory();
@@ -6881,6 +7052,19 @@ mod tests {
                         true,
                     );
                     git.run(&["gc", "--prune"]).await?;
+                    Ok(())
+                })
+                .boxed()
+        }
+
+        /// Force a Git GC that prunes even unreachable objects, so checkpoint
+        /// survival is attributable to the pinned ref rather than the 2-week
+        /// prune grace period.
+        fn gc_prune_now(&self) -> BoxFuture<'_, Result<()>> {
+            let git = self.test_git_binary();
+            self.executor
+                .spawn(async move {
+                    git.run(&["gc", "--prune=now"]).await?;
                     Ok(())
                 })
                 .boxed()
