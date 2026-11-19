@@ -236,9 +236,9 @@ impl PlanStore {
             .into_iter()
             .any(|(_, name, _, _, _, _)| name == "debugger_scoped");
         if !has_column {
-            connection.exec(
-                "ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0",
-            )?()?;
+            connection
+                .exec("ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0")?(
+            )?;
         }
         Ok(())
     }
@@ -265,7 +265,8 @@ impl PlanStore {
             for twin in group.iter().filter(|id| **id != survivor) {
                 Self::merge_plan_row(connection, &survivor, twin)?;
                 Self::remap_plan_dependents(connection, &survivor, twin)?;
-                let mut delete = connection.exec_bound::<String>("DELETE FROM plans WHERE id = ?1")?;
+                let mut delete =
+                    connection.exec_bound::<String>("DELETE FROM plans WHERE id = ?1")?;
                 delete(twin.clone())?;
             }
         }
@@ -321,10 +322,12 @@ impl PlanStore {
         "})?;
         move_incoming((survivor.to_string(), twin.to_string()))?;
 
-        connection
-            .exec_bound::<String>("DELETE FROM plan_nodes WHERE plan_id = ?1")?(twin.to_string())?;
-        connection
-            .exec_bound::<String>("DELETE FROM evidence WHERE plan_id = ?1")?(twin.to_string())?;
+        connection.exec_bound::<String>("DELETE FROM plan_nodes WHERE plan_id = ?1")?(
+            twin.to_string(),
+        )?;
+        connection.exec_bound::<String>("DELETE FROM evidence WHERE plan_id = ?1")?(
+            twin.to_string(),
+        )?;
         connection
             .exec_bound::<String>("DELETE FROM edges WHERE from_plan = ?1 OR to_plan = ?1")?(
             twin.to_string(),
@@ -351,7 +354,8 @@ impl PlanStore {
             .collect::<Vec<_>>();
 
         connection.exec("DELETE FROM edges")?()?;
-        let mut insert = connection.exec_bound::<(String, String, String, Option<i64>)>(indoc! {"
+        let mut insert =
+            connection.exec_bound::<(String, String, String, Option<i64>)>(indoc! {"
             INSERT OR IGNORE INTO edges (from_plan, to_plan, kind, order_rank)
             VALUES (?1, ?2, ?3, ?4)
         "})?;
@@ -436,39 +440,34 @@ impl PlanStore {
             FROM plans WHERE id = ?1
         "})?;
         let rows = select(plan_id.to_string())?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .map(
-                |(
-                    id,
-                    name,
-                    repo,
-                    current_node,
-                    active_node,
-                    holder,
-                    heartbeat,
-                    blocked_reason,
-                    spent_tokens,
-                )| FleetPlanRow {
-                    id,
-                    name,
-                    repo,
-                    current_node,
-                    active_node,
-                    holder,
-                    heartbeat,
-                    blocked_reason,
-                    spent_tokens,
-                },
-            ))
+        Ok(rows.into_iter().next().map(
+            |(
+                id,
+                name,
+                repo,
+                current_node,
+                active_node,
+                holder,
+                heartbeat,
+                blocked_reason,
+                spent_tokens,
+            )| FleetPlanRow {
+                id,
+                name,
+                repo,
+                current_node,
+                active_node,
+                holder,
+                heartbeat,
+                blocked_reason,
+                spent_tokens,
+            },
+        ))
     }
 
     pub fn done_nodes(&self, plan_id: &str) -> Result<Vec<String>> {
         let plan_id = normalize_plan_id(plan_id);
-        let mut select = self
-            .connection
-            .select_bound::<String, String>(indoc! {"
+        let mut select = self.connection.select_bound::<String, String>(indoc! {"
                 SELECT node FROM plan_nodes WHERE plan_id = ?1 ORDER BY node
             "})?;
         select(plan_id.to_string())
@@ -500,12 +499,9 @@ impl PlanStore {
     }
 
     pub fn edges(&self) -> Result<Vec<EdgeRow>> {
-        let mut select = self.connection.select_bound::<(), (
-            String,
-            String,
-            String,
-            Option<i64>,
-        )>(indoc! {"
+        let mut select = self
+            .connection
+            .select_bound::<(), (String, String, String, Option<i64>)>(indoc! {"
             SELECT from_plan, to_plan, kind, order_rank FROM edges
         "})?;
         let rows = select(())?;
@@ -535,14 +531,16 @@ impl PlanStore {
         let rows = select(())?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, repo, stage, status, order_rank)| RoadmapPlanRow {
-                id,
-                name,
-                repo,
-                stage,
-                status,
-                order_rank,
-            })
+            .map(
+                |(id, name, repo, stage, status, order_rank)| RoadmapPlanRow {
+                    id,
+                    name,
+                    repo,
+                    stage,
+                    status,
+                    order_rank,
+                },
+            )
             .collect())
     }
 
@@ -591,9 +589,7 @@ impl PlanStore {
     /// sub-graph. `false` for an unknown plan id.
     pub fn debugger_scoped(&self, plan_id: &str) -> Result<bool> {
         let plan_id = normalize_plan_id(plan_id);
-        let mut select = self
-            .connection
-            .select_bound::<String, bool>(indoc! {"
+        let mut select = self.connection.select_bound::<String, bool>(indoc! {"
                 SELECT debugger_scoped FROM plans WHERE id = ?1
             "})?;
         let rows = select(plan_id.to_string())?;
@@ -623,7 +619,9 @@ impl PlanStore {
     pub fn set_debugger_scoped(&self, plan_id: &str, scoped: bool) -> Result<()> {
         let plan_id = normalize_plan_id(plan_id);
         let now = chrono::Utc::now().to_rfc3339();
-        let mut update = self.connection.exec_bound::<(bool, String, String)>(indoc! {"
+        let mut update = self
+            .connection
+            .exec_bound::<(bool, String, String)>(indoc! {"
             UPDATE plans SET debugger_scoped = ?1, updated_at = ?2 WHERE id = ?3
         "})?;
         update((scoped, now, plan_id.to_string()))
@@ -672,9 +670,7 @@ impl PlanStore {
     }
 
     fn replace_plan_nodes(&self, plan_id: &str, done_nodes: &[String]) -> Result<()> {
-        let mut delete = self
-            .connection
-            .exec_bound::<String>(indoc! {"
+        let mut delete = self.connection.exec_bound::<String>(indoc! {"
                 DELETE FROM plan_nodes WHERE plan_id = ?1
             "})?;
         delete(plan_id.to_string())?;
@@ -799,12 +795,9 @@ impl PlanStore {
     }
 
     pub fn upsert_edge(&self, edge: &EdgeRow) -> Result<()> {
-        let mut upsert = self.connection.exec_bound::<(
-            String,
-            String,
-            String,
-            Option<i64>,
-        )>(indoc! {"
+        let mut upsert = self
+            .connection
+            .exec_bound::<(String, String, String, Option<i64>)>(indoc! {"
             INSERT INTO edges (from_plan, to_plan, kind, order_rank)
             VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(from_plan, to_plan, kind) DO UPDATE SET
@@ -1002,9 +995,15 @@ mod tests {
             order_rank: Some(rank),
         };
 
-        store.upsert_plan_metadata(&plan("P1", "plan", 200)).unwrap();
-        store.upsert_plan_metadata(&plan("P3H", "draft", 600)).unwrap();
-        store.upsert_plan_metadata(&plan("DEFERRED", "plan", 9999)).unwrap();
+        store
+            .upsert_plan_metadata(&plan("P1", "plan", 200))
+            .unwrap();
+        store
+            .upsert_plan_metadata(&plan("P3H", "draft", 600))
+            .unwrap();
+        store
+            .upsert_plan_metadata(&plan("DEFERRED", "plan", 9999))
+            .unwrap();
 
         // Ordered by order_rank, then name — so the roadmap panel reads
         // "what's next" (lowest rank) off the top of this list.
@@ -1062,13 +1061,21 @@ mod tests {
             .unwrap();
 
         let plans = store.fleet_plans().unwrap();
-        assert_eq!(plans.len(), 1, "the filename write aliases onto the kebab row");
+        assert_eq!(
+            plans.len(),
+            1,
+            "the filename write aliases onto the kebab row"
+        );
         assert_eq!(plans[0].id, "plan-of-action-2026-11-19-x");
         assert_eq!(plans[0].current_node.as_deref(), Some("fork"));
 
         assert_eq!(store.edges().unwrap().len(), 1);
         assert_eq!(
-            store.plan("PLAN_OF_ACTION-2026-11-19-x.md").unwrap().unwrap().id,
+            store
+                .plan("PLAN_OF_ACTION-2026-11-19-x.md")
+                .unwrap()
+                .unwrap()
+                .id,
             "plan-of-action-2026-11-19-x"
         );
     }
@@ -1086,10 +1093,18 @@ mod tests {
             INSERT INTO plans (id, name, repo, current_node, updated_at)
             VALUES ('FOO_BAR.md', 'FOO_BAR.md', 'zed', 'fork', '2026-01-02T00:00:00Z')
         "});
-        exec("INSERT INTO plan_nodes (plan_id, node, completed_at) VALUES ('FOO_BAR.md', 'plan', '2026-01-02T00:00:00Z')");
-        exec("INSERT INTO evidence (plan_id, node, updated_at) VALUES ('FOO_BAR.md', 'plan', '2026-01-02T00:00:00Z')");
-        exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('FOO_BAR.md', 'other', 'related')");
-        exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('before', 'FOO_BAR.md', 'blocked_by')");
+        exec(
+            "INSERT INTO plan_nodes (plan_id, node, completed_at) VALUES ('FOO_BAR.md', 'plan', '2026-01-02T00:00:00Z')",
+        );
+        exec(
+            "INSERT INTO evidence (plan_id, node, updated_at) VALUES ('FOO_BAR.md', 'plan', '2026-01-02T00:00:00Z')",
+        );
+        exec(
+            "INSERT INTO edges (from_plan, to_plan, kind) VALUES ('FOO_BAR.md', 'other', 'related')",
+        );
+        exec(
+            "INSERT INTO edges (from_plan, to_plan, kind) VALUES ('before', 'FOO_BAR.md', 'blocked_by')",
+        );
 
         PlanStore::dedupe_plan_identities(&store.connection).unwrap();
 
@@ -1110,8 +1125,16 @@ mod tests {
         assert_eq!(
             edge_select().unwrap(),
             vec![
-                ("before".to_string(), "foo-bar".to_string(), "blocked_by".to_string()),
-                ("foo-bar".to_string(), "other".to_string(), "related".to_string()),
+                (
+                    "before".to_string(),
+                    "foo-bar".to_string(),
+                    "blocked_by".to_string()
+                ),
+                (
+                    "foo-bar".to_string(),
+                    "other".to_string(),
+                    "related".to_string()
+                ),
             ]
         );
     }
@@ -1140,9 +1163,15 @@ mod tests {
             })
             .unwrap();
         let exec = |sql: &str| store.connection.exec(sql).unwrap()().unwrap();
-        exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('dispatch', 'interactive-graph-roadmap (the read-only graph slice must land and', 'blocked_by')");
-        exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('suite', 'browser-test', 'related')");
-        exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('interactive-graph-roadmap', 'interactive-graph-roadmap', 'related')");
+        exec(
+            "INSERT INTO edges (from_plan, to_plan, kind) VALUES ('dispatch', 'interactive-graph-roadmap (the read-only graph slice must land and', 'blocked_by')",
+        );
+        exec(
+            "INSERT INTO edges (from_plan, to_plan, kind) VALUES ('suite', 'browser-test', 'related')",
+        );
+        exec(
+            "INSERT INTO edges (from_plan, to_plan, kind) VALUES ('interactive-graph-roadmap', 'interactive-graph-roadmap', 'related')",
+        );
 
         PlanStore::clean_dangling_edges(&store.connection).unwrap();
 
@@ -1175,7 +1204,7 @@ mod tests {
                 )
             "})
             .unwrap()()
-            .unwrap();
+        .unwrap();
         connection
             .exec("INSERT INTO plans (id, name, updated_at) VALUES ('OLD', 'OLD', '2026-01-01T00:00:00Z')")
             .unwrap()()
