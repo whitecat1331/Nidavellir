@@ -1129,6 +1129,16 @@ mod tests {
                 order_rank: None,
             })
             .unwrap();
+        store
+            .upsert_plan_metadata(&RoadmapPlanRow {
+                id: "dispatch".to_string(),
+                name: "UI_DRIVEN_DEV_FLOW_DISPATCH".to_string(),
+                repo: Some("zed-debugger-demo".to_string()),
+                stage: Some("draft".to_string()),
+                status: None,
+                order_rank: None,
+            })
+            .unwrap();
         let exec = |sql: &str| store.connection.exec(sql).unwrap()().unwrap();
         exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('dispatch', 'interactive-graph-roadmap (the read-only graph slice must land and', 'blocked_by')");
         exec("INSERT INTO edges (from_plan, to_plan, kind) VALUES ('suite', 'browser-test', 'related')");
@@ -1164,10 +1174,13 @@ mod tests {
                     updated_at TEXT NOT NULL
                 )
             "})
-            .unwrap()();
+            })
+            .unwrap()()
+            .unwrap();
         connection
             .exec("INSERT INTO plans (id, name, updated_at) VALUES ('OLD', 'OLD', '2026-01-01T00:00:00Z')")
-            .unwrap()();
+            .unwrap()()
+            .unwrap();
 
         let store = PlanStore::init(connection).expect("migrate an old store");
         assert!(!store.debugger_scoped("OLD").unwrap());
