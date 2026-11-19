@@ -322,6 +322,114 @@ fn evidence_summary(evidence: &EvidenceRow) -> String {
     )
 }
 
+/// The coordinator's read-only decision for a plan (1.29 D2, Option B): what
+/// the next step is, or why the flow is stopped. The graph renders this; it
+/// never acts on it — the agent executes, the graph recommends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionKind {
+    Active,
+    Blocked,
+    Retry,
+    Next,
+    Paused,
+    Done,
+}
+
+pub struct Decision {
+    pub kind: DecisionKind,
+    pub node: String,
+    pub reason: String,
+}
+
+/// Project the coordinator's decision order — retry → human-gate pause → next —
+/// as a read-only view over the store. Mirrors `graph_tool`'s `coordinate`
+/// without mutating state.
+pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
+    let Some(plan) = store.plan(plan_id).unwrap_or_default() else {
+        return Decision {
+            kind: DecisionKind::Paused,
+            node: "—".to_string(),
+            reason: "plan not found".to_string(),
+        };
+    };
+
+    if plan.current_node.as_deref() == Some("complete") {
+        return Decision {
+            kind: DecisionKind::Done,
+            node: "complete".to_string(),
+            reason: "plan complete".to_string(),
+        };
+    }
+
+    if let Some(reason) = &plan.blocked_reason {
+        return Decision {
+            kind: DecisionKind::Blocked,
+            node: plan.current_node.clone().unwrap_or_default(),
+            reason: format!("blocked — {reason}"),
+        };
+    }
+
+    if let Some(active) = &plan.active_node {
+        return Decision {
+            kind: DecisionKind::Active,
+            node: active.clone(),
+            reason: "node is active".to_string(),
+        };
+    }
+
+    let done = store.done_nodes(plan_id).unwrap_or_default();
+    let evidence = store.evidence_for(plan_id).unwrap_or_default();
+    let done_set: HashSet<&str> = done.iter().map(|node| node.as_str()).collect();
+    let failed: HashSet<&str> = evidence
+        .iter()
+        .filter(|row| row.gate_exit_code == Some(1))
+        .map(|row| row.node.as_str())
+        .collect();
+
+    // A done gate that failed must be retried before its successor (the
+    // coordinator's `retry_candidate`).
+    if let Some(retry) = ROUTE
+        .iter()
+        .copied()
+        .find(|node| done_set.contains(node) && failed.contains(node))
+    {
+        return Decision {
+            kind: DecisionKind::Retry,
+            node: retry.to_string(),
+            reason: "failed — retry".to_string(),
+        };
+    }
+
+    match next_ready(&done_set) {
+        Some(node) if is_human_gate(node) => Decision {
+            kind: DecisionKind::Blocked,
+            node: node.to_string(),
+            reason: "human gate — pause and ask".to_string(),
+        },
+        Some(node) => Decision {
+            kind: DecisionKind::Next,
+            node: node.to_string(),
+            reason: "next step".to_string(),
+        },
+        None => Decision {
+            kind: DecisionKind::Paused,
+            node: "—".to_string(),
+            reason: "no ready node".to_string(),
+        },
+    }
+}
+
+pub fn decision_text(decision: &Decision) -> String {
+    match decision.kind {
+        DecisionKind::Done => "Done — plan complete".to_string(),
+        DecisionKind::Active => format!("{} — active", decision.node),
+        DecisionKind::Blocked => format!("⏸ blocked at {} — {}", decision.node, decision.reason),
+        DecisionKind::Retry => format!("retry {} — {}", decision.node, decision.reason),
+        DecisionKind::Next => format!("next step: {}", decision.node),
+        DecisionKind::Paused => format!("paused — {}", decision.reason),
+    }
+}
+
 /// One layer of the layout: a phase (route node) and the plans currently at it.
 fn phase_order(phase: &str) -> usize {
     ROUTE.iter().position(|p| *p == phase).unwrap_or(ROUTE.len())
@@ -353,6 +461,7 @@ pub struct PlanGraph {
     selected_plan: Option<String>,
     dev_flow: Vec<DevFlowNode>,
     debugger_scoped: bool,
+    decision: Option<Decision>,
 }
 
 impl PlanGraph {
@@ -366,6 +475,7 @@ impl PlanGraph {
             selected_plan: None,
             dev_flow: Vec::new(),
             debugger_scoped: false,
+            decision: None,
         }
     }
 
@@ -379,6 +489,7 @@ impl PlanGraph {
         let store = Self::open_store();
         self.dev_flow = project_dev_flow(&store, &plan_id);
         self.debugger_scoped = store.debugger_scoped(&plan_id).unwrap_or(false);
+        self.decision = Some(project_decision(&store, &plan_id));
         self.selected_plan = Some(plan_id);
         cx.notify();
     }
@@ -386,6 +497,7 @@ impl PlanGraph {
     fn zoom_out(&mut self, cx: &mut Context<Self>) {
         self.selected_plan = None;
         self.dev_flow.clear();
+        self.decision = None;
         cx.notify();
     }
 
@@ -477,6 +589,9 @@ impl PlanGraph {
                     .color(Color::Muted)
                     .size(LabelSize::Small),
             )
+            .when_some(self.decision.as_ref(), |this, decision| {
+                this.child(Label::new(decision_text(decision)).size(LabelSize::Small))
+            })
             .child(
                 v_flex().gap_1().children(
                     self.dev_flow
@@ -791,5 +906,59 @@ mod tests {
         assert!(debugger_sub_graph(true).contains(&"stage"));
         assert!(debugger_sub_graph(true).contains(&"fix"));
         assert!(debugger_sub_graph(false).is_empty());
+    }
+
+    #[test]
+    fn decision_projection_stops_at_human_gates_and_retries_failed_gates() {
+        let store = PlanStore::open_in_memory().expect("in-memory store");
+
+        // Next ready node is a human gate → Blocked, not advanced past it.
+        let mut gate = snapshot("P", "merge");
+        gate.done_nodes = [
+            "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        store.apply_graph_snapshot(&gate).unwrap();
+        let decision = project_decision(&store, "P");
+        assert_eq!(decision.kind, DecisionKind::Blocked);
+        assert_eq!(decision.node, "merge");
+
+        // A done gate that failed → Retry (the skipped gate is refused).
+        let mut failed = snapshot("F", "compile");
+        failed.done_nodes = [
+            "plan", "promote", "claim", "fork", "implement", "verify",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        failed.evidence = vec![EvidenceRow {
+            plan_id: "F".to_string(),
+            node: "verify".to_string(),
+            artifact_sha: None,
+            gate_exit_code: Some(1),
+            report_path: None,
+            falsifying_condition: None,
+            negative_control: None,
+        }];
+        store.apply_graph_snapshot(&failed).unwrap();
+        let decision = project_decision(&store, "F");
+        assert_eq!(decision.kind, DecisionKind::Retry);
+        assert_eq!(decision.node, "verify");
+
+        // A non-gate next ready node → Next.
+        let mut next = snapshot("N", "implement");
+        next.done_nodes = ["plan", "promote", "claim", "fork"]
+            .map(str::to_string)
+            .to_vec();
+        store.apply_graph_snapshot(&next).unwrap();
+        let decision = project_decision(&store, "N");
+        assert_eq!(decision.kind, DecisionKind::Next);
+        assert_eq!(decision.node, "implement");
+
+        // A complete plan → Done.
+        let mut done = snapshot("D", "complete");
+        done.done_nodes = ROUTE.iter().map(|node| node.to_string()).collect();
+        store.apply_graph_snapshot(&done).unwrap();
+        assert_eq!(project_decision(&store, "D").kind, DecisionKind::Done);
     }
 }
