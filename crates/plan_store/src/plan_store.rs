@@ -134,6 +134,7 @@ impl PlanStore {
                 heartbeat TEXT,
                 blocked_reason TEXT,
                 spent_tokens INTEGER NOT NULL DEFAULT 0,
+                debugger_scoped INTEGER NOT NULL DEFAULT 0,
                 order_rank INTEGER,
                 updated_at TEXT NOT NULL
             )
@@ -398,6 +399,19 @@ impl PlanStore {
             .collect())
     }
 
+    /// Whether the plan is debugger-scoped — the marker the graph tool co-writes
+    /// (1.29 D8) so the plan graph renders the conditional `stage→…→fix`
+    /// sub-graph. `false` for an unknown plan id.
+    pub fn debugger_scoped(&self, plan_id: &str) -> Result<bool> {
+        let mut select = self
+            .connection
+            .select_bound::<String, bool>(indoc! {"
+                SELECT debugger_scoped FROM plans WHERE id = ?1
+            "})?;
+        let rows = select(plan_id.to_string())?;
+        Ok(rows.into_iter().next().unwrap_or(false))
+    }
+
     // ---- write API (the state-of-record) ----
 
     /// Apply the graph tool's state at save time: plan row + done nodes +
@@ -410,6 +424,19 @@ impl PlanStore {
             self.upsert_evidence(evidence)?;
         }
         Ok(())
+    }
+
+    /// Set the plan's debugger-scope marker. The graph tool calls this after
+    /// `apply_graph_snapshot` (which creates the plan row), so the marker rides
+    /// the same state-of-record write as the rest of the graph state;
+    /// `apply_graph_snapshot` deliberately leaves this column untouched so this
+    /// is its sole writer.
+    pub fn set_debugger_scoped(&self, plan_id: &str, scoped: bool) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut update = self.connection.exec_bound::<(bool, String, String)>(indoc! {"
+            UPDATE plans SET debugger_scoped = ?1, updated_at = ?2 WHERE id = ?3
+        "})?;
+        update((scoped, now, plan_id.to_string()))
     }
 
     fn upsert_plan(&self, snapshot: &GraphSnapshot) -> Result<()> {
@@ -713,6 +740,23 @@ mod tests {
             by_name("FROZEN").blocked_reason.as_deref(),
             Some("human gate")
         );
+    }
+
+    #[test]
+    fn debugger_scope_round_trips() {
+        let store = store();
+        store
+            .apply_graph_snapshot(&snapshot("PLAN_A", "implement", 0))
+            .unwrap();
+
+        assert!(!store.debugger_scoped("PLAN_A").unwrap());
+        assert!(!store.debugger_scoped("MISSING").unwrap());
+
+        store.set_debugger_scoped("PLAN_A", true).unwrap();
+        assert!(store.debugger_scoped("PLAN_A").unwrap());
+
+        store.set_debugger_scoped("PLAN_A", false).unwrap();
+        assert!(!store.debugger_scoped("PLAN_A").unwrap());
     }
 
     #[test]

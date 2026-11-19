@@ -110,6 +110,11 @@ pub struct GraphToolInput {
     /// For `coordinate`: whether the executor is explicitly asking for a decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<bool>,
+    /// For `init`: the plan's scope. `"debugger"` marks the plan debugger-scoped,
+    /// co-writing the store's `debugger_scoped` flag so the plan graph renders the
+    /// conditional `stage→…→fix` sub-graph (1.29 D8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// A structured failure record for a failed attempt (D12, `Reflexion`-shaped).
@@ -244,6 +249,10 @@ const BACK_EDGES: &[(&str, &str)] = &[
 /// rather than restating the list. The launch and laptop-takeover gates are
 /// operational (owned by `dev-flow` / `remote-compiler`), not route nodes.
 const HUMAN_GATES: &[&str] = &["merge", "release", "complete"];
+
+/// The `graph init` scope value that marks a plan debugger-scoped, so the plan
+/// graph renders the conditional `stage→…→fix` sub-graph (1.29 D8).
+const DEBUGGER_SCOPE: &str = "debugger";
 
 /// Attempt budget for a single node before it is declared exhausted (D12).
 const RETRY_BUDGET: usize = 3;
@@ -411,6 +420,8 @@ struct BackEdgeTraversal {
 struct GraphState {
     plan: String,
     repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
     #[serde(default)]
     current: Option<String>,
     #[serde(default)]
@@ -1492,8 +1503,12 @@ fn graph_snapshot(state: &GraphState) -> plan_store::GraphSnapshot {
 #[cfg(not(test))]
 fn persist_to_store(state: &GraphState) {
     let snapshot = graph_snapshot(state);
+    let debugger_scoped = state.scope.as_deref() == Some(DEBUGGER_SCOPE);
     if let Err(error) = (|| -> Result<()> {
-        plan_store::PlanStore::open_default()?.apply_graph_snapshot(&snapshot)
+        let store = plan_store::PlanStore::open_default()?;
+        store.apply_graph_snapshot(&snapshot)?;
+        store.set_debugger_scoped(&state.plan, debugger_scoped)?;
+        Ok(())
     })() {
         log::error!("[GRAPH] failed to persist plan state to the store: {error:#}");
     }
@@ -1522,6 +1537,7 @@ fn run_operation(
             let state = GraphState {
                 plan,
                 repo,
+                scope: input.scope,
                 current: None,
                 done: Vec::new(),
                 next: vec!["plan".to_string()],
@@ -1657,6 +1673,7 @@ mod tests {
         GraphState {
             plan: "TRIVIAL".to_string(),
             repo: "zed".to_string(),
+            scope: None,
             current: None,
             done: Vec::new(),
             next: vec!["plan".to_string()],
@@ -2005,6 +2022,7 @@ mod tests {
                 }),
                 baseline: None,
                 ask: None,
+                scope: Some("debugger".to_string()),
             },
             path.clone(),
             Some("thread-1"),
@@ -2018,6 +2036,7 @@ mod tests {
         let budget = loaded.budget.expect("budget should be stored");
         assert_eq!(budget.max_tokens, 100_000);
         assert_eq!(budget.max_wall_clock_ms, 600_000);
+        assert_eq!(loaded.scope.as_deref(), Some("debugger"));
     }
 
     #[test]
