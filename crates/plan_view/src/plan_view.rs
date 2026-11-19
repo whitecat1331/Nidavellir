@@ -39,6 +39,14 @@ fn is_human_gate(node: &str) -> bool {
     matches!(node, "merge" | "release" | "complete")
 }
 
+/// A plan the selector lists is one the graph tool has actually traversed —
+/// its `current_node`/`active_node` are set. Roadmap-metadata-only rows (the
+/// bulk of the store) have no dev-flow nodes to show, so listing them would
+/// bury the node graph under hundreds of empty selectors.
+fn has_graph_state(plan: &FleetPlanRow) -> bool {
+    plan.current_node.is_some() || plan.active_node.is_some()
+}
+
 fn non_empty(value: Option<&str>) -> bool {
     value.map_or(false, |value| !value.trim().is_empty())
 }
@@ -251,6 +259,7 @@ impl PlanViewPanel {
         };
 
         self.plans = store.fleet_plans().unwrap_or_default();
+        self.plans.retain(has_graph_state);
         let selected = self
             .selected_plan_id
             .clone()
@@ -411,7 +420,7 @@ impl Panel for PlanViewPanel {
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> gpui::Pixels {
-        px(300.)
+        px(380.)
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
@@ -584,6 +593,13 @@ mod tests {
         let pending_merge = node(&nodes, "release");
         assert_eq!(pending_merge.state, NodeState::Pending);
         assert_eq!(pending_merge.state_label(), "stop-point (human gate)");
+    }
+
+    #[test]
+    fn selector_lists_only_plans_the_graph_has_traversed() {
+        assert!(has_graph_state(&plan_row(Some("verify"), None)));
+        assert!(has_graph_state(&plan_row(None, Some("implement"))));
+        assert!(!has_graph_state(&plan_row(None, None)));
     }
 
     #[test]
