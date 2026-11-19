@@ -209,6 +209,7 @@ impl Render for RoadmapPanel {
             .child(
                 v_flex()
                     .size_full()
+                    .overflow_y_scroll()
                     .px_2()
                     .gap_1()
                     .when_some(self.last_error.clone(), |element, error| {
