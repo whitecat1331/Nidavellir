@@ -17,7 +17,7 @@ use gpui::{
     Task, WeakEntity, Window,
 };
 use plan_store::PlanStore;
-use ui::{prelude::*, Button, ButtonSize, IconName, Label, LabelSize};
+use ui::{prelude::*, Button, ButtonSize, IconName, Label, LabelSize, StatefulInteractiveElement};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
