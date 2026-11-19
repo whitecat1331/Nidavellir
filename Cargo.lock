@@ -13546,6 +13546,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plan_view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "plan_store",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "platform_title_bar"
 version = "0.1.0"
 dependencies = [
@@ -22809,6 +22820,7 @@ dependencies = [
  "paths",
  "picker",
  "pkg-config",
+ "plan_view",
  "pretty_assertions",
  "profiling",
  "project",
