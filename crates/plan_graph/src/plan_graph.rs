@@ -29,6 +29,19 @@ const ROUTE: [&str; 11] = [
 /// A plan with no activity for this long is visibly stalled, not "moving".
 const STALL_SECONDS: i64 = 15 * 60;
 
+/// The debugger loop's `stage→…→fix` sub-graph, rendered as a conditional edge
+/// from a dev-flow node when the plan is debugger-scoped (1.29 D8).
+const DEBUGGER_SUB_GRAPH: [&str; 6] = ["stage", "test", "verify", "restart", "run", "fix"];
+
+/// The sub-graph nodes to render, empty unless the plan is debugger-scoped.
+pub fn debugger_sub_graph(scoped: bool) -> &'static [&'static str] {
+    if scoped {
+        &DEBUGGER_SUB_GRAPH
+    } else {
+        &[]
+    }
+}
+
 /// The four build-progress states the legend renders. `Pending` is a fifth
 /// "not started" state that is not part of the progress legend.
 const LEGEND_STATES: [NodeState; 4] = [
@@ -339,6 +352,7 @@ pub struct PlanGraph {
     edges: Vec<EdgeRow>,
     selected_plan: Option<String>,
     dev_flow: Vec<DevFlowNode>,
+    debugger_scoped: bool,
 }
 
 impl PlanGraph {
@@ -351,6 +365,7 @@ impl PlanGraph {
             edges,
             selected_plan: None,
             dev_flow: Vec::new(),
+            debugger_scoped: false,
         }
     }
 
@@ -368,7 +383,9 @@ impl PlanGraph {
     }
 
     fn zoom_in(&mut self, plan_id: String, cx: &mut Context<Self>) {
-        self.dev_flow = project_dev_flow(&Self::open_store(), &plan_id);
+        let store = Self::open_store();
+        self.dev_flow = project_dev_flow(&store, &plan_id);
+        self.debugger_scoped = store.debugger_scoped(&plan_id).unwrap_or(false);
         self.selected_plan = Some(plan_id);
         cx.notify();
     }
@@ -446,6 +463,8 @@ impl PlanGraph {
     }
 
     fn render_dev_flow(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let debugger_scoped = self.debugger_scoped;
+
         v_flex()
             .gap_2()
             .child(
@@ -465,6 +484,20 @@ impl PlanGraph {
                         .map(|node| Self::render_dev_flow_node(node)),
                 ),
             )
+            .when(debugger_scoped, |this| {
+                this.child(
+                    Label::new("Debugger loop (stage → test → verify → restart → run → fix)")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    h_flex().gap_2().children(
+                        debugger_sub_graph(debugger_scoped)
+                            .iter()
+                            .map(|node| Label::new(*node).size(LabelSize::Small)),
+                    ),
+                )
+            })
     }
 
     fn render_dev_flow_node(node: &DevFlowNode) -> impl IntoElement {
@@ -750,5 +783,13 @@ mod tests {
         // `merge` is a human gate stop-point.
         assert!(by_name("merge").is_human_gate);
         assert!(!by_name("merge").done);
+    }
+
+    #[test]
+    fn debugger_sub_graph_is_conditional_on_scope() {
+        assert_eq!(debugger_sub_graph(true).len(), 6);
+        assert!(debugger_sub_graph(true).contains(&"stage"));
+        assert!(debugger_sub_graph(true).contains(&"fix"));
+        assert!(debugger_sub_graph(false).is_empty());
     }
 }
