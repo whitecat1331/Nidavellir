@@ -1174,7 +1174,6 @@ mod tests {
                     updated_at TEXT NOT NULL
                 )
             "})
-            })
             .unwrap()()
             .unwrap();
         connection
