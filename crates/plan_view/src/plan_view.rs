@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn pending_and_done_nodes_render_distinctly() {
         let plan = plan_row(Some("implement"), Some("implement"));
-        let done = HashSet::from(["plan", "promote", "claim", "fork"]);
+        let done = HashSet::from(["plan", "promote", "claim", "fork"].map(str::to_string));
         let evidence = HashMap::new();
 
         let nodes = derive_nodes(&plan, &done, &evidence);
