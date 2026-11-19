@@ -208,6 +208,7 @@ impl Render for RoadmapPanel {
             )
             .child(
                 div()
+                    .id("roadmap-scroll")
                     .flex_col()
                     .size_full()
                     .overflow_y_scroll()
