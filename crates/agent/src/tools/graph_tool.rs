@@ -250,10 +250,6 @@ const BACK_EDGES: &[(&str, &str)] = &[
 /// operational (owned by `dev-flow` / `remote-compiler`), not route nodes.
 const HUMAN_GATES: &[&str] = &["merge", "release", "complete"];
 
-/// The `graph init` scope value that marks a plan debugger-scoped, so the plan
-/// graph renders the conditional `stage→…→fix` sub-graph (1.29 D8).
-const DEBUGGER_SCOPE: &str = "debugger";
-
 /// Attempt budget for a single node before it is declared exhausted (D12).
 const RETRY_BUDGET: usize = 3;
 
@@ -1502,6 +1498,9 @@ fn graph_snapshot(state: &GraphState) -> plan_store::GraphSnapshot {
 /// fail the graph operation — it is logged and the next save retries.
 #[cfg(not(test))]
 fn persist_to_store(state: &GraphState) {
+    /// The `graph init` scope value that marks a plan debugger-scoped (1.29 D8).
+    const DEBUGGER_SCOPE: &str = "debugger";
+
     let snapshot = graph_snapshot(state);
     let debugger_scoped = state.scope.as_deref() == Some(DEBUGGER_SCOPE);
     if let Err(error) = (|| -> Result<()> {
