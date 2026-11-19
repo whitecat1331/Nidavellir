@@ -230,6 +230,54 @@ impl PlanStore {
             .collect())
     }
 
+    /// The fleet view's row for a single plan, or `None` when absent — the
+    /// plan view's selection seam (`fleet_plans` returns every plan; the plan
+    /// view selects one and reads its nodes + evidence).
+    pub fn plan(&self, plan_id: &str) -> Result<Option<FleetPlanRow>> {
+        let mut select = self.connection.select_bound::<String, (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            u64,
+        )>(indoc! {"
+            SELECT id, name, repo, current_node, active_node, holder,
+                   heartbeat, blocked_reason, spent_tokens
+            FROM plans WHERE id = ?1
+        "})?;
+        let rows = select(plan_id.to_string())?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(
+                |(
+                    id,
+                    name,
+                    repo,
+                    current_node,
+                    active_node,
+                    holder,
+                    heartbeat,
+                    blocked_reason,
+                    spent_tokens,
+                )| FleetPlanRow {
+                    id,
+                    name,
+                    repo,
+                    current_node,
+                    active_node,
+                    holder,
+                    heartbeat,
+                    blocked_reason,
+                    spent_tokens,
+                },
+            ))
+    }
+
     pub fn done_nodes(&self, plan_id: &str) -> Result<Vec<String>> {
         let mut select = self
             .connection
@@ -603,6 +651,21 @@ mod tests {
 
         let done = store.done_nodes("PLAN_A").unwrap();
         assert_eq!(done, vec!["plan", "promote"]);
+    }
+
+    #[test]
+    fn plan_returns_single_plan_or_none() {
+        let store = store();
+        store
+            .apply_graph_snapshot(&snapshot("PLAN_A", "implement", 42))
+            .unwrap();
+
+        let plan = store.plan("PLAN_A").unwrap().expect("PLAN_A exists");
+        assert_eq!(plan.id, "PLAN_A");
+        assert_eq!(plan.current_node.as_deref(), Some("implement"));
+        assert_eq!(plan.spent_tokens, 42);
+
+        assert!(store.plan("MISSING").unwrap().is_none());
     }
 
     #[test]
