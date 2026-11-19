@@ -375,13 +375,6 @@ impl PlanGraph {
             .expect("plan store (on-disk or in-memory)")
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        let (nodes, edges) = project_graph(&Self::open_store(), Utc::now());
-        self.nodes = nodes;
-        self.edges = edges;
-        cx.notify();
-    }
-
     fn zoom_in(&mut self, plan_id: String, cx: &mut Context<Self>) {
         let store = Self::open_store();
         self.dev_flow = project_dev_flow(&store, &plan_id);
@@ -423,7 +416,11 @@ impl PlanGraph {
 
         v_flex()
             .gap_4()
-            .child(Label::new("Plan graph"))
+            .child(Label::new(format!(
+                "Plan graph — {} plans, {} edges",
+                self.nodes.len(),
+                self.edges.len()
+            )))
             .child(Self::render_legend())
             .child(
                 v_flex().gap_2().children(groups.into_iter().map(|(phase, nodes)| {
