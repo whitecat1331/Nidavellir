@@ -439,7 +439,7 @@ impl PlanStore {
                    heartbeat, blocked_reason, spent_tokens
             FROM plans WHERE id = ?1
         "})?;
-        let rows = select(plan_id.to_string())?;
+        let rows = select(plan_id)?;
         Ok(rows.into_iter().next().map(
             |(
                 id,
@@ -470,7 +470,7 @@ impl PlanStore {
         let mut select = self.connection.select_bound::<String, String>(indoc! {"
                 SELECT node FROM plan_nodes WHERE plan_id = ?1 ORDER BY node
             "})?;
-        select(plan_id.to_string())
+        select(plan_id)
     }
 
     pub fn claims(&self) -> Result<Vec<ClaimRow>> {
@@ -559,7 +559,7 @@ impl PlanStore {
                    falsifying_condition, negative_control
             FROM evidence WHERE plan_id = ?1 ORDER BY node
         "})?;
-        let rows = select(plan_id.to_string())?;
+        let rows = select(plan_id)?;
         Ok(rows
             .into_iter()
             .map(
@@ -592,7 +592,7 @@ impl PlanStore {
         let mut select = self.connection.select_bound::<String, bool>(indoc! {"
                 SELECT debugger_scoped FROM plans WHERE id = ?1
             "})?;
-        let rows = select(plan_id.to_string())?;
+        let rows = select(plan_id)?;
         Ok(rows.into_iter().next().unwrap_or(false))
     }
 
@@ -624,7 +624,7 @@ impl PlanStore {
             .exec_bound::<(bool, String, String)>(indoc! {"
             UPDATE plans SET debugger_scoped = ?1, updated_at = ?2 WHERE id = ?3
         "})?;
-        update((scoped, now, plan_id.to_string()))
+        update((scoped, now, plan_id))
     }
 
     fn upsert_plan(&self, plan_id: &str, snapshot: &GraphSnapshot) -> Result<()> {
