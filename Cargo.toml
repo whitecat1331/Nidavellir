@@ -54,7 +54,6 @@ members = [
     "crates/debugger_ui",
     "crates/devops_panel",
     "crates/fleet_panel",
-    "crates/roadmap_panel",
     "crates/secret_panel",
     "crates/deepseek",
     "crates/dev_container",
@@ -169,7 +168,6 @@ members = [
     "crates/picker_preview",
     "crates/plan_graph",
     "crates/plan_store",
-    "crates/plan_view",
     "crates/platform_title_bar",
     "crates/prettier",
     "crates/project",
@@ -339,7 +337,6 @@ debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
 devops_panel = { path = "crates/devops_panel" }
 fleet_panel = { path = "crates/fleet_panel" }
-roadmap_panel = { path = "crates/roadmap_panel" }
 secret_panel = { path = "crates/secret_panel" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
@@ -448,7 +445,6 @@ picker = { path = "crates/picker" }
 picker_preview = { path = "crates/picker_preview" }
 plan_graph = { path = "crates/plan_graph" }
 plan_store = { path = "crates/plan_store" }
-plan_view = { path = "crates/plan_view" }
 platform_title_bar = { path = "crates/platform_title_bar" }
 prettier = { path = "crates/prettier" }
 project = { path = "crates/project" }
