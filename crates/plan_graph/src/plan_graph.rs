@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use gpui::{App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, Window, actions};
+use gpui::{App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, Render, Window, actions};
 use plan_store::{EdgeRow, EvidenceRow, FleetPlanRow, PlanStore};
 use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
@@ -155,7 +155,7 @@ pub fn derive_node_state(
         return NodeState::Blocked;
     }
 
-    if let Some(active) = &plan.active_node {
+    if let Some(_active) = &plan.active_node {
         let idle = plan
             .heartbeat
             .as_deref()
@@ -397,7 +397,8 @@ impl PlanGraph {
     }
 
     fn deploy(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-        if let Some(existing) = workspace.items_of_type::<PlanGraph>(cx).next() {
+        let existing = workspace.items_of_type::<PlanGraph>(cx).next();
+        if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
         } else {
             let item = cx.new(|cx| PlanGraph::new(cx));
@@ -430,10 +431,11 @@ impl PlanGraph {
                         .gap_2()
                         .items_start()
                         .child(
-                            Label::new(phase)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .w_24(),
+                            div().w_24().child(
+                                Label::new(phase)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                         )
                         .child(
                             h_flex().gap_1().flex_wrap().children(
@@ -447,7 +449,7 @@ impl PlanGraph {
     fn render_node(&self, node: &GraphNode, cx: &mut Context<Self>) -> impl IntoElement {
         let plan_id = node.id.clone();
         h_flex()
-            .id(("plan-node", node.id.clone()))
+            .id(node.id.as_str())
             .gap_1()
             .items_center()
             .px_2()
