@@ -5670,6 +5670,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 model: request.model.clone(),
                 work_dirs: None,
                 focus: request.focus,
+                plan_path: None,
             };
 
             // If the caller asked for a fresh worktree, open a new workspace
