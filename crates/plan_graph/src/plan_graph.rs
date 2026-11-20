@@ -1263,13 +1263,25 @@ impl PlanGraph {
         self.camera = Camera::fit_around(anchor.0, anchor.1, min_x, min_y, max_x, max_y, pane);
     }
 
-    /// Keep the scale, re-centre on a node (used when it collapses).
-    fn center_camera_on(&mut self, key: &str, window: &Window) {
+    /// Collapsing zooms the wheel back out to fit everything now visible, but
+    /// keeps the clicked node at the centre.
+    fn fit_whole_centered_on(&mut self, key: &str, window: &Window) {
         let layout = self.current_layout();
         let pane = self.pane_size(window);
-        if let Some(node) = layout.nodes.iter().find(|node| node.key == key) {
-            self.camera = self.camera.centered_on(node.x, node.y, pane);
+        let Some(anchor) = layout.nodes.iter().find(|node| node.key == key) else {
+            return;
+        };
+        let mut min_x = anchor.x;
+        let mut min_y = anchor.y;
+        let mut max_x = anchor.x;
+        let mut max_y = anchor.y;
+        for node in &layout.nodes {
+            min_x = min_x.min(node.x);
+            min_y = min_y.min(node.y);
+            max_x = max_x.max(node.x);
+            max_y = max_y.max(node.y);
         }
+        self.camera = Camera::fit_around(anchor.x, anchor.y, min_x, min_y, max_x, max_y, pane);
     }
 
     /// Wheel up zooms in, wheel down zooms out, anchored under the cursor so the
@@ -1618,7 +1630,7 @@ impl PlanGraph {
                 if expanding {
                     self.fit_camera_to("root", window);
                 } else {
-                    self.center_camera_on("root", window);
+                    self.fit_whole_centered_on("root", window);
                 }
             }
             WheelKind::Category
@@ -1629,7 +1641,7 @@ impl PlanGraph {
                 if self.expanded.contains(&node.key) {
                     self.fit_camera_to(&node.key, window);
                 } else {
-                    self.center_camera_on(&node.key, window);
+                    self.fit_whole_centered_on(&node.key, window);
                 }
             }
             WheelKind::Plan => {
@@ -1638,7 +1650,7 @@ impl PlanGraph {
                     if self.expanded.contains(&node.key) {
                         self.fit_camera_to(&node.key, window);
                     } else {
-                        self.center_camera_on(&node.key, window);
+                        self.fit_whole_centered_on(&node.key, window);
                     }
                 } else if let Some(plan_id) = node.plan_id.clone() {
                     self.open_plan(plan_id, window, cx);
@@ -2666,6 +2678,59 @@ mod tests {
         assert!(!feature.contains(&"cat:bug".to_string()));
         assert!(!feature.contains(&"plan:p2".to_string()));
         assert!(subtree_keys(&root, "cat:missing").is_none());
+    }
+
+    #[test]
+    fn collapsing_fits_the_whole_wheel_around_the_clicked_node() {
+        let taxonomy = vec![
+            category("feature", None, "Feature", 100),
+            category("process", None, "Process", 150),
+            category("bug", None, "Bug", 200),
+            category("qol", None, "QOL", 210),
+            category("build", None, "Build and infra", 220),
+            category("browser", None, "Browser and preview", 230),
+        ];
+        let plans = vec![plan("p0", "Plan zero", Some("feature"), None)];
+        let root = build_visible_wheel(
+            &taxonomy,
+            &plans,
+            &[],
+            &HashMap::new(),
+            &expanded(&["root", "cat:feature"]),
+            false,
+        );
+        let layout = layout_wheel(&root);
+        let anchor = layout.nodes.iter().find(|n| n.key == "cat:bug").unwrap();
+        let mut min_x = anchor.x;
+        let mut min_y = anchor.y;
+        let mut max_x = anchor.x;
+        let mut max_y = anchor.y;
+        for node in &layout.nodes {
+            min_x = min_x.min(node.x);
+            min_y = min_y.min(node.y);
+            max_x = max_x.max(node.x);
+            max_y = max_y.max(node.y);
+        }
+        let pane = size(px(1310.0), px(776.0));
+        let camera = Camera::fit_around(anchor.x, anchor.y, min_x, min_y, max_x, max_y, pane);
+        let landed = camera.wheel_to_pane(anchor.x, anchor.y, pane);
+        assert!((f32::from(landed.x) - 655.0).abs() < 0.5);
+        assert!((f32::from(landed.y) - 388.0).abs() < 0.5);
+        for node in &layout.nodes {
+            let point = camera.wheel_to_pane(node.x, node.y, pane);
+            assert!(
+                f32::from(point.x) > 0.0 && f32::from(point.x) < 1310.0,
+                "{} inside x: {}",
+                node.label,
+                point.x
+            );
+            assert!(
+                f32::from(point.y) > 0.0 && f32::from(point.y) < 776.0,
+                "{} inside y: {}",
+                node.label,
+                point.y
+            );
+        }
     }
 
     #[test]
