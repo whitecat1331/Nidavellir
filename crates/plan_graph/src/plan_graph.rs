@@ -578,8 +578,39 @@ impl Camera {
         }
     }
 
-    /// Frame `anchor` (the node the user clicked) at the pane's centre, zoomed
-    /// out just enough for its whole visible subtree to fit around it.
+    /// Where a wheel coordinate lands on screen. The pane's centre is the
+    /// origin of the wheel, so an identity camera puts the root in the middle and
+    /// every other view is a `zoom` plus a `pan` around that one point.
+    ///
+    /// This is the single transform both the node layout and the spoke paint
+    /// use, so the two can never drift apart.
+    pub fn wheel_to_pane(self, x: f32, y: f32, pane: Size<Pixels>) -> Point<Pixels> {
+        point(
+            px(f32::from(pane.width) / 2.0 + x * self.zoom + self.pan_x),
+            px(f32::from(pane.height) / 2.0 + y * self.zoom + self.pan_y),
+        )
+    }
+
+    /// Put wheel coordinate `(x, y)` at `target` (pane coordinates) at the
+    /// current zoom.
+    ///
+    /// This is d3-zoom's `translateTo`: `t = target - centre - k * (x, y)`, which
+    /// is `t = -k * (x, y)` when the target is the pane's centre.
+    pub fn translate_to(self, x: f32, y: f32, target: Point<Pixels>, pane: Size<Pixels>) -> Self {
+        Self {
+            pan_x: f32::from(target.x) - f32::from(pane.width) / 2.0 - x * self.zoom,
+            pan_y: f32::from(target.y) - f32::from(pane.height) / 2.0 - y * self.zoom,
+            ..self
+        }
+    }
+
+    /// Centre `(x, y)` in the pane at the current zoom.
+    pub fn centered_on(self, x: f32, y: f32, pane: Size<Pixels>) -> Self {
+        self.translate_to(x, y, pane_center(pane), pane)
+    }
+
+    /// Frame `anchor` (the node the user clicked) in the middle of the pane,
+    /// zoomed out just enough for its whole visible subtree to fit around it.
     pub fn fit_around(
         anchor_x: f32,
         anchor_y: f32,
@@ -587,10 +618,10 @@ impl Camera {
         min_y: f32,
         max_x: f32,
         max_y: f32,
-        size: Size<Pixels>,
+        pane: Size<Pixels>,
     ) -> Self {
-        let width = f32::from(size.width).max(1.0);
-        let height = f32::from(size.height).max(1.0);
+        let width = f32::from(pane.width).max(1.0);
+        let height = f32::from(pane.height).max(1.0);
         let reach_x = (max_x - anchor_x).max(anchor_x - min_x) + (NODE_WIDTH + NODE_GAP) / 2.0;
         let reach_y = (max_y - anchor_y).max(anchor_y - min_y) + (NODE_HEIGHT + NODE_GAP) / 2.0;
         let zoom = (width * 0.46 / reach_x.max(1.0))
@@ -598,20 +629,34 @@ impl Camera {
             .clamp(MIN_ZOOM, 1.6);
         Self {
             zoom,
-            pan_x: width / 2.0 - anchor_x * zoom,
-            pan_y: height / 2.0 - anchor_y * zoom,
+            pan_x: 0.0,
+            pan_y: 0.0,
         }
+        .centered_on(anchor_x, anchor_y, pane)
     }
 
-    /// Recentre on a wheel coordinate at the current zoom, so collapsing a node
-    /// keeps the scale the user chose.
-    pub fn centered_on(self, center_x: f32, center_y: f32, size: Size<Pixels>) -> Self {
+    /// Zoom about a pane point, keeping whatever sits under it in place.
+    ///
+    /// `scaleTo(k, p)` from d3-zoom: the reference point `p` does not move, so
+    /// `pan' = p - centre - (k' / k) * (p - centre - pan)`.
+    pub fn zoom_about(self, target_zoom: f32, anchor: Point<Pixels>, pane: Size<Pixels>) -> Self {
+        let target_zoom = target_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let ratio = target_zoom / self.zoom;
+        let rel_x = f32::from(anchor.x) - f32::from(pane.width) / 2.0;
+        let rel_y = f32::from(anchor.y) - f32::from(pane.height) / 2.0;
         Self {
-            pan_x: f32::from(size.width) / 2.0 - center_x * self.zoom,
-            pan_y: f32::from(size.height) / 2.0 - center_y * self.zoom,
-            ..self
+            zoom: target_zoom,
+            pan_x: rel_x - (rel_x - self.pan_x) * ratio,
+            pan_y: rel_y - (rel_y - self.pan_y) * ratio,
         }
     }
+}
+
+fn pane_center(pane: Size<Pixels>) -> Point<Pixels> {
+    point(
+        px(f32::from(pane.width) / 2.0),
+        px(f32::from(pane.height) / 2.0),
+    )
 }
 
 fn short_label(text: &str) -> String {
@@ -1249,12 +1294,9 @@ impl PlanGraph {
             .get()
             .map(|bounds| bounds.origin)
             .unwrap_or_else(|| point(px(0.0), px(0.0)));
-        let anchor_x = f32::from(event.position.x - origin.x);
-        let anchor_y = f32::from(event.position.y - origin.y);
-        let ratio = target / self.camera.zoom;
-        self.camera.pan_x = anchor_x - (anchor_x - self.camera.pan_x) * ratio;
-        self.camera.pan_y = anchor_y - (anchor_y - self.camera.pan_y) * ratio;
-        self.camera.zoom = target;
+        let anchor = point(event.position.x - origin.x, event.position.y - origin.y);
+        let pane = self.pane_size(window);
+        self.camera = self.camera.zoom_about(target, anchor, pane);
         self.needs_fit = false;
         cx.notify();
     }
@@ -1633,9 +1675,7 @@ impl PlanGraph {
             self.camera = Camera::fit(layout.extent, self.pane_size(window));
             self.needs_fit = false;
         }
-        let zoom = self.camera.zoom;
-        let pan_x = self.camera.pan_x;
-        let pan_y = self.camera.pan_y;
+        let camera = self.camera;
         let pane = self.pane_size(window);
         let spoke_color = cx.theme().colors().border;
         let spokes = layout.spokes.clone();
@@ -1714,20 +1754,17 @@ impl PlanGraph {
                                     if wheel_bounds.replace(Some(bounds)) != Some(bounds) {
                                         notify.update(cx, |_, cx| cx.notify()).ok();
                                     }
-                                    let center_x =
-                                        bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
-                                    let center_y =
-                                        bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
+                                    // Same transform the nodes use, so a spoke always
+                                    // ends exactly on its node's centre.
+                                    let origin = bounds.origin;
                                     for spoke in &spokes {
+                                        let from = origin
+                                            + camera.wheel_to_pane(spoke.x1, spoke.y1, bounds.size);
+                                        let to = origin
+                                            + camera.wheel_to_pane(spoke.x2, spoke.y2, bounds.size);
                                         let mut builder = gpui::PathBuilder::stroke(px(1.0));
-                                        builder.move_to(point(
-                                            center_x + px(spoke.x1 * zoom),
-                                            center_y + px(spoke.y1 * zoom),
-                                        ));
-                                        builder.line_to(point(
-                                            center_x + px(spoke.x2 * zoom),
-                                            center_y + px(spoke.y2 * zoom),
-                                        ));
+                                        builder.move_to(from);
+                                        builder.line_to(to);
                                         if let Ok(path) = builder.build() {
                                             window.paint_path(path, spoke_color);
                                         }
@@ -1738,12 +1775,12 @@ impl PlanGraph {
                         ),
                     )
                     .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .children(layout.nodes.iter().map(|node| {
-                                self.render_wheel_node(node, zoom, pan_x, pan_y, pane, cx)
-                            })),
+                        div().absolute().inset_0().children(
+                            layout
+                                .nodes
+                                .iter()
+                                .map(|node| self.render_wheel_node(node, camera, pane, cx)),
+                        ),
                     ),
             )
             .into_any_element()
@@ -1752,9 +1789,7 @@ impl PlanGraph {
     fn render_wheel_node(
         &self,
         node: &WheelNode,
-        zoom: f32,
-        pan_x: f32,
-        pan_y: f32,
+        camera: Camera,
         pane: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1763,10 +1798,12 @@ impl PlanGraph {
         let expandable = node.expandable;
         let state = node.state;
         let focused = self.focused_key.as_deref() == Some(node.key.as_str());
+        let zoom = camera.zoom;
         let width = NODE_WIDTH * zoom;
         let height = NODE_HEIGHT * zoom;
-        let left = f32::from(pane.width) / 2.0 + node.x * zoom - width / 2.0 + pan_x;
-        let top = f32::from(pane.height) / 2.0 + node.y * zoom - height / 2.0 + pan_y;
+        let center = camera.wheel_to_pane(node.x, node.y, pane);
+        let left = f32::from(center.x) - width / 2.0;
+        let top = f32::from(center.y) - height / 2.0;
         let font = (0.85 * zoom).clamp(0.45, 1.1);
 
         let border_color = if focused {
@@ -2519,26 +2556,87 @@ mod tests {
         // The clicked node sits off-centre in its own subtree; it must land on the
         // pane's centre while the whole subtree still fits around it.
         let camera = Camera::fit_around(400.0, 0.0, 300.0, -100.0, 500.0, 100.0, pane);
-        let screen_x = 400.0 * camera.zoom + camera.pan_x;
-        let screen_y = 0.0 * camera.zoom + camera.pan_y;
-        assert!((screen_x - 600.0).abs() < 0.5, "centred x: {screen_x}");
-        assert!((screen_y - 400.0).abs() < 0.5, "centred y: {screen_y}");
+        let anchor = camera.wheel_to_pane(400.0, 0.0, pane);
+        assert!(
+            (f32::from(anchor.x) - 600.0).abs() < 0.5,
+            "clicked node centred x: {}",
+            anchor.x
+        );
+        assert!(
+            (f32::from(anchor.y) - 400.0).abs() < 0.5,
+            "clicked node centred y: {}",
+            anchor.y
+        );
         for (x, y) in [(300.0, -100.0), (500.0, 100.0)] {
-            let edge_x = x * camera.zoom + camera.pan_x;
-            let edge_y = y * camera.zoom + camera.pan_y;
-            assert!(edge_x > 0.0 && edge_x < 1200.0, "x inside pane: {edge_x}");
-            assert!(edge_y > 0.0 && edge_y < 800.0, "y inside pane: {edge_y}");
+            let edge = camera.wheel_to_pane(x, y, pane);
+            assert!(
+                f32::from(edge.x) > 0.0 && f32::from(edge.x) < 1200.0,
+                "x inside pane: {}",
+                edge.x
+            );
+            assert!(
+                f32::from(edge.y) > 0.0 && f32::from(edge.y) < 800.0,
+                "y inside pane: {}",
+                edge.y
+            );
         }
     }
 
     #[test]
     fn recentring_keeps_the_zoom() {
         let pane = size(px(1200.0), px(800.0));
-        let camera = Camera::fit_around(0.0, 0.0, 0.0, 0.0, 100.0, 100.0, pane)
-            .centered_on(600.0, 300.0, pane);
-        assert!((600.0 * camera.zoom + camera.pan_x - 600.0).abs() < 0.5);
-        assert!((300.0 * camera.zoom + camera.pan_y - 400.0).abs() < 0.5);
-        assert!(camera.zoom > 0.0);
+        let camera = Camera::fit_around(0.0, 0.0, 0.0, 0.0, 100.0, 100.0, pane);
+        let zoom = camera.zoom;
+        let camera = camera.centered_on(600.0, 300.0, pane);
+        let centered = camera.wheel_to_pane(600.0, 300.0, pane);
+        assert!((f32::from(centered.x) - 600.0).abs() < 0.5);
+        assert!((f32::from(centered.y) - 400.0).abs() < 0.5);
+        assert_eq!(camera.zoom, zoom, "recentring must not change the scale");
+    }
+
+    #[test]
+    fn a_clicked_node_lands_exactly_on_the_pane_centre() {
+        let pane = size(px(1310.0), px(776.0));
+        for anchor in [(0.0, 0.0), (412.5, -233.0), (-800.0, 640.0)] {
+            let camera = Camera::fit_around(
+                anchor.0,
+                anchor.1,
+                anchor.0 - 50.0,
+                anchor.1 - 50.0,
+                anchor.0 + 900.0,
+                anchor.1 + 900.0,
+                pane,
+            );
+            let landed = camera.wheel_to_pane(anchor.0, anchor.1, pane);
+            assert!(
+                (f32::from(landed.x) - 655.0).abs() < 0.5,
+                "anchor {anchor:?} landed at x {}",
+                landed.x
+            );
+            assert!(
+                (f32::from(landed.y) - 388.0).abs() < 0.5,
+                "anchor {anchor:?} landed at y {}",
+                landed.y
+            );
+        }
+    }
+
+    #[test]
+    fn wheel_zoom_keeps_the_point_under_the_cursor() {
+        let pane = size(px(1200.0), px(800.0));
+        let camera = Camera::fit_around(0.0, 0.0, -400.0, -400.0, 400.0, 400.0, pane);
+        let cursor = point(px(900.0), px(250.0));
+        let before = {
+            // The wheel coordinate currently under the cursor.
+            let x = (f32::from(cursor.x) - 600.0 - camera.pan_x) / camera.zoom;
+            let y = (f32::from(cursor.y) - 400.0 - camera.pan_y) / camera.zoom;
+            (x, y)
+        };
+        let zoomed = camera.zoom_about(camera.zoom * 1.6, cursor, pane);
+        let after = zoomed.wheel_to_pane(before.0, before.1, pane);
+        assert!((f32::from(after.x) - f32::from(cursor.x)).abs() < 0.5);
+        assert!((f32::from(after.y) - f32::from(cursor.y)).abs() < 0.5);
+        assert!(zoomed.zoom > camera.zoom);
     }
 
     #[test]
