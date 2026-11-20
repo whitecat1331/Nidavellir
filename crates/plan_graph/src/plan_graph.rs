@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    Rems, Size, StatefulInteractiveElement, WeakEntity, Window, actions, point, px,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems,
+    Render, Size, StatefulInteractiveElement, WeakEntity, Window, actions, point, px,
 };
 use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
@@ -1481,31 +1481,27 @@ impl PlanGraph {
                             cx.notify();
                         }),
                     )
-                    .child(
-                        div().absolute().inset_0().child(gpui::canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| {
-                                let center_x =
-                                    bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
-                                let center_y =
-                                    bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
-                                for spoke in &spokes {
-                                    let mut builder = gpui::PathBuilder::stroke(px(1.0));
-                                    builder.move_to(point(
-                                        center_x + px(spoke.x1 * zoom),
-                                        center_y + px(spoke.y1 * zoom),
-                                    ));
-                                    builder.line_to(point(
-                                        center_x + px(spoke.x2 * zoom),
-                                        center_y + px(spoke.y2 * zoom),
-                                    ));
-                                    if let Ok(path) = builder.build() {
-                                        window.paint_path(path, spoke_color);
-                                    }
+                    .child(div().absolute().inset_0().child(gpui::canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let center_x = bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
+                            let center_y = bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
+                            for spoke in &spokes {
+                                let mut builder = gpui::PathBuilder::stroke(px(1.0));
+                                builder.move_to(point(
+                                    center_x + px(spoke.x1 * zoom),
+                                    center_y + px(spoke.y1 * zoom),
+                                ));
+                                builder.line_to(point(
+                                    center_x + px(spoke.x2 * zoom),
+                                    center_y + px(spoke.y2 * zoom),
+                                ));
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, spoke_color);
                                 }
-                            },
-                        )),
-                    )
+                            }
+                        },
+                    )))
                     .child(
                         div()
                             .absolute()
@@ -1513,13 +1509,11 @@ impl PlanGraph {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(
-                                div().relative().w(px(0.0)).h(px(0.0)).children(
-                                    layout.nodes.iter().map(|node| {
-                                        self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
-                                    }),
-                                ),
-                            ),
+                            .child(div().relative().w(px(0.0)).h(px(0.0)).children(
+                                layout.nodes.iter().map(|node| {
+                                    self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
+                                }),
+                            )),
                     ),
             )
             .into_any_element()
@@ -2032,7 +2026,10 @@ mod tests {
             false,
         );
         assert_eq!(collapsed.key, "root");
-        assert!(collapsed.children.is_empty(), "only Plans is visible at first");
+        assert!(
+            collapsed.children.is_empty(),
+            "only Plans is visible at first"
+        );
         assert!(collapsed.expandable);
 
         let open = build_visible_wheel(
