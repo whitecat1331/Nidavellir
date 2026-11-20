@@ -5850,6 +5850,8 @@ pub(crate) mod tests {
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         workspace_id: None,
+                        plan_path: None,
+                        driver: false,
                         remote_connection: None,
                         archived: false,
                     },
