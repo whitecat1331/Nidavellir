@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    actions, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render,
-    Task, WeakEntity, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render, Task,
+    WeakEntity, Window, actions,
 };
-use plan_flow::{is_human_gate, next_ready, STALL_SECONDS};
+use plan_flow::{STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{ClaimRow, FleetPlanRow, PlanStore};
 use ui::{Button, ButtonSize, IconName, Label, LabelSize, prelude::*};
 use workspace::Workspace;
@@ -85,7 +85,11 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
 /// circuit-breaker taxonomy: closed (moving/ready/done), half-open (waiting on
 /// a human), open (stalled or blocked). A completed plan is closed — the
 /// circuit finished, it did not open.
-fn derive_state(plan: &FleetPlanRow, done_nodes: &[String], now: DateTime<Utc>) -> (String, bool, String) {
+fn derive_state(
+    plan: &FleetPlanRow,
+    done_nodes: &[String],
+    now: DateTime<Utc>,
+) -> (String, bool, String) {
     if plan.current_node.as_deref() == Some("complete") {
         return ("complete".to_string(), false, "closed".to_string());
     }
@@ -106,7 +110,11 @@ fn derive_state(plan: &FleetPlanRow, done_nodes: &[String], now: DateTime<Utc>) 
             .map(|time| (now - time).num_seconds())
             .unwrap_or(i64::MAX);
         if idle > STALL_SECONDS {
-            return (format!("stuck (stalled — {active})"), false, "open".to_string());
+            return (
+                format!("stuck (stalled — {active})"),
+                false,
+                "open".to_string(),
+            );
         }
         return (format!("moving ({active})"), false, "closed".to_string());
     }
@@ -552,7 +560,14 @@ mod tests {
     #[test]
     fn human_gate_blocks_on_you() {
         let done = [
-            "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept",
+            "plan",
+            "promote",
+            "claim",
+            "fork",
+            "implement",
+            "verify",
+            "compile",
+            "accept",
         ];
         let (state, blocked, breaker) = derive_state(
             &FleetPlanRow {
@@ -639,7 +654,10 @@ mod tests {
         let rows = load_plans(&store, now());
         let by_name = |name: &str| rows.iter().find(|row| row.plan == name).unwrap();
         assert_eq!(by_name("MOVING").state, "moving (verify)");
-        assert_eq!(by_name("FROZEN").state, "blocked on you (resume — human gate)");
+        assert_eq!(
+            by_name("FROZEN").state,
+            "blocked on you (resume — human gate)"
+        );
         assert_eq!(by_name("MOVING").spent_tokens, 42);
         assert_eq!(by_name("FROZEN").spent_tokens, 7);
     }

@@ -538,11 +538,12 @@ fn repeated_burn_warning(state: &GraphState) -> Option<BurnWarning> {
         }
         let latest = entry.attempts.last()?;
         let previous = &entry.attempts[entry.attempts.len() - 2];
-        if let Some(warning) = latest
-            .warnings
-            .iter()
-            .find(|warning| previous.warnings.iter().any(|other| other.kind == warning.kind))
-        {
+        if let Some(warning) = latest.warnings.iter().find(|warning| {
+            previous
+                .warnings
+                .iter()
+                .any(|other| other.kind == warning.kind)
+        }) {
             return Some(warning.clone());
         }
     }
@@ -575,8 +576,7 @@ fn evaluate_stop(state: &GraphState, now: DateTime<Utc>) -> Option<Decision> {
         }
         let latest = &entry.attempts[entry.attempts.len() - 1];
         let previous = &entry.attempts[entry.attempts.len() - 2];
-        if let (Some(latest_failure), Some(previous_failure)) =
-            (&latest.failure, &previous.failure)
+        if let (Some(latest_failure), Some(previous_failure)) = (&latest.failure, &previous.failure)
         {
             if latest_failure.what_failed == previous_failure.what_failed
                 && latest_failure.why == previous_failure.why
@@ -617,7 +617,11 @@ fn evaluate_stop(state: &GraphState, now: DateTime<Utc>) -> Option<Decision> {
         let Some(entry) = state.done.iter().find(|entry| entry.node == *gate) else {
             continue;
         };
-        let failures = entry.attempts.iter().filter(|attempt| attempt.failed).count();
+        let failures = entry
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.failed)
+            .count();
         if failures >= GATE_FAILURE_STREAK {
             return Some(stop_decision(
                 state,
