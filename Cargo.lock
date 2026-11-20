@@ -13558,6 +13558,8 @@ dependencies = [
  "log",
  "plan_flow",
  "plan_store",
+ "schemars 1.0.4",
+ "serde",
  "ui",
  "workspace",
 ]
