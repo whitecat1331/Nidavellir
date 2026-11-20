@@ -1581,6 +1581,7 @@ impl PlanGraph {
         };
 
         v_flex()
+            .id(ElementId::Name("plan-page".into()))
             .size_full()
             .p_4()
             .gap_3()
