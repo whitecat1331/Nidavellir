@@ -578,21 +578,28 @@ impl Camera {
         }
     }
 
-    /// Frame the wheel coordinates `min..max` inside a pane of `size`, so a
-    /// node and everything it just revealed fill the view instead of the whole
-    /// map.
-    pub fn fit_bounds(min_x: f32, min_y: f32, max_x: f32, max_y: f32, size: Size<Pixels>) -> Self {
+    /// Frame `anchor` (the node the user clicked) at the pane's centre, zoomed
+    /// out just enough for its whole visible subtree to fit around it.
+    pub fn fit_around(
+        anchor_x: f32,
+        anchor_y: f32,
+        min_x: f32,
+        min_y: f32,
+        max_x: f32,
+        max_y: f32,
+        size: Size<Pixels>,
+    ) -> Self {
         let width = f32::from(size.width).max(1.0);
         let height = f32::from(size.height).max(1.0);
-        let content_width = (max_x - min_x + NODE_WIDTH + NODE_GAP).max(NODE_WIDTH);
-        let content_height = (max_y - min_y + NODE_HEIGHT + NODE_GAP).max(NODE_HEIGHT);
-        let zoom = (width * 0.86 / content_width)
-            .min(height * 0.86 / content_height)
+        let reach_x = (max_x - anchor_x).max(anchor_x - min_x) + (NODE_WIDTH + NODE_GAP) / 2.0;
+        let reach_y = (max_y - anchor_y).max(anchor_y - min_y) + (NODE_HEIGHT + NODE_GAP) / 2.0;
+        let zoom = (width * 0.46 / reach_x.max(1.0))
+            .min(height * 0.46 / reach_y.max(1.0))
             .clamp(MIN_ZOOM, 1.6);
         Self {
             zoom,
-            pan_x: width / 2.0 - (min_x + max_x) / 2.0 * zoom,
-            pan_y: height / 2.0 - (min_y + max_y) / 2.0 * zoom,
+            pan_x: width / 2.0 - anchor_x * zoom,
+            pan_y: height / 2.0 - anchor_y * zoom,
         }
     }
 
@@ -1182,31 +1189,33 @@ impl PlanGraph {
             .unwrap_or_else(|| window.viewport_size())
     }
 
-    /// Frame a node and its visible descendants, so expanding a branch fills the
-    /// view with that branch instead of zooming the whole map down around it.
+    /// Frame the clicked node at the pane's centre, with everything it just
+    /// revealed fitted around it. Expanding used to re-fit the whole map, and
+    /// centring on the subtree's bounding box left the clicked node off-centre.
     fn fit_camera_to(&mut self, key: &str, window: &Window) {
         let wheel = self.visible_wheel();
         let layout = layout_wheel(&wheel);
         let pane = self.pane_size(window);
+        let Some(anchor) = layout.nodes.iter().find(|node| node.key == key) else {
+            self.camera = Camera::fit(layout.extent, pane);
+            return;
+        };
+        let anchor = (anchor.x, anchor.y);
         let Some(keys) = subtree_keys(&wheel, key) else {
             self.camera = Camera::fit(layout.extent, pane);
             return;
         };
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
+        let mut min_x = anchor.0;
+        let mut min_y = anchor.1;
+        let mut max_x = anchor.0;
+        let mut max_y = anchor.1;
         for node in layout.nodes.iter().filter(|node| keys.contains(&node.key)) {
             min_x = min_x.min(node.x);
             min_y = min_y.min(node.y);
             max_x = max_x.max(node.x);
             max_y = max_y.max(node.y);
         }
-        self.camera = if min_x <= max_x {
-            Camera::fit_bounds(min_x, min_y, max_x, max_y, pane)
-        } else {
-            Camera::fit(layout.extent, pane)
-        };
+        self.camera = Camera::fit_around(anchor.0, anchor.1, min_x, min_y, max_x, max_y, pane);
     }
 
     /// Keep the scale, re-centre on a node (used when it collapses).
@@ -1627,9 +1636,11 @@ impl PlanGraph {
         let zoom = self.camera.zoom;
         let pan_x = self.camera.pan_x;
         let pan_y = self.camera.pan_y;
+        let pane = self.pane_size(window);
         let spoke_color = cx.theme().colors().border;
         let spokes = layout.spokes.clone();
         let wheel_bounds = self.wheel_bounds.clone();
+        let notify = cx.weak_entity();
 
         v_flex()
             .size_full()
@@ -1696,45 +1707,43 @@ impl PlanGraph {
                     // one explicitly; otherwise its bounds are 0x0 at the pane's
                     // top-left and the spokes lose the node frame's centre.
                     .child(
-                        gpui::canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| {
-                                wheel_bounds.set(Some(bounds));
-                                let center_x =
-                                    bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
-                                let center_y =
-                                    bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
-                                for spoke in &spokes {
-                                    let mut builder = gpui::PathBuilder::stroke(px(1.0));
-                                    builder.move_to(point(
-                                        center_x + px(spoke.x1 * zoom),
-                                        center_y + px(spoke.y1 * zoom),
-                                    ));
-                                    builder.line_to(point(
-                                        center_x + px(spoke.x2 * zoom),
-                                        center_y + px(spoke.y2 * zoom),
-                                    ));
-                                    if let Ok(path) = builder.build() {
-                                        window.paint_path(path, spoke_color);
+                        div().absolute().inset_0().child(
+                            gpui::canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, cx| {
+                                    if wheel_bounds.replace(Some(bounds)) != Some(bounds) {
+                                        notify.update(cx, |_, cx| cx.notify()).ok();
                                     }
-                                }
-                            },
-                        )
-                        .absolute()
-                        .inset_0(),
+                                    let center_x =
+                                        bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
+                                    let center_y =
+                                        bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
+                                    for spoke in &spokes {
+                                        let mut builder = gpui::PathBuilder::stroke(px(1.0));
+                                        builder.move_to(point(
+                                            center_x + px(spoke.x1 * zoom),
+                                            center_y + px(spoke.y1 * zoom),
+                                        ));
+                                        builder.line_to(point(
+                                            center_x + px(spoke.x2 * zoom),
+                                            center_y + px(spoke.y2 * zoom),
+                                        ));
+                                        if let Ok(path) = builder.build() {
+                                            window.paint_path(path, spoke_color);
+                                        }
+                                    }
+                                },
+                            )
+                            .size_full(),
+                        ),
                     )
                     .child(
                         div()
                             .absolute()
                             .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(div().relative().w(px(0.0)).h(px(0.0)).children(
-                                layout.nodes.iter().map(|node| {
-                                    self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
-                                }),
-                            )),
+                            .children(layout.nodes.iter().map(|node| {
+                                self.render_wheel_node(node, zoom, pan_x, pan_y, pane, cx)
+                            })),
                     ),
             )
             .into_any_element()
@@ -1746,6 +1755,7 @@ impl PlanGraph {
         zoom: f32,
         pan_x: f32,
         pan_y: f32,
+        pane: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = node.key.clone();
@@ -1755,8 +1765,8 @@ impl PlanGraph {
         let focused = self.focused_key.as_deref() == Some(node.key.as_str());
         let width = NODE_WIDTH * zoom;
         let height = NODE_HEIGHT * zoom;
-        let left = node.x * zoom - width / 2.0 + pan_x;
-        let top = node.y * zoom - height / 2.0 + pan_y;
+        let left = f32::from(pane.width) / 2.0 + node.x * zoom - width / 2.0 + pan_x;
+        let top = f32::from(pane.height) / 2.0 + node.y * zoom - height / 2.0 + pan_y;
         let font = (0.85 * zoom).clamp(0.45, 1.1);
 
         let border_color = if focused {
@@ -2504,25 +2514,28 @@ mod tests {
     }
 
     #[test]
-    fn fitting_a_subtree_centres_it_in_the_pane() {
+    fn fitting_a_subtree_centres_the_clicked_node() {
         let pane = size(px(1200.0), px(800.0));
-        // A branch sitting well off-centre: its middle must land at the pane's
-        // middle, and its nodes must stay inside the pane.
-        let camera = Camera::fit_bounds(300.0, -100.0, 500.0, 100.0, pane);
+        // The clicked node sits off-centre in its own subtree; it must land on the
+        // pane's centre while the whole subtree still fits around it.
+        let camera = Camera::fit_around(400.0, 0.0, 300.0, -100.0, 500.0, 100.0, pane);
         let screen_x = 400.0 * camera.zoom + camera.pan_x;
         let screen_y = 0.0 * camera.zoom + camera.pan_y;
         assert!((screen_x - 600.0).abs() < 0.5, "centred x: {screen_x}");
         assert!((screen_y - 400.0).abs() < 0.5, "centred y: {screen_y}");
-        let half_width = (NODE_WIDTH + NODE_GAP) / 2.0 * camera.zoom;
-        assert!(screen_x - half_width > 0.0);
-        assert!(screen_x + half_width < 1200.0);
+        for (x, y) in [(300.0, -100.0), (500.0, 100.0)] {
+            let edge_x = x * camera.zoom + camera.pan_x;
+            let edge_y = y * camera.zoom + camera.pan_y;
+            assert!(edge_x > 0.0 && edge_x < 1200.0, "x inside pane: {edge_x}");
+            assert!(edge_y > 0.0 && edge_y < 800.0, "y inside pane: {edge_y}");
+        }
     }
 
     #[test]
     fn recentring_keeps_the_zoom() {
         let pane = size(px(1200.0), px(800.0));
-        let camera =
-            Camera::fit_bounds(0.0, 0.0, 100.0, 100.0, pane).centered_on(600.0, 300.0, pane);
+        let camera = Camera::fit_around(0.0, 0.0, 0.0, 0.0, 100.0, 100.0, pane)
+            .centered_on(600.0, 300.0, pane);
         assert!((600.0 * camera.zoom + camera.pan_x - 600.0).abs() < 0.5);
         assert!((300.0 * camera.zoom + camera.pan_y - 400.0).abs() < 0.5);
         assert!(camera.zoom > 0.0);
