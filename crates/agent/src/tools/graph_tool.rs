@@ -4,8 +4,9 @@ use std::sync::Arc;
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
-// Re-exported rather than imported: the type is only named by the test module.
-pub use chrono::{DateTime, Utc};
+use chrono::Utc;
+#[cfg(test)]
+use chrono::DateTime;
 use gpui::{App, AppContext as _, AsyncApp, SharedString, Task, WeakEntity};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -115,6 +116,22 @@ pub struct GraphToolInput {
     /// conditional `stage→…→fix` sub-graph (1.29 D8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GraphToolOutput {
+    Success { message: String },
+    Error { error: String },
+}
+
+impl From<GraphToolOutput> for LanguageModelToolResultContent {
+    fn from(value: GraphToolOutput) -> Self {
+        match value {
+            GraphToolOutput::Success { message } => message.into(),
+            GraphToolOutput::Error { error } => error.into(),
+        }
+    }
 }
 
 pub use plan_flow::{
