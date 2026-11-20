@@ -9,20 +9,15 @@
 //! related/blocking/slice chips, and a plan-scoped agent composer + thread
 //! sidebar.
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::f32::consts::TAU;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems,
-    Render, ScrollWheelEvent, Size, StatefulInteractiveElement, WeakEntity, Window, actions, point,
-    px,
+    AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable, Render,
+    WeakEntity, Window, actions, px,
 };
 use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
@@ -55,22 +50,6 @@ const STALL_SECONDS: i64 = 15 * 60;
 
 /// The debugger loop's `stage→…→fix` sub-graph (1.29 D8).
 const DEBUGGER_SUB_GRAPH: [&str; 6] = ["stage", "test", "verify", "restart", "run", "fix"];
-
-/// Base distance between rings and the minimum spacing a ring's circumference
-/// must provide for its nodes, both in unscaled wheel coordinates.
-const RING_BASE: f32 = 220.0;
-const NODE_SPACING: f32 = 250.0;
-const NODE_WIDTH: f32 = 190.0;
-const NODE_HEIGHT: f32 = 58.0;
-const NODE_GAP: f32 = 28.0;
-/// No child may claim less than this fraction of an even share of its ring, so a
-/// small subtree beside a huge one cannot squeeze its neighbour into it.
-const MIN_SLOT_SHARE: f32 = 0.55;
-/// A ring whose tightest pair needs more than this is left overlapping rather
-/// than blowing the wheel (and the camera fit) up to an unusable size.
-const MAX_RING_RADIUS: f32 = 9000.0;
-const MIN_ZOOM: f32 = 0.12;
-const MAX_ZOOM: f32 = 2.5;
 
 pub fn debugger_sub_graph(scoped: bool) -> &'static [&'static str] {
     if scoped { &DEBUGGER_SUB_GRAPH } else { &[] }
@@ -452,7 +431,7 @@ pub fn decision_text(decision: &Decision) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WheelKind {
+pub enum TreeKind {
     Root,
     History,
     Category,
@@ -468,7 +447,7 @@ pub enum WheelKind {
 pub struct VisibleNode {
     pub key: String,
     pub label: String,
-    pub kind: WheelKind,
+    pub kind: TreeKind,
     pub plan_id: Option<String>,
     pub state: NodeState,
     pub expanded: bool,
@@ -478,7 +457,7 @@ pub struct VisibleNode {
 }
 
 impl VisibleNode {
-    fn new(key: String, label: String, kind: WheelKind) -> Self {
+    fn new(key: String, label: String, kind: TreeKind) -> Self {
         Self {
             key,
             label,
@@ -491,172 +470,6 @@ impl VisibleNode {
             children: Vec::new(),
         }
     }
-}
-
-/// One positioned node. `x`/`y` are unscaled offsets from the wheel centre.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WheelNode {
-    pub key: String,
-    pub label: String,
-    pub kind: WheelKind,
-    pub plan_id: Option<String>,
-    pub state: NodeState,
-    pub expanded: bool,
-    pub expandable: bool,
-    pub slice_count: usize,
-    pub depth: usize,
-    /// The node's slot midpoint on its ring, in radians. Kept so the layout can
-    /// measure how tightly a ring packs without re-deriving the angles.
-    pub angle: f32,
-    pub x: f32,
-    pub y: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WheelSpoke {
-    pub x1: f32,
-    pub y1: f32,
-    pub x2: f32,
-    pub y2: f32,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct WheelLayout {
-    pub nodes: Vec<WheelNode>,
-    pub spokes: Vec<WheelSpoke>,
-    pub extent: f32,
-}
-
-/// One depth's ring: where it sits, and the smallest share of a parent's sector
-/// any single child may claim.
-#[derive(Debug, Clone, Copy, Default)]
-struct Ring {
-    radius: f32,
-    min_share: f32,
-}
-
-/// The camera over the wheel. Positions are scaled by `zoom` and offset by the
-/// pan; the plan page remembers this so `Back to graph` is reversible (D13).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Camera {
-    pub zoom: f32,
-    pub pan_x: f32,
-    pub pan_y: f32,
-}
-
-impl Default for Camera {
-    fn default() -> Self {
-        Self {
-            zoom: 1.0,
-            pan_x: 0.0,
-            pan_y: 0.0,
-        }
-    }
-}
-
-impl Camera {
-    /// Fit a wheel of `extent` into the viewport with a small margin.
-    pub fn fit(extent: f32, viewport: Size<gpui::Pixels>) -> Self {
-        if extent <= 0.0 {
-            return Self::default();
-        }
-        let width = f32::from(viewport.width);
-        let height = f32::from(viewport.height);
-        let available = width.min(height) * 0.92;
-        let zoom = (available / extent).clamp(MIN_ZOOM, 1.3);
-        Self {
-            zoom,
-            pan_x: 0.0,
-            pan_y: 0.0,
-        }
-    }
-
-    pub fn zoomed(self, factor: f32) -> Self {
-        Self {
-            zoom: (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM),
-            ..self
-        }
-    }
-
-    /// Where a wheel coordinate lands on screen. The pane's centre is the
-    /// origin of the wheel, so an identity camera puts the root in the middle and
-    /// every other view is a `zoom` plus a `pan` around that one point.
-    ///
-    /// This is the single transform both the node layout and the spoke paint
-    /// use, so the two can never drift apart.
-    pub fn wheel_to_pane(self, x: f32, y: f32, pane: Size<Pixels>) -> Point<Pixels> {
-        point(
-            px(f32::from(pane.width) / 2.0 + x * self.zoom + self.pan_x),
-            px(f32::from(pane.height) / 2.0 + y * self.zoom + self.pan_y),
-        )
-    }
-
-    /// Put wheel coordinate `(x, y)` at `target` (pane coordinates) at the
-    /// current zoom.
-    ///
-    /// This is d3-zoom's `translateTo`: `t = target - centre - k * (x, y)`, which
-    /// is `t = -k * (x, y)` when the target is the pane's centre.
-    pub fn translate_to(self, x: f32, y: f32, target: Point<Pixels>, pane: Size<Pixels>) -> Self {
-        Self {
-            pan_x: f32::from(target.x) - f32::from(pane.width) / 2.0 - x * self.zoom,
-            pan_y: f32::from(target.y) - f32::from(pane.height) / 2.0 - y * self.zoom,
-            ..self
-        }
-    }
-
-    /// Centre `(x, y)` in the pane at the current zoom.
-    pub fn centered_on(self, x: f32, y: f32, pane: Size<Pixels>) -> Self {
-        self.translate_to(x, y, pane_center(pane), pane)
-    }
-
-    /// Frame `anchor` (the node the user clicked) in the middle of the pane,
-    /// zoomed out just enough for its whole visible subtree to fit around it.
-    pub fn fit_around(
-        anchor_x: f32,
-        anchor_y: f32,
-        min_x: f32,
-        min_y: f32,
-        max_x: f32,
-        max_y: f32,
-        pane: Size<Pixels>,
-    ) -> Self {
-        let width = f32::from(pane.width).max(1.0);
-        let height = f32::from(pane.height).max(1.0);
-        let reach_x = (max_x - anchor_x).max(anchor_x - min_x) + (NODE_WIDTH + NODE_GAP) / 2.0;
-        let reach_y = (max_y - anchor_y).max(anchor_y - min_y) + (NODE_HEIGHT + NODE_GAP) / 2.0;
-        let zoom = (width * 0.46 / reach_x.max(1.0))
-            .min(height * 0.46 / reach_y.max(1.0))
-            .clamp(MIN_ZOOM, 1.6);
-        Self {
-            zoom,
-            pan_x: 0.0,
-            pan_y: 0.0,
-        }
-        .centered_on(anchor_x, anchor_y, pane)
-    }
-
-    /// Zoom about a pane point, keeping whatever sits under it in place.
-    ///
-    /// `scaleTo(k, p)` from d3-zoom: the reference point `p` does not move, so
-    /// `pan' = p - centre - (k' / k) * (p - centre - pan)`.
-    pub fn zoom_about(self, target_zoom: f32, anchor: Point<Pixels>, pane: Size<Pixels>) -> Self {
-        let target_zoom = target_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        let ratio = target_zoom / self.zoom;
-        let rel_x = f32::from(anchor.x) - f32::from(pane.width) / 2.0;
-        let rel_y = f32::from(anchor.y) - f32::from(pane.height) / 2.0;
-        Self {
-            zoom: target_zoom,
-            pan_x: rel_x - (rel_x - self.pan_x) * ratio,
-            pan_y: rel_y - (rel_y - self.pan_y) * ratio,
-        }
-    }
-}
-
-fn pane_center(pane: Size<Pixels>) -> Point<Pixels> {
-    point(
-        px(f32::from(pane.width) / 2.0),
-        px(f32::from(pane.height) / 2.0),
-    )
 }
 
 fn short_label(text: &str) -> String {
@@ -680,7 +493,7 @@ fn plan_label(plan: &CategorizedPlanRow) -> String {
     short_label(&plan.name)
 }
 
-fn wheel_state(plan: &CategorizedPlanRow, fleet: Option<&FleetPlanRow>) -> NodeState {
+fn plan_state(plan: &CategorizedPlanRow, fleet: Option<&FleetPlanRow>) -> NodeState {
     if plan.lifecycle() == Lifecycle::History {
         return NodeState::Done;
     }
@@ -709,7 +522,7 @@ fn slices_for<'a>(parents: &'a [PlanParentRow], plan_id: &str) -> Vec<&'a str> {
 
 /// Build the visible wheel tree from the taxonomy, assignments, parent links
 /// and expansion state. Pure so the disclosure rules are testable.
-pub fn build_visible_wheel(
+pub fn build_visible_tree(
     categories: &[CategoryRow],
     plans: &[CategorizedPlanRow],
     parents: &[PlanParentRow],
@@ -769,10 +582,10 @@ pub fn build_visible_wheel(
                                 let mut node = VisibleNode::new(
                                     format!("slice:{slice_id}"),
                                     plan_label(slice),
-                                    WheelKind::Slice,
+                                    TreeKind::Slice,
                                 );
                                 node.plan_id = Some((*slice_id).to_string());
-                                node.state = wheel_state(slice, fleet.get(*slice_id));
+                                node.state = plan_state(slice, fleet.get(*slice_id));
                                 slice_children.push(node);
                             }
                         }
@@ -780,7 +593,7 @@ pub fn build_visible_wheel(
                     let mut group = VisibleNode::new(
                         group_key,
                         format!("slices ({})", slices.len()),
-                        WheelKind::SliceGroup,
+                        TreeKind::SliceGroup,
                     );
                     group.plan_id = Some(plan.id.clone());
                     group.expandable = !slice_children.is_empty();
@@ -790,9 +603,9 @@ pub fn build_visible_wheel(
                     children.push(group);
                 }
 
-                let mut node = VisibleNode::new(plan_key, plan_label(plan), WheelKind::Plan);
+                let mut node = VisibleNode::new(plan_key, plan_label(plan), TreeKind::Plan);
                 node.plan_id = Some(plan.id.clone());
-                node.state = wheel_state(plan, fleet.get(plan.id.as_str()));
+                node.state = plan_state(plan, fleet.get(plan.id.as_str()));
                 node.expandable = !slices.is_empty();
                 node.expanded = plan_expanded;
                 node.slice_count = slices.len();
@@ -805,7 +618,7 @@ pub fn build_visible_wheel(
             let mut node = VisibleNode::new(
                 sub_key,
                 format!("{} · {}", sub.name, sub_children.len()),
-                WheelKind::Subcategory,
+                TreeKind::Subcategory,
             );
             node.expandable = !sub_children.is_empty();
             node.expanded = sub_expanded;
@@ -822,7 +635,7 @@ pub fn build_visible_wheel(
         let mut node = VisibleNode::new(
             cat_key,
             format!("{} · {}", category.name, category_live_count),
-            WheelKind::Category,
+            TreeKind::Category,
         );
         node.expandable = !cat_children.is_empty();
         node.expanded = cat_expanded;
@@ -843,7 +656,7 @@ pub fn build_visible_wheel(
                 let mut node = VisibleNode::new(
                     format!("hist:{}", plan.id),
                     plan_label(plan),
-                    WheelKind::Plan,
+                    TreeKind::Plan,
                 );
                 node.plan_id = Some(plan.id.clone());
                 node.state = NodeState::Done;
@@ -854,7 +667,7 @@ pub fn build_visible_wheel(
         let mut node = VisibleNode::new(
             key,
             format!("History · {}", history_nodes.len()),
-            WheelKind::History,
+            TreeKind::History,
         );
         node.state = NodeState::Done;
         node.expandable = !history_nodes.is_empty();
@@ -867,7 +680,7 @@ pub fn build_visible_wheel(
         root_children.push(node);
     }
 
-    let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), WheelKind::Root);
+    let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), TreeKind::Root);
     let root_expanded = expanded.contains("root");
     root.expandable = true;
     root.expanded = root_expanded;
@@ -877,175 +690,6 @@ pub fn build_visible_wheel(
         Vec::new()
     };
     root
-}
-
-fn descendant_count(node: &VisibleNode) -> usize {
-    1 + node.children.iter().map(descendant_count).sum::<usize>()
-}
-
-/// Every visible key in `key`'s subtree, so the camera can frame a node and
-/// what it just revealed rather than the whole map.
-fn subtree_keys(node: &VisibleNode, key: &str) -> Option<Vec<String>> {
-    if node.key == key {
-        let mut keys = Vec::new();
-        collect_keys(node, &mut keys);
-        return Some(keys);
-    }
-    node.children
-        .iter()
-        .find_map(|child| subtree_keys(child, key))
-}
-
-fn collect_keys(node: &VisibleNode, keys: &mut Vec<String>) {
-    keys.push(node.key.clone());
-    for child in &node.children {
-        collect_keys(child, keys);
-    }
-}
-
-/// Lay the visible tree out on concentric rings. A child's wedge is
-/// proportional to its subtree, so every branch keeps its own sector; a floor on
-/// that wedge stops two small neighbours collapsing onto each other when they
-/// sit beside a huge branch. Ring radii then grow to fit both the count on the
-/// ring and the tightest gap actually assigned to it. Pure so the camera-fit and
-/// disclosure tests can assert it.
-pub fn layout_wheel(root: &VisibleNode) -> WheelLayout {
-    let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
-    fn count(node: &VisibleNode, depth: usize, counts: &mut BTreeMap<usize, usize>) {
-        *counts.entry(depth).or_insert(0) += 1;
-        for child in &node.children {
-            count(child, depth + 1, counts);
-        }
-    }
-    count(root, 0, &mut counts);
-    let max_depth = counts.keys().max().copied().unwrap_or(0);
-
-    let mut rings = vec![Ring::default(); max_depth + 1];
-    for depth in 1..=max_depth {
-        let nodes = counts.get(&depth).copied().unwrap_or(1).max(1) as f32;
-        rings[depth].min_share = MIN_SLOT_SHARE / nodes;
-    }
-
-    // Angles do not depend on the radii, so lay the tree out once at zero radius
-    // to learn how tightly each floored ring packs.
-    let mut probe = WheelLayout::default();
-    let mut probe_extent = 0.0_f32;
-    place_node(root, 0, 0.0, TAU, &rings, &mut probe, &mut probe_extent);
-
-    let mut previous = 0.0_f32;
-    for depth in 1..=max_depth {
-        let nodes = counts.get(&depth).copied().unwrap_or(1).max(1) as f32;
-        let radius = (depth as f32 * RING_BASE)
-            .max(nodes * NODE_SPACING / TAU)
-            .max(previous + RING_BASE)
-            .max(required_clearance(&probe.nodes, depth))
-            .min(MAX_RING_RADIUS);
-        rings[depth].radius = radius;
-        previous = radius;
-    }
-
-    let mut layout = WheelLayout::default();
-    let mut max_radius = 0.0_f32;
-    place_node(root, 0, 0.0, TAU, &rings, &mut layout, &mut max_radius);
-    layout.extent = (max_radius + NODE_HEIGHT) * 2.0;
-    layout
-}
-
-/// The radius at which the two closest nodes on `depth`'s ring are still a full
-/// node apart. Adjacent boxes are `2 * r * sin(gap / 2)` apart, so clearing
-/// `NODE_WIDTH + NODE_GAP` needs `r >= (width + gap) / (2 sin(gap / 2))`.
-fn required_clearance(nodes: &[WheelNode], depth: usize) -> f32 {
-    let mut angles: Vec<f32> = nodes
-        .iter()
-        .filter(|node| node.depth == depth)
-        .map(|node| node.angle)
-        .collect();
-    if angles.len() < 2 {
-        return 0.0;
-    }
-    angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut tightest = f32::MAX;
-    for pair in angles.windows(2) {
-        tightest = tightest.min(pair[1] - pair[0]);
-    }
-    tightest = tightest.min(angles[0] + TAU - angles[angles.len() - 1]);
-    if tightest <= 0.0 {
-        return 0.0;
-    }
-    (NODE_WIDTH + NODE_GAP) / (2.0 * (tightest / 2.0).sin())
-}
-
-fn place_node(
-    node: &VisibleNode,
-    depth: usize,
-    start: f32,
-    end: f32,
-    rings: &[Ring],
-    layout: &mut WheelLayout,
-    max_radius: &mut f32,
-) {
-    let radius = rings.get(depth).map(|ring| ring.radius).unwrap_or(0.0);
-    let angle = (start + end) / 2.0 - std::f32::consts::FRAC_PI_2;
-    let x = angle.cos() * radius;
-    let y = angle.sin() * radius;
-    *max_radius = max_radius.max(radius);
-
-    layout.nodes.push(WheelNode {
-        key: node.key.clone(),
-        label: node.label.clone(),
-        kind: node.kind,
-        plan_id: node.plan_id.clone(),
-        state: node.state,
-        expanded: node.expanded,
-        expandable: node.expandable,
-        slice_count: node.slice_count,
-        depth,
-        angle: (start + end) / 2.0,
-        x,
-        y,
-    });
-
-    if node.children.is_empty() {
-        return;
-    }
-    let min_share = rings
-        .get(depth + 1)
-        .map(|ring| ring.min_share)
-        .unwrap_or(0.0);
-    let weights: Vec<f32> = node
-        .children
-        .iter()
-        .map(|child| descendant_count(child) as f32)
-        .collect();
-    let total: f32 = weights.iter().sum();
-    let shares: Vec<f32> = weights
-        .iter()
-        .map(|weight| (weight / total).max(min_share))
-        .collect();
-    let share_total: f32 = shares.iter().sum();
-
-    let mut cursor = start;
-    for (child, share) in node.children.iter().zip(shares) {
-        let span = (end - start) * (share / share_total);
-        place_node(
-            child,
-            depth + 1,
-            cursor,
-            cursor + span,
-            rings,
-            layout,
-            max_radius,
-        );
-        let child_radius = rings.get(depth + 1).map(|ring| ring.radius).unwrap_or(0.0);
-        let child_angle = cursor + span / 2.0 - std::f32::consts::FRAC_PI_2;
-        layout.spokes.push(WheelSpoke {
-            x1: x,
-            y1: y,
-            x2: child_angle.cos() * child_radius,
-            y2: child_angle.sin() * child_radius,
-        });
-        cursor += span;
-    }
 }
 
 /// Strip directories and plan-file suffixes from a thread's `plan_path` and
@@ -1103,13 +747,7 @@ struct PlanThread {
     updated_at: DateTime<Utc>,
 }
 
-struct DragState {
-    start: Point<Pixels>,
-    start_pan: (f32, f32),
-    moved: bool,
-}
-
-/// The wheel `Item` (main editor area, not a bottom `Panel`).
+/// The plan navigation `Item` (main editor area, not a bottom `Panel`).
 pub struct PlanGraph {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -1120,20 +758,10 @@ pub struct PlanGraph {
     edges: Vec<EdgeRow>,
     expanded: HashSet<String>,
     history_visible: bool,
-    camera: Camera,
-    needs_fit: bool,
-    saved_camera: Option<Camera>,
-    focused_key: Option<String>,
-    saved_focus: Option<String>,
     page_stack: Vec<String>,
     page: Option<PageData>,
     composer: gpui::Entity<Editor>,
     threads: Vec<PlanThread>,
-    drag: Option<DragState>,
-    suppress_click: bool,
-    /// The pane's bounds as laid out, recorded on paint so zoom anchors on the
-    /// point under the cursor rather than the window.
-    wheel_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl PlanGraph {
@@ -1153,18 +781,10 @@ impl PlanGraph {
             edges: Vec::new(),
             expanded: HashSet::new(),
             history_visible: false,
-            camera: Camera::default(),
-            needs_fit: true,
-            saved_camera: None,
-            focused_key: None,
-            saved_focus: None,
             page_stack: Vec::new(),
             page: None,
             composer,
             threads: Vec::new(),
-            drag: None,
-            suppress_click: false,
-            wheel_bounds: Rc::new(Cell::new(None)),
         };
         graph.refresh();
         graph
@@ -1205,8 +825,8 @@ impl PlanGraph {
             .collect();
     }
 
-    fn visible_wheel(&self) -> VisibleNode {
-        build_visible_wheel(
+    fn visible_tree(&self) -> VisibleNode {
+        build_visible_tree(
             &self.categories,
             &self.plans,
             &self.parents,
@@ -1214,103 +834,6 @@ impl PlanGraph {
             &self.expanded,
             self.history_visible,
         )
-    }
-
-    fn current_layout(&self) -> WheelLayout {
-        layout_wheel(&self.visible_wheel())
-    }
-
-    fn fit_camera(&mut self, window: &mut Window) {
-        let layout = self.current_layout();
-        self.camera = Camera::fit(layout.extent, self.pane_size(window));
-    }
-
-    /// The pane's size, falling back to the window before the first paint has
-    /// recorded the wheel's bounds.
-    fn pane_size(&self, window: &Window) -> Size<Pixels> {
-        self.wheel_bounds
-            .get()
-            .map(|bounds| bounds.size)
-            .unwrap_or_else(|| window.viewport_size())
-    }
-
-    /// Frame the clicked node at the pane's centre, with everything it just
-    /// revealed fitted around it. Expanding used to re-fit the whole map, and
-    /// centring on the subtree's bounding box left the clicked node off-centre.
-    fn fit_camera_to(&mut self, key: &str, window: &Window) {
-        let wheel = self.visible_wheel();
-        let layout = layout_wheel(&wheel);
-        let pane = self.pane_size(window);
-        let Some(anchor) = layout.nodes.iter().find(|node| node.key == key) else {
-            self.camera = Camera::fit(layout.extent, pane);
-            return;
-        };
-        let anchor = (anchor.x, anchor.y);
-        let Some(keys) = subtree_keys(&wheel, key) else {
-            self.camera = Camera::fit(layout.extent, pane);
-            return;
-        };
-        let mut min_x = anchor.0;
-        let mut min_y = anchor.1;
-        let mut max_x = anchor.0;
-        let mut max_y = anchor.1;
-        for node in layout.nodes.iter().filter(|node| keys.contains(&node.key)) {
-            min_x = min_x.min(node.x);
-            min_y = min_y.min(node.y);
-            max_x = max_x.max(node.x);
-            max_y = max_y.max(node.y);
-        }
-        self.camera = Camera::fit_around(anchor.0, anchor.1, min_x, min_y, max_x, max_y, pane);
-    }
-
-    /// Collapsing zooms the wheel back out to fit everything now visible, but
-    /// keeps the clicked node at the centre.
-    fn fit_whole_centered_on(&mut self, key: &str, window: &Window) {
-        let layout = self.current_layout();
-        let pane = self.pane_size(window);
-        let Some(anchor) = layout.nodes.iter().find(|node| node.key == key) else {
-            return;
-        };
-        let mut min_x = anchor.x;
-        let mut min_y = anchor.y;
-        let mut max_x = anchor.x;
-        let mut max_y = anchor.y;
-        for node in &layout.nodes {
-            min_x = min_x.min(node.x);
-            min_y = min_y.min(node.y);
-            max_x = max_x.max(node.x);
-            max_y = max_y.max(node.y);
-        }
-        self.camera = Camera::fit_around(anchor.x, anchor.y, min_x, min_y, max_x, max_y, pane);
-    }
-
-    /// Wheel up zooms in, wheel down zooms out, anchored under the cursor so the
-    /// node you are looking at stays put.
-    fn handle_wheel_zoom(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let delta = event.delta.pixel_delta(window.line_height());
-        let steps = (f32::from(delta.y) / 120.0).clamp(-3.0, 3.0);
-        if steps == 0.0 {
-            return;
-        }
-        let target = (self.camera.zoom * 1.15_f32.powf(steps)).clamp(MIN_ZOOM, MAX_ZOOM);
-        if (target - self.camera.zoom).abs() < f32::EPSILON {
-            return;
-        }
-        let origin = self
-            .wheel_bounds
-            .get()
-            .map(|bounds| bounds.origin)
-            .unwrap_or_else(|| point(px(0.0), px(0.0)));
-        let anchor = point(event.position.x - origin.x, event.position.y - origin.y);
-        let pane = self.pane_size(window);
-        self.camera = self.camera.zoom_about(target, anchor, pane);
-        self.needs_fit = false;
-        cx.notify();
     }
 
     fn plan_display(&self, plan_id: &str) -> String {
@@ -1322,11 +845,6 @@ impl PlanGraph {
     }
 
     fn open_plan(&mut self, plan_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page_stack.is_empty() {
-            self.saved_camera = Some(self.camera);
-            self.saved_focus = self.focused_key.clone();
-        }
-        self.focused_key = Some(format!("plan:{plan_id}"));
         self.page_stack.push(plan_id.clone());
         self.load_page(&plan_id);
         self.threads.clear();
@@ -1347,27 +865,19 @@ impl PlanGraph {
             None => {
                 self.page = None;
                 self.threads.clear();
-                if let Some(camera) = self.saved_camera.take() {
-                    self.camera = camera;
-                }
-                self.focused_key = self.saved_focus.take();
             }
         }
         let _ = window;
         cx.notify();
     }
 
-    fn back_to_graph(&mut self, cx: &mut Context<Self>) {
+    fn close_page(&mut self, cx: &mut Context<Self>) {
         if self.page_stack.is_empty() {
             return;
         }
         self.page_stack.clear();
         self.page = None;
         self.threads.clear();
-        if let Some(camera) = self.saved_camera.take() {
-            self.camera = camera;
-        }
-        self.focused_key = self.saved_focus.take();
         cx.notify();
     }
 
@@ -1556,7 +1066,6 @@ impl PlanGraph {
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
         self.history_visible = !self.history_visible;
-        self.needs_fit = true;
         cx.notify();
     }
 
@@ -1590,338 +1099,149 @@ impl PlanGraph {
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
-            .child(Button::new("graph-history", "History").on_click(
+            .child(Button::new("tree-history", "History").on_click(
                 cx.listener(|this: &mut PlanGraph, _: &ClickEvent, _, cx| this.toggle_history(cx)),
             ))
-            .child(Button::new("graph-zoom-out", "−").on_click(cx.listener(
-                |this: &mut PlanGraph, _: &ClickEvent, _, cx| {
-                    this.camera = this.camera.zoomed(0.8);
-                    cx.notify();
-                },
-            )))
-            .child(Button::new("graph-zoom-in", "+").on_click(cx.listener(
-                |this: &mut PlanGraph, _: &ClickEvent, _, cx| {
-                    this.camera = this.camera.zoomed(1.25);
-                    cx.notify();
-                },
-            )))
-            .child(Button::new("graph-fit", "Fit").on_click(cx.listener(
-                |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                    this.fit_camera(window);
-                    cx.notify();
-                },
-            )))
             .child(
-                Label::new("single-click expands · double-click opens · Enter opens focused")
+                Label::new("click a branch to expand · click a plan to open it")
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
     }
 
-    fn single_click(&mut self, node: &WheelNode, window: &mut Window, cx: &mut Context<Self>) {
+    fn click_node(&mut self, node: &VisibleNode, window: &mut Window, cx: &mut Context<Self>) {
         match node.kind {
-            WheelKind::Root => {
+            TreeKind::Root => {
                 let expanding = !self.expanded.contains("root");
                 if expanding {
                     self.expanded.insert("root".to_string());
                 } else {
                     self.expanded.clear();
                 }
-                if expanding {
-                    self.fit_camera_to("root", window);
-                } else {
-                    self.fit_whole_centered_on("root", window);
-                }
             }
-            WheelKind::Category
-            | WheelKind::Subcategory
-            | WheelKind::History
-            | WheelKind::SliceGroup => {
+            TreeKind::Category
+            | TreeKind::Subcategory
+            | TreeKind::History
+            | TreeKind::SliceGroup => {
                 toggle(&mut self.expanded, &node.key);
-                if self.expanded.contains(&node.key) {
-                    self.fit_camera_to(&node.key, window);
-                } else {
-                    self.fit_whole_centered_on(&node.key, window);
-                }
             }
-            WheelKind::Plan => {
+            TreeKind::Plan => {
                 if node.expandable {
                     toggle(&mut self.expanded, &node.key);
-                    if self.expanded.contains(&node.key) {
-                        self.fit_camera_to(&node.key, window);
-                    } else {
-                        self.fit_whole_centered_on(&node.key, window);
-                    }
                 } else if let Some(plan_id) = node.plan_id.clone() {
                     self.open_plan(plan_id, window, cx);
                     return;
                 }
             }
-            WheelKind::Slice => {
+            TreeKind::Slice => {
                 if let Some(plan_id) = node.plan_id.clone() {
                     self.open_plan(plan_id, window, cx);
                     return;
                 }
             }
         }
-        self.focused_key = Some(node.key.clone());
         cx.notify();
     }
 
-    fn open_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.focused_key.clone() else {
-            return;
-        };
-        if let Some(plan_id) = key.strip_prefix("plan:") {
-            self.open_plan(plan_id.to_string(), window, cx);
-        } else if let Some(plan_id) = key.strip_prefix("slice:") {
-            self.open_plan(plan_id.to_string(), window, cx);
-        } else if let Some(plan_id) = key.strip_prefix("hist:") {
-            self.open_plan(plan_id.to_string(), window, cx);
-        }
-    }
-
-    fn render_wheel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let layout = self.current_layout();
-        if self.needs_fit {
-            self.camera = Camera::fit(layout.extent, self.pane_size(window));
-            self.needs_fit = false;
-        }
-        let camera = self.camera;
-        let pane = self.pane_size(window);
-        let spoke_color = cx.theme().colors().border;
-        let spokes = layout.spokes.clone();
-        let wheel_bounds = self.wheel_bounds.clone();
-        let notify = cx.weak_entity();
-
+    fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = self.visible_tree();
         v_flex()
-            .size_full()
-            .track_focus(&self.focus_handle)
-            .on_key_down(
-                cx.listener(|this: &mut PlanGraph, event: &KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "enter" {
-                        this.open_focused(window, cx);
-                    }
-                }),
+            .id(ElementId::Name("plan-tree".into()))
+            .flex_1()
+            .overflow_y_scroll()
+            .children(
+                root.children
+                    .iter()
+                    .map(|child| self.render_tree_row(child, 0, cx)),
             )
-            .child(self.render_toolbar(cx))
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .overflow_hidden()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this: &mut PlanGraph, event: &MouseDownEvent, _, cx| {
-                            this.suppress_click = false;
-                            this.drag = Some(DragState {
-                                start: event.position,
-                                start_pan: (this.camera.pan_x, this.camera.pan_y),
-                                moved: false,
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(
-                        |this: &mut PlanGraph, event: &MouseMoveEvent, _, cx| {
-                            if this.drag.is_none() {
-                                return;
-                            }
-                            if event.pressed_button != Some(MouseButton::Left) {
-                                this.drag = None;
-                                return;
-                            }
-                            let Some(drag) = this.drag.as_mut() else {
-                                return;
-                            };
-                            let dx = f32::from(event.position.x - drag.start.x);
-                            let dy = f32::from(event.position.y - drag.start.y);
-                            if dx.abs() + dy.abs() > 3.0 {
-                                drag.moved = true;
-                            }
-                            let (start_x, start_y) = drag.start_pan;
-                            let moved = drag.moved;
-                            this.camera.pan_x = start_x + dx;
-                            this.camera.pan_y = start_y + dy;
-                            this.suppress_click = moved;
-                            cx.notify();
-                        },
-                    ))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this: &mut PlanGraph, _: &MouseUpEvent, _, cx| {
-                            this.drag = None;
-                            cx.notify();
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(Self::handle_wheel_zoom))
-                    // `gpui::canvas` has no intrinsic size, so it must be given
-                    // one explicitly; otherwise its bounds are 0x0 at the pane's
-                    // top-left and the spokes lose the node frame's centre.
-                    .child(
-                        div().absolute().inset_0().child(
-                            gpui::canvas(
-                                |_, _, _| {},
-                                move |bounds, _, window, cx| {
-                                    if wheel_bounds.replace(Some(bounds)) != Some(bounds) {
-                                        notify.update(cx, |_, cx| cx.notify()).ok();
-                                    }
-                                    // Same transform the nodes use, so a spoke always
-                                    // ends exactly on its node's centre.
-                                    let origin = bounds.origin;
-                                    for spoke in &spokes {
-                                        let from = origin
-                                            + camera.wheel_to_pane(spoke.x1, spoke.y1, bounds.size);
-                                        let to = origin
-                                            + camera.wheel_to_pane(spoke.x2, spoke.y2, bounds.size);
-                                        let mut builder = gpui::PathBuilder::stroke(px(1.0));
-                                        builder.move_to(from);
-                                        builder.line_to(to);
-                                        if let Ok(path) = builder.build() {
-                                            window.paint_path(path, spoke_color);
-                                        }
-                                    }
-                                },
-                            )
-                            .size_full(),
-                        ),
-                    )
-                    .child(
-                        div().absolute().inset_0().children(
-                            layout
-                                .nodes
-                                .iter()
-                                .map(|node| self.render_wheel_node(node, camera, pane, cx)),
-                        ),
-                    ),
-            )
-            .into_any_element()
     }
 
-    fn render_wheel_node(
+    fn render_tree_row(
         &self,
-        node: &WheelNode,
-        camera: Camera,
-        pane: Size<Pixels>,
+        node: &VisibleNode,
+        depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = node.key.clone();
-        let kind = node.kind;
         let expandable = node.expandable;
         let state = node.state;
-        let focused = self.focused_key.as_deref() == Some(node.key.as_str());
-        let zoom = camera.zoom;
-        let width = NODE_WIDTH * zoom;
-        let height = NODE_HEIGHT * zoom;
-        let center = camera.wheel_to_pane(node.x, node.y, pane);
-        let left = f32::from(center.x) - width / 2.0;
-        let top = f32::from(center.y) - height / 2.0;
-        let font = (0.85 * zoom).clamp(0.45, 1.1);
-
-        let border_color = if focused {
-            cx.theme().colors().border_focused
-        } else {
-            cx.theme().colors().border_variant
-        };
-        let background = if matches!(kind, WheelKind::Root) {
-            cx.theme().colors().element_selected
-        } else {
-            cx.theme().colors().element_background
-        };
+        let selected = self
+            .page
+            .as_ref()
+            .map(|page| page.id.as_str())
+            .is_some_and(|id| node.plan_id.as_deref() == Some(id));
         let glyph = node_shape(state);
         let glyph_color = node_color(state);
-        let secondary = self.node_secondary(node);
 
         let click_node = node.clone();
-        div()
-            .id(ElementId::Name(node.key.clone().into()))
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(width))
-            .h(px(height))
+        let row = div()
+            .id(ElementId::Name(format!("tree-node:{key}").into()))
+            .pl(px((depth as f32 * 14.0) + 8.0))
+            .pr_2()
+            .py_1()
             .flex()
-            .flex_col()
             .items_center()
-            .justify_center()
-            .px_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(border_color)
-            .bg(background)
+            .gap_1()
             .cursor_pointer()
-            .when(focused, |this| this.border_2())
-            .on_hover(
-                cx.listener(move |this: &mut PlanGraph, hovered: &bool, _, cx| {
-                    if *hovered {
-                        this.focused_key = Some(key.clone());
-                        cx.notify();
-                    }
+            .rounded_md()
+            .when(selected, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
+            .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .on_click(
+                cx.listener(move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                    this.click_node(&click_node, window, cx);
                 }),
             )
-            .on_click(cx.listener(
-                move |this: &mut PlanGraph, event: &ClickEvent, window, cx| {
-                    if this.suppress_click {
-                        this.suppress_click = false;
-                        return;
-                    }
-                    if event.click_count() >= 2 {
-                        if let Some(plan_id) = click_node.plan_id.clone() {
-                            this.open_plan(plan_id, window, cx);
-                        }
-                    } else {
-                        this.single_click(&click_node, window, cx);
-                    }
-                },
-            ))
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        Label::new(glyph)
-                            .size(LabelSize::Custom(Rems(font)))
-                            .color(glyph_color),
-                    )
-                    .child(
-                        Label::new(node.label.clone())
-                            .size(LabelSize::Custom(Rems(font)))
-                            .color(Color::Default),
-                    ),
+                Label::new(if expandable {
+                    if node.expanded { "▾" } else { "▸" }
+                } else {
+                    "·"
+                })
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
             )
-            .when(zoom > 0.45 && secondary.is_some(), |this| {
-                this.child(
-                    Label::new(secondary.unwrap_or_default())
-                        .size(LabelSize::Custom(Rems((font * 0.82).max(0.4))))
-                        .color(Color::Muted),
-                )
-            })
-            .when(expandable && node.slice_count == 0, |this| {
-                this.child(
-                    Label::new(if node.expanded { "−" } else { "+" })
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            })
+            .child(Label::new(glyph).size(LabelSize::XSmall).color(glyph_color))
+            .child(Label::new(node.label.clone()).size(LabelSize::Small))
             .when(node.slice_count > 0, |this| {
                 this.child(
                     Label::new(format!("slices ({})", node.slice_count))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-            })
-            .into_any_element()
+            });
+
+        if node.expanded && !node.children.is_empty() {
+            v_flex()
+                .child(row)
+                .children(
+                    node.children
+                        .iter()
+                        .map(|child| self.render_tree_row(child, depth + 1, cx)),
+                )
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
-    fn node_secondary(&self, node: &WheelNode) -> Option<String> {
-        let plan_id = node.plan_id.as_deref()?;
-        let plan = self.plans.iter().find(|plan| plan.id == plan_id)?;
-        if let Some(next) = plan.current_node.as_deref() {
-            return Some(format!("next: {next}"));
+    fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.page.is_some() {
+            self.render_page(window, cx)
+        } else {
+            v_flex()
+                .id(ElementId::Name("plan-empty".into()))
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new("Select a plan to see its detail.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
         }
-        plan.summary
-            .as_deref()
-            .map(|summary| summary.chars().take(60).collect::<String>())
     }
 
     fn render_page(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1961,11 +1281,9 @@ impl PlanGraph {
                             },
                         )))
                     })
-                    .child(
-                        Button::new("page-graph", "Back to graph").on_click(cx.listener(
-                            |this: &mut PlanGraph, _: &ClickEvent, _, cx| this.back_to_graph(cx),
-                        )),
-                    )
+                    .child(Button::new("page-close", "Close").on_click(cx.listener(
+                        |this: &mut PlanGraph, _: &ClickEvent, _, cx| this.close_page(cx),
+                    )))
                     .child(Label::new(title).size(LabelSize::Large))
                     .child(badge(
                         if page.lifecycle == Lifecycle::History {
@@ -2209,11 +1527,25 @@ impl EventEmitter<()> for PlanGraph {}
 
 impl Render for PlanGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.page.is_some() {
-            self.render_page(window, cx).into_any_element()
-        } else {
-            self.render_wheel(window, cx).into_any_element()
-        }
+        v_flex().size_full().child(self.render_toolbar(cx)).child(
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .w(px(320.0))
+                        .h_full()
+                        .border_r_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(self.render_tree(cx)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .child(self.render_detail(window, cx)),
+                ),
+        )
     }
 }
 
@@ -2239,7 +1571,6 @@ pub fn init(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::size;
     use plan_store::{GraphSnapshot, RoadmapPlanRow};
 
     fn category(id: &str, parent: Option<&str>, name: &str, rank: i64) -> CategoryRow {
@@ -2297,7 +1628,7 @@ mod tests {
             plan("p1", "Plan one", Some("feature/agent-core"), None),
             plan("p2", "Plan two", Some("bug/threads"), None),
         ];
-        let collapsed = build_visible_wheel(
+        let collapsed = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
@@ -2312,7 +1643,7 @@ mod tests {
         );
         assert!(collapsed.expandable);
 
-        let open = build_visible_wheel(
+        let open = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
@@ -2332,7 +1663,7 @@ mod tests {
             plan("p1", "Plan one", Some("feature/agent-core"), None),
             plan("p2", "Plan two", Some("bug/threads"), None),
         ];
-        let root = build_visible_wheel(
+        let root = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
@@ -2349,7 +1680,7 @@ mod tests {
 
     #[test]
     fn expanding_a_category_collapses_cleanly() {
-        let root_open = build_visible_wheel(
+        let root_open = build_visible_tree(
             &taxonomy(),
             &[],
             &[],
@@ -2358,7 +1689,7 @@ mod tests {
             false,
         );
         assert_eq!(find(&root_open, "cat:feature").unwrap().children.len(), 1);
-        let root_closed = build_visible_wheel(
+        let root_closed = build_visible_tree(
             &taxonomy(),
             &[],
             &[],
@@ -2384,7 +1715,7 @@ mod tests {
             plan_id: "slice".to_string(),
             parent_id: "parent".to_string(),
         }];
-        let root = build_visible_wheel(
+        let root = build_visible_tree(
             &taxonomy(),
             &plans,
             &parents,
@@ -2396,7 +1727,7 @@ mod tests {
         assert!(parent.expandable);
         assert!(parent.children.is_empty(), "slices are behind a toggle");
 
-        let root = build_visible_wheel(
+        let root = build_visible_tree(
             &taxonomy(),
             &plans,
             &parents,
@@ -2421,7 +1752,7 @@ mod tests {
             plan("live", "Live plan", Some("feature/agent-core"), None),
             plan("done", "Done plan", None, Some("done — shipped")),
         ];
-        let hidden = build_visible_wheel(
+        let hidden = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
@@ -2431,7 +1762,7 @@ mod tests {
         );
         assert!(find(&hidden, "history").is_none());
 
-        let shown = build_visible_wheel(
+        let shown = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
@@ -2442,305 +1773,6 @@ mod tests {
         let history = find(&shown, "history").expect("history node");
         assert_eq!(history.children.len(), 1);
         assert_eq!(history.children[0].plan_id.as_deref(), Some("done"));
-    }
-
-    #[test]
-    fn layout_places_nodes_on_distinct_rings() {
-        let plans = vec![
-            plan("p1", "Plan one", Some("feature/agent-core"), None),
-            plan("p2", "Plan two", Some("bug/threads"), None),
-        ];
-        let root = build_visible_wheel(
-            &taxonomy(),
-            &plans,
-            &[],
-            &HashMap::new(),
-            &expanded(&[
-                "root",
-                "cat:feature",
-                "cat:bug",
-                "sub:feature/agent-core",
-                "sub:bug/threads",
-            ]),
-            false,
-        );
-        let layout = layout_wheel(&root);
-        assert_eq!(layout.nodes.len(), 7);
-        let root_node = layout.nodes.iter().find(|n| n.key == "root").unwrap();
-        assert_eq!((root_node.x, root_node.y), (0.0, 0.0));
-        let categories: Vec<&WheelNode> = layout.nodes.iter().filter(|n| n.depth == 1).collect();
-        assert_eq!(categories.len(), 2);
-        assert_ne!(categories[0].x, categories[1].x);
-        assert!(layout.extent > 0.0);
-        assert_eq!(layout.spokes.len(), layout.nodes.len() - 1);
-    }
-
-    #[test]
-    fn every_ring_is_round_and_its_neighbours_clear_each_other() {
-        // The shape of the live store: a few large categories and several small
-        // ones, which used to leave neighbours (Bug next to QOL) overlapping.
-        let taxonomy = vec![
-            category("feature", None, "Feature", 100),
-            category("process", None, "Process", 150),
-            category("bug", None, "Bug", 200),
-            category("qol", None, "QOL", 210),
-            category("build", None, "Build and infra", 220),
-            category("browser", None, "Browser and preview", 230),
-        ];
-        let mut plans = Vec::new();
-        for index in 0..12 {
-            plans.push(plan(
-                &format!("feature-{index}"),
-                "Feature plan",
-                Some("feature"),
-                None,
-            ));
-        }
-        for index in 0..7 {
-            plans.push(plan(
-                &format!("process-{index}"),
-                "Process plan",
-                Some("process"),
-                None,
-            ));
-        }
-        plans.push(plan("bug-0", "Bug plan", Some("bug"), None));
-        plans.push(plan("qol-0", "QOL plan", Some("qol"), None));
-        plans.push(plan("build-0", "Build plan", Some("build"), None));
-        plans.push(plan("browser-0", "Browser plan", Some("browser"), None));
-
-        let root = build_visible_wheel(
-            &taxonomy,
-            &plans,
-            &[],
-            &HashMap::new(),
-            &expanded(&["root"]),
-            false,
-        );
-        let layout = layout_wheel(&root);
-
-        let mut depths: Vec<usize> = layout.nodes.iter().map(|node| node.depth).collect();
-        depths.sort_unstable();
-        depths.dedup();
-        for depth in depths {
-            let mut ring: Vec<&WheelNode> = layout
-                .nodes
-                .iter()
-                .filter(|node| node.depth == depth)
-                .collect();
-            if depth == 0 {
-                assert_eq!(ring.len(), 1, "the root sits alone at the centre");
-                continue;
-            }
-            // One radius per ring: no node may sit inboard or outboard of its
-            // siblings, which is what made the wheel look lopsided.
-            let radius = (ring[0].x.powi(2) + ring[0].y.powi(2)).sqrt();
-            for node in &ring {
-                let node_radius = (node.x.powi(2) + node.y.powi(2)).sqrt();
-                assert!(
-                    (node_radius - radius).abs() < 0.5,
-                    "{} sits at {node_radius} on a ring of {radius}",
-                    node.label
-                );
-            }
-            // Neighbours on a ring must clear each other, or the boxes overlap.
-            ring.sort_by(|a, b| {
-                a.angle
-                    .partial_cmp(&b.angle)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for pair in ring.windows(2) {
-                let distance =
-                    ((pair[1].x - pair[0].x).powi(2) + (pair[1].y - pair[0].y).powi(2)).sqrt();
-                assert!(
-                    distance >= NODE_WIDTH,
-                    "depth {depth}: {} and {} are only {distance} apart",
-                    pair[0].label,
-                    pair[1].label
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn fitting_a_subtree_centres_the_clicked_node() {
-        let pane = size(px(1200.0), px(800.0));
-        // The clicked node sits off-centre in its own subtree; it must land on the
-        // pane's centre while the whole subtree still fits around it.
-        let camera = Camera::fit_around(400.0, 0.0, 300.0, -100.0, 500.0, 100.0, pane);
-        let anchor = camera.wheel_to_pane(400.0, 0.0, pane);
-        assert!(
-            (f32::from(anchor.x) - 600.0).abs() < 0.5,
-            "clicked node centred x: {}",
-            anchor.x
-        );
-        assert!(
-            (f32::from(anchor.y) - 400.0).abs() < 0.5,
-            "clicked node centred y: {}",
-            anchor.y
-        );
-        for (x, y) in [(300.0, -100.0), (500.0, 100.0)] {
-            let edge = camera.wheel_to_pane(x, y, pane);
-            assert!(
-                f32::from(edge.x) > 0.0 && f32::from(edge.x) < 1200.0,
-                "x inside pane: {}",
-                edge.x
-            );
-            assert!(
-                f32::from(edge.y) > 0.0 && f32::from(edge.y) < 800.0,
-                "y inside pane: {}",
-                edge.y
-            );
-        }
-    }
-
-    #[test]
-    fn recentring_keeps_the_zoom() {
-        let pane = size(px(1200.0), px(800.0));
-        let camera = Camera::fit_around(0.0, 0.0, 0.0, 0.0, 100.0, 100.0, pane);
-        let zoom = camera.zoom;
-        let camera = camera.centered_on(600.0, 300.0, pane);
-        let centered = camera.wheel_to_pane(600.0, 300.0, pane);
-        assert!((f32::from(centered.x) - 600.0).abs() < 0.5);
-        assert!((f32::from(centered.y) - 400.0).abs() < 0.5);
-        assert_eq!(camera.zoom, zoom, "recentring must not change the scale");
-    }
-
-    #[test]
-    fn a_clicked_node_lands_exactly_on_the_pane_centre() {
-        let pane = size(px(1310.0), px(776.0));
-        for anchor in [(0.0, 0.0), (412.5, -233.0), (-800.0, 640.0)] {
-            let camera = Camera::fit_around(
-                anchor.0,
-                anchor.1,
-                anchor.0 - 50.0,
-                anchor.1 - 50.0,
-                anchor.0 + 900.0,
-                anchor.1 + 900.0,
-                pane,
-            );
-            let landed = camera.wheel_to_pane(anchor.0, anchor.1, pane);
-            assert!(
-                (f32::from(landed.x) - 655.0).abs() < 0.5,
-                "anchor {anchor:?} landed at x {}",
-                landed.x
-            );
-            assert!(
-                (f32::from(landed.y) - 388.0).abs() < 0.5,
-                "anchor {anchor:?} landed at y {}",
-                landed.y
-            );
-        }
-    }
-
-    #[test]
-    fn wheel_zoom_keeps_the_point_under_the_cursor() {
-        let pane = size(px(1200.0), px(800.0));
-        let camera = Camera::fit_around(0.0, 0.0, -400.0, -400.0, 400.0, 400.0, pane);
-        let cursor = point(px(900.0), px(250.0));
-        let before = {
-            // The wheel coordinate currently under the cursor.
-            let x = (f32::from(cursor.x) - 600.0 - camera.pan_x) / camera.zoom;
-            let y = (f32::from(cursor.y) - 400.0 - camera.pan_y) / camera.zoom;
-            (x, y)
-        };
-        let zoomed = camera.zoom_about(camera.zoom * 1.6, cursor, pane);
-        let after = zoomed.wheel_to_pane(before.0, before.1, pane);
-        assert!((f32::from(after.x) - f32::from(cursor.x)).abs() < 0.5);
-        assert!((f32::from(after.y) - f32::from(cursor.y)).abs() < 0.5);
-        assert!(zoomed.zoom > camera.zoom);
-    }
-
-    #[test]
-    fn subtree_keys_collects_only_the_clicked_branch() {
-        let plans = vec![
-            plan("p1", "Plan one", Some("feature/agent-core"), None),
-            plan("p2", "Plan two", Some("bug/threads"), None),
-        ];
-        let root = build_visible_wheel(
-            &taxonomy(),
-            &plans,
-            &[],
-            &HashMap::new(),
-            &expanded(&[
-                "root",
-                "cat:feature",
-                "cat:bug",
-                "sub:feature/agent-core",
-                "sub:bug/threads",
-            ]),
-            false,
-        );
-        let feature = subtree_keys(&root, "cat:feature").expect("feature subtree");
-        assert!(feature.contains(&"cat:feature".to_string()));
-        assert!(feature.contains(&"sub:feature/agent-core".to_string()));
-        assert!(feature.contains(&"plan:p1".to_string()));
-        assert!(!feature.contains(&"cat:bug".to_string()));
-        assert!(!feature.contains(&"plan:p2".to_string()));
-        assert!(subtree_keys(&root, "cat:missing").is_none());
-    }
-
-    #[test]
-    fn collapsing_fits_the_whole_wheel_around_the_clicked_node() {
-        let taxonomy = vec![
-            category("feature", None, "Feature", 100),
-            category("process", None, "Process", 150),
-            category("bug", None, "Bug", 200),
-            category("qol", None, "QOL", 210),
-            category("build", None, "Build and infra", 220),
-            category("browser", None, "Browser and preview", 230),
-        ];
-        let plans = vec![plan("p0", "Plan zero", Some("feature"), None)];
-        let root = build_visible_wheel(
-            &taxonomy,
-            &plans,
-            &[],
-            &HashMap::new(),
-            &expanded(&["root", "cat:feature"]),
-            false,
-        );
-        let layout = layout_wheel(&root);
-        let anchor = layout.nodes.iter().find(|n| n.key == "cat:bug").unwrap();
-        let mut min_x = anchor.x;
-        let mut min_y = anchor.y;
-        let mut max_x = anchor.x;
-        let mut max_y = anchor.y;
-        for node in &layout.nodes {
-            min_x = min_x.min(node.x);
-            min_y = min_y.min(node.y);
-            max_x = max_x.max(node.x);
-            max_y = max_y.max(node.y);
-        }
-        let pane = size(px(1310.0), px(776.0));
-        let camera = Camera::fit_around(anchor.x, anchor.y, min_x, min_y, max_x, max_y, pane);
-        let landed = camera.wheel_to_pane(anchor.x, anchor.y, pane);
-        assert!((f32::from(landed.x) - 655.0).abs() < 0.5);
-        assert!((f32::from(landed.y) - 388.0).abs() < 0.5);
-        for node in &layout.nodes {
-            let point = camera.wheel_to_pane(node.x, node.y, pane);
-            assert!(
-                f32::from(point.x) > 0.0 && f32::from(point.x) < 1310.0,
-                "{} inside x: {}",
-                node.label,
-                point.x
-            );
-            assert!(
-                f32::from(point.y) > 0.0 && f32::from(point.y) < 776.0,
-                "{} inside y: {}",
-                node.label,
-                point.y
-            );
-        }
-    }
-
-    #[test]
-    fn camera_fit_is_reversible() {
-        let fitted = Camera::fit(2000.0, size(px(1200.0), px(800.0)));
-        let zoomed = fitted.zoomed(0.5);
-        assert!(zoomed.zoom < fitted.zoom);
-        // Restoring the saved camera returns the same camera exactly.
-        let restored = fitted;
-        assert_eq!(restored, fitted);
     }
 
     #[test]
