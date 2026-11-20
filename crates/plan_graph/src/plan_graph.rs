@@ -10,6 +10,7 @@
 //! sidebar.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::f32::consts::TAU;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
@@ -55,9 +56,16 @@ const DEBUGGER_SUB_GRAPH: [&str; 6] = ["stage", "test", "verify", "restart", "ru
 /// Base distance between rings and the minimum spacing a ring's circumference
 /// must provide for its nodes, both in unscaled wheel coordinates.
 const RING_BASE: f32 = 220.0;
-const NODE_SPACING: f32 = 210.0;
+const NODE_SPACING: f32 = 250.0;
 const NODE_WIDTH: f32 = 190.0;
 const NODE_HEIGHT: f32 = 58.0;
+const NODE_GAP: f32 = 28.0;
+/// No child may claim less than this fraction of an even share of its ring, so a
+/// small subtree beside a huge one cannot squeeze its neighbour into it.
+const MIN_SLOT_SHARE: f32 = 0.55;
+/// A ring whose tightest pair needs more than this is left overlapping rather
+/// than blowing the wheel (and the camera fit) up to an unusable size.
+const MAX_RING_RADIUS: f32 = 9000.0;
 const MIN_ZOOM: f32 = 0.12;
 const MAX_ZOOM: f32 = 2.5;
 
@@ -494,6 +502,9 @@ pub struct WheelNode {
     pub expandable: bool,
     pub slice_count: usize,
     pub depth: usize,
+    /// The node's slot midpoint on its ring, in radians. Kept so the layout can
+    /// measure how tightly a ring packs without re-deriving the angles.
+    pub angle: f32,
     pub x: f32,
     pub y: f32,
 }
@@ -511,6 +522,14 @@ pub struct WheelLayout {
     pub nodes: Vec<WheelNode>,
     pub spokes: Vec<WheelSpoke>,
     pub extent: f32,
+}
+
+/// One depth's ring: where it sits, and the smallest share of a parent's sector
+/// any single child may claim.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ring {
+    radius: f32,
+    min_share: f32,
 }
 
 /// The camera over the wheel. Positions are scaled by `zoom` and offset by the
@@ -781,10 +800,12 @@ fn descendant_count(node: &VisibleNode) -> usize {
     1 + node.children.iter().map(descendant_count).sum::<usize>()
 }
 
-/// Lay the visible tree out on concentric rings. Angles are allocated
-/// proportional to each subtree's visible size, so every ring stays evenly
-/// spaced no matter which branch is open; ring radii grow to fit the count at
-/// that depth. Pure so the camera-fit and disclosure tests can assert it.
+/// Lay the visible tree out on concentric rings. A child's wedge is
+/// proportional to its subtree, so every branch keeps its own sector; a floor on
+/// that wedge stops two small neighbours collapsing onto each other when they
+/// sit beside a huge branch. Ring radii then grow to fit both the count on the
+/// ring and the tightest gap actually assigned to it. Pure so the camera-fit and
+/// disclosure tests can assert it.
 pub fn layout_wheel(root: &VisibleNode) -> WheelLayout {
     let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
     fn count(node: &VisibleNode, depth: usize, counts: &mut BTreeMap<usize, usize>) {
@@ -796,31 +817,59 @@ pub fn layout_wheel(root: &VisibleNode) -> WheelLayout {
     count(root, 0, &mut counts);
     let max_depth = counts.keys().max().copied().unwrap_or(0);
 
-    let mut radii = vec![0.0_f32; max_depth + 1];
-    let mut previous = 0.0;
+    let mut rings = vec![Ring::default(); max_depth + 1];
     for depth in 1..=max_depth {
         let nodes = counts.get(&depth).copied().unwrap_or(1).max(1) as f32;
-        let circumference_radius = nodes * NODE_SPACING / std::f32::consts::TAU;
+        rings[depth].min_share = MIN_SLOT_SHARE / nodes;
+    }
+
+    // Angles do not depend on the radii, so lay the tree out once at zero radius
+    // to learn how tightly each floored ring packs.
+    let mut probe = WheelLayout::default();
+    let mut probe_extent = 0.0_f32;
+    place_node(root, 0, 0.0, TAU, &rings, &mut probe, &mut probe_extent);
+
+    let mut previous = 0.0_f32;
+    for depth in 1..=max_depth {
+        let nodes = counts.get(&depth).copied().unwrap_or(1).max(1) as f32;
         let radius = (depth as f32 * RING_BASE)
-            .max(circumference_radius)
-            .max(previous + RING_BASE);
-        radii[depth] = radius;
+            .max(nodes * NODE_SPACING / TAU)
+            .max(previous + RING_BASE)
+            .max(required_clearance(&probe.nodes, depth))
+            .min(MAX_RING_RADIUS);
+        rings[depth].radius = radius;
         previous = radius;
     }
 
     let mut layout = WheelLayout::default();
     let mut max_radius = 0.0_f32;
-    place_node(
-        root,
-        0,
-        0.0,
-        std::f32::consts::TAU,
-        &radii,
-        &mut layout,
-        &mut max_radius,
-    );
+    place_node(root, 0, 0.0, TAU, &rings, &mut layout, &mut max_radius);
     layout.extent = (max_radius + NODE_HEIGHT) * 2.0;
     layout
+}
+
+/// The radius at which the two closest nodes on `depth`'s ring are still a full
+/// node apart. Adjacent boxes are `2 * r * sin(gap / 2)` apart, so clearing
+/// `NODE_WIDTH + NODE_GAP` needs `r >= (width + gap) / (2 sin(gap / 2))`.
+fn required_clearance(nodes: &[WheelNode], depth: usize) -> f32 {
+    let mut angles: Vec<f32> = nodes
+        .iter()
+        .filter(|node| node.depth == depth)
+        .map(|node| node.angle)
+        .collect();
+    if angles.len() < 2 {
+        return 0.0;
+    }
+    angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut tightest = f32::MAX;
+    for pair in angles.windows(2) {
+        tightest = tightest.min(pair[1] - pair[0]);
+    }
+    tightest = tightest.min(angles[0] + TAU - angles[angles.len() - 1]);
+    if tightest <= 0.0 {
+        return 0.0;
+    }
+    (NODE_WIDTH + NODE_GAP) / (2.0 * (tightest / 2.0).sin())
 }
 
 fn place_node(
@@ -828,11 +877,11 @@ fn place_node(
     depth: usize,
     start: f32,
     end: f32,
-    radii: &[f32],
+    rings: &[Ring],
     layout: &mut WheelLayout,
     max_radius: &mut f32,
 ) {
-    let radius = radii.get(depth).copied().unwrap_or(0.0);
+    let radius = rings.get(depth).map(|ring| ring.radius).unwrap_or(0.0);
     let angle = (start + end) / 2.0 - std::f32::consts::FRAC_PI_2;
     let x = angle.cos() * radius;
     let y = angle.sin() * radius;
@@ -848,28 +897,43 @@ fn place_node(
         expandable: node.expandable,
         slice_count: node.slice_count,
         depth,
+        angle: (start + end) / 2.0,
         x,
         y,
     });
 
-    let weights: Vec<usize> = node.children.iter().map(descendant_count).collect();
-    let total: usize = weights.iter().sum();
-    if total == 0 {
+    if node.children.is_empty() {
         return;
     }
+    let min_share = rings
+        .get(depth + 1)
+        .map(|ring| ring.min_share)
+        .unwrap_or(0.0);
+    let weights: Vec<f32> = node
+        .children
+        .iter()
+        .map(|child| descendant_count(child) as f32)
+        .collect();
+    let total: f32 = weights.iter().sum();
+    let shares: Vec<f32> = weights
+        .iter()
+        .map(|weight| (weight / total).max(min_share))
+        .collect();
+    let share_total: f32 = shares.iter().sum();
+
     let mut cursor = start;
-    for (child, weight) in node.children.iter().zip(weights) {
-        let span = (end - start) * (weight as f32 / total as f32);
+    for (child, share) in node.children.iter().zip(shares) {
+        let span = (end - start) * (share / share_total);
         place_node(
             child,
             depth + 1,
             cursor,
             cursor + span,
-            radii,
+            rings,
             layout,
             max_radius,
         );
-        let child_radius = radii.get(depth + 1).copied().unwrap_or(0.0);
+        let child_radius = rings.get(depth + 1).map(|ring| ring.radius).unwrap_or(0.0);
         let child_angle = cursor + span / 2.0 - std::f32::consts::FRAC_PI_2;
         layout.spokes.push(WheelSpoke {
             x1: x,
@@ -1481,27 +1545,36 @@ impl PlanGraph {
                             cx.notify();
                         }),
                     )
-                    .child(div().absolute().inset_0().child(gpui::canvas(
-                        |_, _, _| {},
-                        move |bounds, _, window, _| {
-                            let center_x = bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
-                            let center_y = bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
-                            for spoke in &spokes {
-                                let mut builder = gpui::PathBuilder::stroke(px(1.0));
-                                builder.move_to(point(
-                                    center_x + px(spoke.x1 * zoom),
-                                    center_y + px(spoke.y1 * zoom),
-                                ));
-                                builder.line_to(point(
-                                    center_x + px(spoke.x2 * zoom),
-                                    center_y + px(spoke.y2 * zoom),
-                                ));
-                                if let Ok(path) = builder.build() {
-                                    window.paint_path(path, spoke_color);
+                    // `gpui::canvas` has no intrinsic size, so it must be given
+                    // one explicitly; otherwise its bounds are 0x0 at the pane's
+                    // top-left and the spokes lose the node frame's centre.
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let center_x =
+                                    bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
+                                let center_y =
+                                    bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
+                                for spoke in &spokes {
+                                    let mut builder = gpui::PathBuilder::stroke(px(1.0));
+                                    builder.move_to(point(
+                                        center_x + px(spoke.x1 * zoom),
+                                        center_y + px(spoke.y1 * zoom),
+                                    ));
+                                    builder.line_to(point(
+                                        center_x + px(spoke.x2 * zoom),
+                                        center_y + px(spoke.y2 * zoom),
+                                    ));
+                                    if let Ok(path) = builder.build() {
+                                        window.paint_path(path, spoke_color);
+                                    }
                                 }
-                            }
-                        },
-                    )))
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .child(
                         div()
                             .absolute()
@@ -2193,6 +2266,93 @@ mod tests {
         assert_ne!(categories[0].x, categories[1].x);
         assert!(layout.extent > 0.0);
         assert_eq!(layout.spokes.len(), layout.nodes.len() - 1);
+    }
+
+    #[test]
+    fn every_ring_is_round_and_its_neighbours_clear_each_other() {
+        // The shape of the live store: a few large categories and several small
+        // ones, which used to leave neighbours (Bug next to QOL) overlapping.
+        let taxonomy = vec![
+            category("feature", None, "Feature", 100),
+            category("process", None, "Process", 150),
+            category("bug", None, "Bug", 200),
+            category("qol", None, "QOL", 210),
+            category("build", None, "Build and infra", 220),
+            category("browser", None, "Browser and preview", 230),
+        ];
+        let mut plans = Vec::new();
+        for index in 0..12 {
+            plans.push(plan(
+                &format!("feature-{index}"),
+                "Feature plan",
+                Some("feature"),
+                None,
+            ));
+        }
+        for index in 0..7 {
+            plans.push(plan(
+                &format!("process-{index}"),
+                "Process plan",
+                Some("process"),
+                None,
+            ));
+        }
+        plans.push(plan("bug-0", "Bug plan", Some("bug"), None));
+        plans.push(plan("qol-0", "QOL plan", Some("qol"), None));
+        plans.push(plan("build-0", "Build plan", Some("build"), None));
+        plans.push(plan("browser-0", "Browser plan", Some("browser"), None));
+
+        let root = build_visible_wheel(
+            &taxonomy,
+            &plans,
+            &[],
+            &HashMap::new(),
+            &expanded(&["root"]),
+            false,
+        );
+        let layout = layout_wheel(&root);
+
+        let mut depths: Vec<usize> = layout.nodes.iter().map(|node| node.depth).collect();
+        depths.sort_unstable();
+        depths.dedup();
+        for depth in depths {
+            let mut ring: Vec<&WheelNode> = layout
+                .nodes
+                .iter()
+                .filter(|node| node.depth == depth)
+                .collect();
+            if depth == 0 {
+                assert_eq!(ring.len(), 1, "the root sits alone at the centre");
+                continue;
+            }
+            // One radius per ring: no node may sit inboard or outboard of its
+            // siblings, which is what made the wheel look lopsided.
+            let radius = (ring[0].x.powi(2) + ring[0].y.powi(2)).sqrt();
+            for node in &ring {
+                let node_radius = (node.x.powi(2) + node.y.powi(2)).sqrt();
+                assert!(
+                    (node_radius - radius).abs() < 0.5,
+                    "{} sits at {node_radius} on a ring of {radius}",
+                    node.label
+                );
+            }
+            // Neighbours on a ring must clear each other, or the boxes overlap.
+            ring.sort_by(|a, b| {
+                a.angle
+                    .partial_cmp(&b.angle)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for pair in ring.windows(2) {
+                let distance =
+                    ((pair[1].x - pair[0].x).powi(2) + (pair[1].y - pair[0].y).powi(2)).sqrt();
+                assert!(
+                    distance >= NODE_WIDTH,
+                    "depth {depth}: {} and {} are only {distance} apart",
+                    pair[0].label,
+                    pair[1].label
+                );
+            }
+        }
     }
 
     #[test]
