@@ -1107,7 +1107,11 @@ impl PlanGraph {
         cx.notify();
     }
 
-    fn deploy(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<Self> {
+    fn deploy(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
         let existing = workspace.items_of_type::<PlanGraph>(cx).next();
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
@@ -1694,15 +1698,13 @@ pub fn init(cx: &mut App) {
                 PlanGraph::deploy(workspace, window, cx);
             },
         );
-        workspace.register_action(
-            |workspace: &mut Workspace, action: &OpenPlan, window, cx| {
-                let item = PlanGraph::deploy(workspace, window, cx);
-                let plan_id = action.plan_id.clone();
-                item.update(cx, |graph, cx| {
-                    graph.navigate_to_plan(plan_id.as_ref(), cx);
-                });
-            },
-        );
+        workspace.register_action(|workspace: &mut Workspace, action: &OpenPlan, window, cx| {
+            let item = PlanGraph::deploy(workspace, window, cx);
+            let plan_id = action.plan_id.clone();
+            item.update(cx, |graph, cx| {
+                graph.navigate_to_plan(plan_id.as_ref(), cx);
+            });
+        });
     })
     .detach();
 }
