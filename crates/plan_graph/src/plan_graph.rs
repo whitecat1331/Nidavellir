@@ -17,11 +17,11 @@ use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, Render, Rems, Size, StatefulInteractiveElement, WeakEntity, Window, actions,
+    KeyDownEvent, Rems, Render, Size, StatefulInteractiveElement, WeakEntity, Window, actions,
     point, px,
 };
 use plan_store::{
-    CategoryRow, CategorizedPlanRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
+    CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
     PlanStore,
 };
 use ui::{Button, Color, Label, LabelSize, prelude::*};
@@ -33,8 +33,17 @@ actions!(plan_graph, [DeployPlanGraph]);
 /// The dev-flow route — the same readiness table the `graph_tool` coordinator
 /// and the fleet panel use.
 const ROUTE: [&str; 11] = [
-    "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept", "merge",
-    "release", "complete",
+    "plan",
+    "promote",
+    "claim",
+    "fork",
+    "implement",
+    "verify",
+    "compile",
+    "accept",
+    "merge",
+    "release",
+    "complete",
 ];
 
 /// A plan with no activity for this long is visibly stalled, not "moving".
@@ -53,11 +62,7 @@ const MIN_ZOOM: f32 = 0.12;
 const MAX_ZOOM: f32 = 2.5;
 
 pub fn debugger_sub_graph(scoped: bool) -> &'static [&'static str] {
-    if scoped {
-        &DEBUGGER_SUB_GRAPH
-    } else {
-        &[]
-    }
+    if scoped { &DEBUGGER_SUB_GRAPH } else { &[] }
 }
 
 const LEGEND_STATES: [NodeState; 4] = [
@@ -147,9 +152,10 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
 }
 
 fn next_ready(done: &HashSet<&str>) -> Option<&'static str> {
-    ROUTE.iter().copied().find(|node| {
-        !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p))
-    })
+    ROUTE
+        .iter()
+        .copied()
+        .find(|node| !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p)))
 }
 
 /// Derive a plan's node state from its graph-state row + done nodes.
@@ -318,7 +324,6 @@ pub fn dev_flow_visual(node: &DevFlowNode) -> (&'static str, Color) {
         ("○", Color::Muted)
     }
 }
-
 
 /// The coordinator's read-only decision for a plan (1.29 D2, Option B).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,7 +724,11 @@ pub fn build_visible_wheel(
         );
         node.expandable = !cat_children.is_empty();
         node.expanded = cat_expanded;
-        node.children = if cat_expanded { cat_children } else { Vec::new() };
+        node.children = if cat_expanded {
+            cat_children
+        } else {
+            Vec::new()
+        };
         root_children.push(node);
     }
 
@@ -729,8 +738,11 @@ pub fn build_visible_wheel(
         let mut history_nodes: Vec<VisibleNode> = history
             .iter()
             .map(|plan| {
-                let mut node =
-                    VisibleNode::new(format!("hist:{}", plan.id), plan_label(plan), WheelKind::Plan);
+                let mut node = VisibleNode::new(
+                    format!("hist:{}", plan.id),
+                    plan_label(plan),
+                    WheelKind::Plan,
+                );
                 node.plan_id = Some(plan.id.clone());
                 node.state = NodeState::Done;
                 node
@@ -793,7 +805,15 @@ pub fn layout_wheel(root: &VisibleNode) -> WheelLayout {
 
     let mut layout = WheelLayout::default();
     let mut max_radius = 0.0_f32;
-    place_node(root, 0, 0.0, std::f32::consts::TAU, &radii, &mut layout, &mut max_radius);
+    place_node(
+        root,
+        0,
+        0.0,
+        std::f32::consts::TAU,
+        &radii,
+        &mut layout,
+        &mut max_radius,
+    );
     layout.extent = (max_radius + NODE_HEIGHT) * 2.0;
     layout
 }
@@ -835,7 +855,15 @@ fn place_node(
     let mut cursor = start;
     for (child, weight) in node.children.iter().zip(weights) {
         let span = (end - start) * (weight as f32 / total as f32);
-        place_node(child, depth + 1, cursor, cursor + span, radii, layout, max_radius);
+        place_node(
+            child,
+            depth + 1,
+            cursor,
+            cursor + span,
+            radii,
+            layout,
+            max_radius,
+        );
         let child_radius = radii.get(depth + 1).copied().unwrap_or(0.0);
         let child_angle = cursor + span / 2.0 - std::f32::consts::FRAC_PI_2;
         layout.spokes.push(WheelSpoke {
@@ -1028,7 +1056,8 @@ impl PlanGraph {
         self.page_stack.push(plan_id.clone());
         self.load_page(&plan_id);
         self.threads.clear();
-        self.composer.update(cx, |editor, cx| editor.clear(window, cx));
+        self.composer
+            .update(cx, |editor, cx| editor.clear(window, cx));
         self.load_threads(cx);
         cx.notify();
     }
@@ -1070,12 +1099,7 @@ impl PlanGraph {
 
     fn load_page(&mut self, plan_id: &str) {
         let store = Self::open_store();
-        let Some(plan) = self
-            .plans
-            .iter()
-            .find(|plan| plan.id == plan_id)
-            .cloned()
-        else {
+        let Some(plan) = self.plans.iter().find(|plan| plan.id == plan_id).cloned() else {
             return;
         };
 
@@ -1144,9 +1168,7 @@ impl PlanGraph {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let database = cx
-                .update(|cx| agent::ThreadsDatabase::connect(cx))
-                .await;
+            let database = cx.update(|cx| agent::ThreadsDatabase::connect(cx)).await;
             let database = match database {
                 Ok(database) => database,
                 Err(error) => {
@@ -1222,12 +1244,15 @@ impl PlanGraph {
                 cx,
             );
         });
-        self.composer.update(cx, |editor, cx| editor.clear(window, cx));
+        self.composer
+            .update(cx, |editor, cx| editor.clear(window, cx));
         self.load_threads(cx);
         // The new thread is persisted asynchronously; reload once the save has
         // landed so it appears in this plan's sidebar without reopening the page.
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(900)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(900))
+                .await;
             if let Err(error) = this.update(cx, |this, cx| this.load_threads(cx)) {
                 log::debug!("[GRAPH] plan page closed before thread refresh: {error:#}");
             }
@@ -1236,7 +1261,12 @@ impl PlanGraph {
         cx.notify();
     }
 
-    fn open_thread(&mut self, session_id: acp::SessionId, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_thread(
+        &mut self,
+        session_id: acp::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1308,20 +1338,13 @@ impl PlanGraph {
                 },
             )))
             .child(
-                Label::new(
-                    "single-click expands · double-click opens · Enter opens focused",
-                )
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
+                Label::new("single-click expands · double-click opens · Enter opens focused")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             )
     }
 
-    fn single_click(
-        &mut self,
-        node: &WheelNode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn single_click(&mut self, node: &WheelNode, window: &mut Window, cx: &mut Context<Self>) {
         match node.kind {
             WheelKind::Root => {
                 self.expanded.clear();
@@ -1383,71 +1406,67 @@ impl PlanGraph {
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(
-                |this: &mut PlanGraph, event: &KeyDownEvent, window, cx| {
+            .on_key_down(
+                cx.listener(|this: &mut PlanGraph, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "enter" {
                         this.open_focused(window, cx);
                     }
-                },
-            ))
+                }),
+            )
             .child(self.render_toolbar(cx))
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .relative()
-                                    .w(px(0.0))
-                                    .h(px(0.0))
-                                    // Spokes are painted on a canvas centred on the
-                                    // wheel origin; the nodes are absolutely placed
-                                    // around the same origin.
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left(px(pan_x - canvas_extent / 2.0))
-                                            .top(px(pan_y - canvas_extent / 2.0))
-                                            .w(px(canvas_extent))
-                                            .h(px(canvas_extent))
-                                            .child(gpui::canvas(
-                                                |_, _, _| {},
-                                                move |bounds, _, window, _| {
-                                                    let center_x = bounds.origin.x
-                                                        + bounds.size.width / 2.0;
-                                                    let center_y = bounds.origin.y
-                                                        + bounds.size.height / 2.0;
-                                                    for spoke in &spokes {
-                                                        let mut builder =
-                                                            gpui::PathBuilder::stroke(px(1.0));
-                                                        builder.move_to(point(
-                                                            center_x + px(spoke.x1 * zoom),
-                                                            center_y + px(spoke.y1 * zoom),
-                                                        ));
-                                                        builder.line_to(point(
-                                                            center_x + px(spoke.x2 * zoom),
-                                                            center_y + px(spoke.y2 * zoom),
-                                                        ));
-                                                        if let Ok(path) = builder.build() {
-                                                            window.paint_path(path, spoke_color);
-                                                        }
+                div().relative().flex_1().overflow_hidden().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(0.0))
+                                .h(px(0.0))
+                                // Spokes are painted on a canvas centred on the
+                                // wheel origin; the nodes are absolutely placed
+                                // around the same origin.
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(pan_x - canvas_extent / 2.0))
+                                        .top(px(pan_y - canvas_extent / 2.0))
+                                        .w(px(canvas_extent))
+                                        .h(px(canvas_extent))
+                                        .child(gpui::canvas(
+                                            |_, _, _| {},
+                                            move |bounds, _, window, _| {
+                                                let center_x =
+                                                    bounds.origin.x + bounds.size.width / 2.0;
+                                                let center_y =
+                                                    bounds.origin.y + bounds.size.height / 2.0;
+                                                for spoke in &spokes {
+                                                    let mut builder =
+                                                        gpui::PathBuilder::stroke(px(1.0));
+                                                    builder.move_to(point(
+                                                        center_x + px(spoke.x1 * zoom),
+                                                        center_y + px(spoke.y1 * zoom),
+                                                    ));
+                                                    builder.line_to(point(
+                                                        center_x + px(spoke.x2 * zoom),
+                                                        center_y + px(spoke.y2 * zoom),
+                                                    ));
+                                                    if let Ok(path) = builder.build() {
+                                                        window.paint_path(path, spoke_color);
                                                     }
-                                                },
-                                            )),
-                                    )
-                                    .children(layout.nodes.iter().map(|node| {
-                                        self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
-                                    })),
-                            ),
-                    ),
+                                                }
+                                            },
+                                        )),
+                                )
+                                .children(layout.nodes.iter().map(|node| {
+                                    self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
+                                })),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -1504,26 +1523,34 @@ impl PlanGraph {
             .bg(background)
             .cursor_pointer()
             .when(focused, |this| this.border_2())
-            .on_hover(cx.listener(move |this: &mut PlanGraph, hovered: &bool, _, cx| {
-                if *hovered {
-                    this.focused_key = Some(key.clone());
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |this: &mut PlanGraph, event: &ClickEvent, window, cx| {
-                if event.click_count() >= 2 {
-                    if let Some(plan_id) = click_node.plan_id.clone() {
-                        this.open_plan(plan_id, window, cx);
+            .on_hover(
+                cx.listener(move |this: &mut PlanGraph, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.focused_key = Some(key.clone());
+                        cx.notify();
                     }
-                } else {
-                    this.single_click(&click_node, window, cx);
-                }
-            }))
+                }),
+            )
+            .on_click(cx.listener(
+                move |this: &mut PlanGraph, event: &ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        if let Some(plan_id) = click_node.plan_id.clone() {
+                            this.open_plan(plan_id, window, cx);
+                        }
+                    } else {
+                        this.single_click(&click_node, window, cx);
+                    }
+                },
+            ))
             .child(
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(Label::new(glyph).size(LabelSize::Custom(Rems(font))).color(glyph_color))
+                    .child(
+                        Label::new(glyph)
+                            .size(LabelSize::Custom(Rems(font)))
+                            .color(glyph_color),
+                    )
                     .child(
                         Label::new(node.label.clone())
                             .size(LabelSize::Custom(Rems(font)))
@@ -1596,17 +1623,17 @@ impl PlanGraph {
                     .gap_2()
                     .items_center()
                     .when(can_go_back, |this| {
-                        this.child(Button::new("page-back", "← Back").on_click(
-                            cx.listener(|this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                        this.child(Button::new("page-back", "← Back").on_click(cx.listener(
+                            |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
                                 this.back(window, cx)
-                            }),
-                        ))
+                            },
+                        )))
                     })
-                    .child(Button::new("page-graph", "Back to graph").on_click(
-                        cx.listener(|this: &mut PlanGraph, _: &ClickEvent, _, cx| {
-                            this.back_to_graph(cx)
-                        }),
-                    ))
+                    .child(
+                        Button::new("page-graph", "Back to graph").on_click(cx.listener(
+                            |this: &mut PlanGraph, _: &ClickEvent, _, cx| this.back_to_graph(cx),
+                        )),
+                    )
                     .child(Label::new(title).size(LabelSize::Large))
                     .child(badge(
                         if page.lifecycle == Lifecycle::History {
@@ -1627,8 +1654,12 @@ impl PlanGraph {
                     .gap_3()
                     .flex_wrap()
                     .child(meta("id", &page.id))
-                    .when_some(page.repo.clone(), |this, repo| this.child(meta("repo", &repo)))
-                    .when_some(page.stage.clone(), |this, stage| this.child(meta("stage", &stage)))
+                    .when_some(page.repo.clone(), |this, repo| {
+                        this.child(meta("repo", &repo))
+                    })
+                    .when_some(page.stage.clone(), |this, stage| {
+                        this.child(meta("stage", &stage))
+                    })
                     .when_some(page.status.clone(), |this, status| {
                         this.child(meta("status", &status))
                     })
@@ -1651,7 +1682,11 @@ impl PlanGraph {
                     .py_1()
                     .rounded_md()
                     .bg(cx.theme().colors().element_background)
-                    .child(Label::new(decision_text(&page.decision)).size(LabelSize::Small).color(decision_color)),
+                    .child(
+                        Label::new(decision_text(&page.decision))
+                            .size(LabelSize::Small)
+                            .color(decision_color),
+                    ),
             )
             .child(
                 v_flex()
@@ -1752,11 +1787,11 @@ impl PlanGraph {
                                     .bg(cx.theme().colors().editor_background)
                                     .child(self.composer.clone()),
                             )
-                            .child(Button::new("plan-send", "Send").on_click(
-                                cx.listener(|this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                            .child(Button::new("plan-send", "Send").on_click(cx.listener(
+                                |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
                                     this.send_composer(window, cx)
-                                }),
-                            )),
+                                },
+                            ))),
                     ),
             )
             .into_any_element()
@@ -1766,7 +1801,11 @@ impl PlanGraph {
 fn meta(label: &str, value: &str) -> AnyElement {
     h_flex()
         .gap_1()
-        .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+        .child(
+            Label::new(label.to_string())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
         .child(Label::new(value.to_string()).size(LabelSize::XSmall))
         .into_any_element()
 }
@@ -1778,18 +1817,22 @@ fn badge(label: &str, color: Color, cx: &App) -> AnyElement {
         .rounded_full()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
-        .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
+        .child(
+            Label::new(label.to_string())
+                .size(LabelSize::XSmall)
+                .color(color),
+        )
         .into_any_element()
 }
 
-fn chip_row(
-    title: &str,
-    chips: &[RelationChip],
-    cx: &mut Context<PlanGraph>,
-) -> AnyElement {
+fn chip_row(title: &str, chips: &[RelationChip], cx: &mut Context<PlanGraph>) -> AnyElement {
     v_flex()
         .gap_1()
-        .child(Label::new(title.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+        .child(
+            Label::new(title.to_string())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
         .child(
             h_flex()
                 .gap_1()
@@ -1876,7 +1919,12 @@ mod tests {
         }
     }
 
-    fn plan(id: &str, name: &str, category_id: Option<&str>, status: Option<&str>) -> CategorizedPlanRow {
+    fn plan(
+        id: &str,
+        name: &str,
+        category_id: Option<&str>,
+        status: Option<&str>,
+    ) -> CategorizedPlanRow {
         CategorizedPlanRow {
             id: id.to_string(),
             name: name.to_string(),
@@ -1972,7 +2020,12 @@ mod tests {
             &expanded(&[]),
             false,
         );
-        assert!(find(&root_closed, "cat:feature").unwrap().children.is_empty());
+        assert!(
+            find(&root_closed, "cat:feature")
+                .unwrap()
+                .children
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2051,18 +2104,19 @@ mod tests {
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["cat:feature", "cat:bug", "sub:feature/agent-core", "sub:bug/threads"]),
+            &expanded(&[
+                "cat:feature",
+                "cat:bug",
+                "sub:feature/agent-core",
+                "sub:bug/threads",
+            ]),
             false,
         );
         let layout = layout_wheel(&root);
         assert_eq!(layout.nodes.len(), 7);
         let root_node = layout.nodes.iter().find(|n| n.key == "root").unwrap();
         assert_eq!((root_node.x, root_node.y), (0.0, 0.0));
-        let categories: Vec<&WheelNode> = layout
-            .nodes
-            .iter()
-            .filter(|n| n.depth == 1)
-            .collect();
+        let categories: Vec<&WheelNode> = layout.nodes.iter().filter(|n| n.depth == 1).collect();
         assert_eq!(categories.len(), 2);
         assert_ne!(categories[0].x, categories[1].x);
         assert!(layout.extent > 0.0);
@@ -2082,9 +2136,7 @@ mod tests {
     #[test]
     fn plan_id_from_path_normalizes_progress_and_markdown_paths() {
         assert_eq!(
-            plan_id_from_path(
-                "/home/me/plans/in-progress-plans/PLAN_OF_ACTION-2026-11-19-x.md"
-            ),
+            plan_id_from_path("/home/me/plans/in-progress-plans/PLAN_OF_ACTION-2026-11-19-x.md"),
             "plan-of-action-2026-11-19-x"
         );
         assert_eq!(
@@ -2150,27 +2202,20 @@ mod tests {
             heartbeat: Some(Utc::now().to_rfc3339()),
             ..row("MOVING", "implement", 0)
         };
-        assert_eq!(
-            derive_node_state(&moving, &[], now()),
-            NodeState::Moving
-        );
+        assert_eq!(derive_node_state(&moving, &[], now()), NodeState::Moving);
         let stalled = FleetPlanRow {
             active_node: Some("implement".to_string()),
-            heartbeat: Some((Utc::now() - chrono::Duration::seconds(STALL_SECONDS + 1)).to_rfc3339()),
+            heartbeat: Some(
+                (Utc::now() - chrono::Duration::seconds(STALL_SECONDS + 1)).to_rfc3339(),
+            ),
             ..row("STALLED", "implement", 0)
         };
-        assert_eq!(
-            derive_node_state(&stalled, &[], now()),
-            NodeState::Stuck
-        );
+        assert_eq!(derive_node_state(&stalled, &[], now()), NodeState::Stuck);
         let blocked = FleetPlanRow {
             blocked_reason: Some("human gate".to_string()),
             ..row("BLOCKED", "verify", 0)
         };
-        assert_eq!(
-            derive_node_state(&blocked, &[], now()),
-            NodeState::Blocked
-        );
+        assert_eq!(derive_node_state(&blocked, &[], now()), NodeState::Blocked);
         assert_eq!(
             derive_node_state(&row("DONE", "complete", 0), &[], now()),
             NodeState::Done
@@ -2257,15 +2302,16 @@ mod tests {
         let mut active = snapshot("PLAN_A", "implement");
         active.active_node = Some("implement".to_string());
         store.apply_graph_snapshot(&active).unwrap();
-        assert_eq!(project_decision(&store, "PLAN_A").kind, DecisionKind::Active);
+        assert_eq!(
+            project_decision(&store, "PLAN_A").kind,
+            DecisionKind::Active
+        );
 
         let mut next = snapshot("PLAN_B", "verify");
-        next.done_nodes = [
-            "plan", "promote", "claim", "fork", "implement", "verify",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        next.done_nodes = ["plan", "promote", "claim", "fork", "implement", "verify"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         store.apply_graph_snapshot(&next).unwrap();
         let decision = project_decision(&store, "PLAN_B");
         assert_eq!(decision.kind, DecisionKind::Next);
@@ -2273,7 +2319,14 @@ mod tests {
 
         let mut gate = snapshot("PLAN_C", "accept");
         gate.done_nodes = [
-            "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept",
+            "plan",
+            "promote",
+            "claim",
+            "fork",
+            "implement",
+            "verify",
+            "compile",
+            "accept",
         ]
         .into_iter()
         .map(str::to_string)
@@ -2299,10 +2352,7 @@ mod tests {
         }];
         retry.done_nodes.push("compile".to_string());
         store.apply_graph_snapshot(&retry).unwrap();
-        assert_eq!(
-            project_decision(&store, "PLAN_D").kind,
-            DecisionKind::Retry
-        );
+        assert_eq!(project_decision(&store, "PLAN_D").kind, DecisionKind::Retry);
     }
 
     #[test]
