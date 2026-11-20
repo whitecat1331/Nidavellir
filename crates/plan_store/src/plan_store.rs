@@ -739,35 +739,31 @@ impl PlanStore {
     }
 
     pub fn plan_categories(&self) -> Result<Vec<PlanCategoryRow>> {
-        let mut select = self.connection.select_bound::<(), (
-            String,
-            String,
-            String,
-            String,
-        )>(indoc! {"
+        let mut select = self
+            .connection
+            .select_bound::<(), (String, String, String, String)>(indoc! {"
             SELECT plan_id, category_id, source, input_hash
             FROM plan_categories ORDER BY plan_id
         "})?;
         let rows = select(())?;
         Ok(rows
             .into_iter()
-            .map(|(plan_id, category_id, source, input_hash)| PlanCategoryRow {
-                plan_id,
-                category_id,
-                source,
-                input_hash,
-            })
+            .map(
+                |(plan_id, category_id, source, input_hash)| PlanCategoryRow {
+                    plan_id,
+                    category_id,
+                    source,
+                    input_hash,
+                },
+            )
             .collect())
     }
 
     pub fn plan_category(&self, plan_id: &str) -> Result<Option<PlanCategoryRow>> {
         let plan_id = normalize_plan_id(plan_id);
-        let mut select = self.connection.select_bound::<String, (
-            String,
-            String,
-            String,
-            String,
-        )>(indoc! {"
+        let mut select = self
+            .connection
+            .select_bound::<String, (String, String, String, String)>(indoc! {"
             SELECT plan_id, category_id, source, input_hash
             FROM plan_categories WHERE plan_id = ?1
         "})?;
@@ -775,12 +771,14 @@ impl PlanStore {
         Ok(rows
             .into_iter()
             .next()
-            .map(|(plan_id, category_id, source, input_hash)| PlanCategoryRow {
-                plan_id,
-                category_id,
-                source,
-                input_hash,
-            }))
+            .map(
+                |(plan_id, category_id, source, input_hash)| PlanCategoryRow {
+                    plan_id,
+                    category_id,
+                    source,
+                    input_hash,
+                },
+            ))
     }
 
     pub fn plan_parents(&self) -> Result<Vec<PlanParentRow>> {
@@ -1074,12 +1072,9 @@ impl PlanStore {
     }
 
     pub fn upsert_category(&self, category: &CategoryRow) -> Result<()> {
-        let mut upsert = self.connection.exec_bound::<(
-            String,
-            Option<String>,
-            String,
-            i64,
-        )>(indoc! {"
+        let mut upsert = self
+            .connection
+            .exec_bound::<(String, Option<String>, String, i64)>(indoc! {"
             INSERT INTO categories (id, parent_id, name, rank)
             VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(id) DO UPDATE SET
@@ -1109,13 +1104,9 @@ impl PlanStore {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut upsert = self.connection.exec_bound::<(
-            String,
-            String,
-            String,
-            String,
-            String,
-        )>(indoc! {"
+        let mut upsert = self
+            .connection
+            .exec_bound::<(String, String, String, String, String)>(indoc! {"
             INSERT INTO plan_categories (plan_id, category_id, source, input_hash, assigned_at)
             VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(plan_id) DO UPDATE SET
@@ -1144,11 +1135,9 @@ impl PlanStore {
 
     pub fn upsert_plan_parent(&self, parent: &PlanParentRow) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let mut upsert = self.connection.exec_bound::<(
-            String,
-            String,
-            String,
-        )>(indoc! {"
+        let mut upsert = self
+            .connection
+            .exec_bound::<(String, String, String)>(indoc! {"
             INSERT INTO plan_parents (plan_id, parent_id, source, updated_at)
             VALUES (?1, ?2, 'parent', ?3)
             ON CONFLICT(plan_id) DO UPDATE SET
@@ -1595,7 +1584,11 @@ mod tests {
             Lifecycle::Live
         );
         assert_eq!(
-            classify_lifecycle(None, Some("2026-10-13 (parked — waiting on upstream)"), None),
+            classify_lifecycle(
+                None,
+                Some("2026-10-13 (parked — waiting on upstream)"),
+                None
+            ),
             Lifecycle::Live
         );
         assert_eq!(
