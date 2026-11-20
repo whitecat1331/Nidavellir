@@ -1149,11 +1149,7 @@ impl PlanGraph {
             .id(ElementId::Name("plan-tree".into()))
             .flex_1()
             .overflow_y_scroll()
-            .children(
-                root.children
-                    .iter()
-                    .map(|child| self.render_tree_row(child, 0, cx)),
-            )
+            .child(self.render_tree_row(&root, 0, cx))
     }
 
     fn render_tree_row(
