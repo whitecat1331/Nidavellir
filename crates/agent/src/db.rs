@@ -38,6 +38,9 @@ pub struct DbThreadMetadata {
     /// The stable managed-workspace id this thread belongs to, if one has been
     /// minted. Stored as the hyphenated string form of the manager id.
     pub workspace_id: Option<String>,
+    /// The dev-flow plan this thread is executing (`graph_tool`'s `plan_path`).
+    /// Lets the plan page scope its thread sidebar to one plan.
+    pub plan_path: Option<String>,
 }
 
 impl From<&DbThreadMetadata> for acp_thread::AgentSessionInfo {
@@ -799,6 +802,13 @@ impl ThreadsDatabase {
             s().ok();
         }
 
+        if let Ok(mut s) = connection.exec(indoc! {"
+            ALTER TABLE threads ADD COLUMN plan_path TEXT
+        "})
+        {
+            s().ok();
+        }
+
         // `list_threads` orders by `updated_at DESC, created_at DESC`; without an
         // index SQLite full-scans the blob-heavy `threads` table and temp-sorts it
         // on every sidebar refresh / thread activation (ISSUE-0063).
@@ -882,6 +892,7 @@ impl ThreadsDatabase {
         }
 
         let title = thread.title.to_string();
+        let plan_path = thread.plan_path.clone();
         let updated_at = thread.updated_at.to_rfc3339();
         let parent_id = thread
             .subagent_context
@@ -950,10 +961,10 @@ impl ThreadsDatabase {
             created_at,
         ))?;
 
-        let mut update_dedup = connection.exec_bound::<(Option<String>, Arc<str>)>(indoc! {"
-            UPDATE threads SET dedup_key = ?1 WHERE id = ?2
+        let mut update_metadata = connection.exec_bound::<(Option<String>, Option<String>, Arc<str>)>(indoc! {"
+            UPDATE threads SET dedup_key = ?1, plan_path = ?2 WHERE id = ?3
         "})?;
-        update_dedup((dedup_key, id_for_dedup))?;
+        update_metadata((dedup_key, plan_path, id_for_dedup))?;
 
         Ok(json_data.len())
     }
@@ -965,14 +976,14 @@ impl ThreadsDatabase {
             let connection = connection.lock();
 
             let mut select = connection
-                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, Option<String>)>(indoc! {"
-                SELECT id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at FROM threads WHERE merged_into IS NULL ORDER BY updated_at DESC, created_at DESC
+                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<String>)>(indoc! {"
+                SELECT id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at, plan_path FROM threads WHERE merged_into IS NULL ORDER BY updated_at DESC, created_at DESC
             "})?;
 
             let rows = select(())?;
             let mut threads = Vec::new();
 
-            for (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at) in rows {
+            for (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at, plan_path) in rows {
                 let folder_paths = folder_paths
                     .map(|paths| {
                         PathList::deserialize(&util::path_list::SerializedPathList {
@@ -995,6 +1006,7 @@ impl ThreadsDatabase {
                     created_at,
                     folder_paths,
                     workspace_id,
+                    plan_path,
                 });
             }
 

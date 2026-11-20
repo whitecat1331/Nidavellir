@@ -133,7 +133,10 @@ pub struct CategorizedPlanRow {
     pub current_node: Option<String>,
     pub category_id: Option<String>,
     pub category_source: Option<String>,
-    pub category_input_hash: Option<String>,
+    /// One-line summary for the wheel leaf (from the plan markdown).
+    pub summary: Option<String>,
+    /// One-paragraph summary for the plan page.
+    pub detail: Option<String>,
 }
 
 impl CategorizedPlanRow {
@@ -271,6 +274,8 @@ impl PlanStore {
                 blocked_reason TEXT,
                 spent_tokens INTEGER NOT NULL DEFAULT 0,
                 debugger_scoped INTEGER NOT NULL DEFAULT 0,
+                summary TEXT,
+                detail TEXT,
                 order_rank INTEGER,
                 updated_at TEXT NOT NULL
             )
@@ -352,7 +357,7 @@ impl PlanStore {
     /// `ALTER TABLE`. The identity repair is gated once; the column check is
     /// cheap enough to repeat on every open.
     fn migrate(connection: &Connection) -> Result<()> {
-        Self::ensure_debugger_scoped_column(connection)?;
+        Self::ensure_plan_columns(connection)?;
 
         let mut version_select = connection.select::<i64>("PRAGMA user_version")?;
         let version = version_select()?.into_iter().next().unwrap_or(0);
@@ -364,17 +369,21 @@ impl PlanStore {
         Ok(())
     }
 
-    fn ensure_debugger_scoped_column(connection: &Connection) -> Result<()> {
+    fn ensure_plan_columns(connection: &Connection) -> Result<()> {
         let mut select = connection.select::<(i64, String, String, i64, Option<String>, i64)>(
             "PRAGMA table_info(plans)",
         )?;
-        let has_column = select()?
-            .into_iter()
-            .any(|(_, name, _, _, _, _)| name == "debugger_scoped");
-        if !has_column {
-            connection
-                .exec("ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0")?(
-            )?;
+        let columns: HashSet<String> = select()?.into_iter().map(|(_, name, ..)| name).collect();
+        if !columns.contains("debugger_scoped") {
+            connection.exec(
+                "ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0",
+            )?()?;
+        }
+        if !columns.contains("summary") {
+            connection.exec("ALTER TABLE plans ADD COLUMN summary TEXT")?()?;
+        }
+        if !columns.contains("detail") {
+            connection.exec("ALTER TABLE plans ADD COLUMN detail TEXT")?()?;
         }
         Ok(())
     }
@@ -808,9 +817,10 @@ impl PlanStore {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         )>(indoc! {"
             SELECT p.id, p.name, p.repo, p.stage, p.status, p.current_node,
-                   c.category_id, c.source, c.input_hash
+                   c.category_id, c.source, p.summary, p.detail
             FROM plans p
             LEFT JOIN plan_categories c ON c.plan_id = p.id
             ORDER BY p.name
@@ -828,7 +838,8 @@ impl PlanStore {
                     current_node,
                     category_id,
                     category_source,
-                    category_input_hash,
+                    summary,
+                    detail,
                 )| CategorizedPlanRow {
                     id,
                     name,
@@ -838,7 +849,8 @@ impl PlanStore {
                     current_node,
                     category_id,
                     category_source,
-                    category_input_hash,
+                    summary,
+                    detail,
                 },
             )
             .collect())
