@@ -9,17 +9,20 @@
 //! related/blocking/slice chips, and a plan-scoped agent composer + thread
 //! sidebar.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f32::consts::TAU;
+use std::rc::Rc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, Bounds, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems,
-    Render, Size, StatefulInteractiveElement, WeakEntity, Window, actions, point, px,
+    Render, ScrollWheelEvent, Size, StatefulInteractiveElement, WeakEntity, Window, actions, point,
+    px,
 };
 use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
@@ -574,6 +577,34 @@ impl Camera {
             ..self
         }
     }
+
+    /// Frame the wheel coordinates `min..max` inside a pane of `size`, so a
+    /// node and everything it just revealed fill the view instead of the whole
+    /// map.
+    pub fn fit_bounds(min_x: f32, min_y: f32, max_x: f32, max_y: f32, size: Size<Pixels>) -> Self {
+        let width = f32::from(size.width).max(1.0);
+        let height = f32::from(size.height).max(1.0);
+        let content_width = (max_x - min_x + NODE_WIDTH + NODE_GAP).max(NODE_WIDTH);
+        let content_height = (max_y - min_y + NODE_HEIGHT + NODE_GAP).max(NODE_HEIGHT);
+        let zoom = (width * 0.86 / content_width)
+            .min(height * 0.86 / content_height)
+            .clamp(MIN_ZOOM, 1.6);
+        Self {
+            zoom,
+            pan_x: width / 2.0 - (min_x + max_x) / 2.0 * zoom,
+            pan_y: height / 2.0 - (min_y + max_y) / 2.0 * zoom,
+        }
+    }
+
+    /// Recentre on a wheel coordinate at the current zoom, so collapsing a node
+    /// keeps the scale the user chose.
+    pub fn centered_on(self, center_x: f32, center_y: f32, size: Size<Pixels>) -> Self {
+        Self {
+            pan_x: f32::from(size.width) / 2.0 - center_x * self.zoom,
+            pan_y: f32::from(size.height) / 2.0 - center_y * self.zoom,
+            ..self
+        }
+    }
 }
 
 fn short_label(text: &str) -> String {
@@ -798,6 +829,26 @@ pub fn build_visible_wheel(
 
 fn descendant_count(node: &VisibleNode) -> usize {
     1 + node.children.iter().map(descendant_count).sum::<usize>()
+}
+
+/// Every visible key in `key`'s subtree, so the camera can frame a node and
+/// what it just revealed rather than the whole map.
+fn subtree_keys(node: &VisibleNode, key: &str) -> Option<Vec<String>> {
+    if node.key == key {
+        let mut keys = Vec::new();
+        collect_keys(node, &mut keys);
+        return Some(keys);
+    }
+    node.children
+        .iter()
+        .find_map(|child| subtree_keys(child, key))
+}
+
+fn collect_keys(node: &VisibleNode, keys: &mut Vec<String>) {
+    keys.push(node.key.clone());
+    for child in &node.children {
+        collect_keys(child, keys);
+    }
 }
 
 /// Lay the visible tree out on concentric rings. A child's wedge is
@@ -1028,6 +1079,9 @@ pub struct PlanGraph {
     threads: Vec<PlanThread>,
     drag: Option<DragState>,
     suppress_click: bool,
+    /// The pane's bounds as laid out, recorded on paint so zoom anchors on the
+    /// point under the cursor rather than the window.
+    wheel_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl PlanGraph {
@@ -1058,6 +1112,7 @@ impl PlanGraph {
             threads: Vec::new(),
             drag: None,
             suppress_click: false,
+            wheel_bounds: Rc::new(Cell::new(None)),
         };
         graph.refresh();
         graph
@@ -1115,7 +1170,84 @@ impl PlanGraph {
 
     fn fit_camera(&mut self, window: &mut Window) {
         let layout = self.current_layout();
-        self.camera = Camera::fit(layout.extent, window.viewport_size());
+        self.camera = Camera::fit(layout.extent, self.pane_size(window));
+    }
+
+    /// The pane's size, falling back to the window before the first paint has
+    /// recorded the wheel's bounds.
+    fn pane_size(&self, window: &Window) -> Size<Pixels> {
+        self.wheel_bounds
+            .get()
+            .map(|bounds| bounds.size)
+            .unwrap_or_else(|| window.viewport_size())
+    }
+
+    /// Frame a node and its visible descendants, so expanding a branch fills the
+    /// view with that branch instead of zooming the whole map down around it.
+    fn fit_camera_to(&mut self, key: &str, window: &Window) {
+        let wheel = self.visible_wheel();
+        let layout = layout_wheel(&wheel);
+        let pane = self.pane_size(window);
+        let Some(keys) = subtree_keys(&wheel, key) else {
+            self.camera = Camera::fit(layout.extent, pane);
+            return;
+        };
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for node in layout.nodes.iter().filter(|node| keys.contains(&node.key)) {
+            min_x = min_x.min(node.x);
+            min_y = min_y.min(node.y);
+            max_x = max_x.max(node.x);
+            max_y = max_y.max(node.y);
+        }
+        self.camera = if min_x <= max_x {
+            Camera::fit_bounds(min_x, min_y, max_x, max_y, pane)
+        } else {
+            Camera::fit(layout.extent, pane)
+        };
+    }
+
+    /// Keep the scale, re-centre on a node (used when it collapses).
+    fn center_camera_on(&mut self, key: &str, window: &Window) {
+        let layout = self.current_layout();
+        let pane = self.pane_size(window);
+        if let Some(node) = layout.nodes.iter().find(|node| node.key == key) {
+            self.camera = self.camera.centered_on(node.x, node.y, pane);
+        }
+    }
+
+    /// Wheel up zooms in, wheel down zooms out, anchored under the cursor so the
+    /// node you are looking at stays put.
+    fn handle_wheel_zoom(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let steps = (f32::from(delta.y) / 120.0).clamp(-3.0, 3.0);
+        if steps == 0.0 {
+            return;
+        }
+        let target = (self.camera.zoom * 1.15_f32.powf(steps)).clamp(MIN_ZOOM, MAX_ZOOM);
+        if (target - self.camera.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let origin = self
+            .wheel_bounds
+            .get()
+            .map(|bounds| bounds.origin)
+            .unwrap_or_else(|| point(px(0.0), px(0.0)));
+        let anchor_x = f32::from(event.position.x - origin.x);
+        let anchor_y = f32::from(event.position.y - origin.y);
+        let ratio = target / self.camera.zoom;
+        self.camera.pan_x = anchor_x - (anchor_x - self.camera.pan_x) * ratio;
+        self.camera.pan_y = anchor_y - (anchor_y - self.camera.pan_y) * ratio;
+        self.camera.zoom = target;
+        self.needs_fit = false;
+        cx.notify();
     }
 
     fn plan_display(&self, plan_id: &str) -> String {
@@ -1426,24 +1558,37 @@ impl PlanGraph {
     fn single_click(&mut self, node: &WheelNode, window: &mut Window, cx: &mut Context<Self>) {
         match node.kind {
             WheelKind::Root => {
-                if self.expanded.contains("root") {
-                    self.expanded.clear();
-                } else {
+                let expanding = !self.expanded.contains("root");
+                if expanding {
                     self.expanded.insert("root".to_string());
+                } else {
+                    self.expanded.clear();
                 }
-                self.fit_camera(window);
+                if expanding {
+                    self.fit_camera_to("root", window);
+                } else {
+                    self.center_camera_on("root", window);
+                }
             }
             WheelKind::Category
             | WheelKind::Subcategory
             | WheelKind::History
             | WheelKind::SliceGroup => {
                 toggle(&mut self.expanded, &node.key);
-                self.fit_camera(window);
+                if self.expanded.contains(&node.key) {
+                    self.fit_camera_to(&node.key, window);
+                } else {
+                    self.center_camera_on(&node.key, window);
+                }
             }
             WheelKind::Plan => {
                 if node.expandable {
                     toggle(&mut self.expanded, &node.key);
-                    self.fit_camera(window);
+                    if self.expanded.contains(&node.key) {
+                        self.fit_camera_to(&node.key, window);
+                    } else {
+                        self.center_camera_on(&node.key, window);
+                    }
                 } else if let Some(plan_id) = node.plan_id.clone() {
                     self.open_plan(plan_id, window, cx);
                     return;
@@ -1476,7 +1621,7 @@ impl PlanGraph {
     fn render_wheel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let layout = self.current_layout();
         if self.needs_fit {
-            self.camera = Camera::fit(layout.extent, window.viewport_size());
+            self.camera = Camera::fit(layout.extent, self.pane_size(window));
             self.needs_fit = false;
         }
         let zoom = self.camera.zoom;
@@ -1484,6 +1629,7 @@ impl PlanGraph {
         let pan_y = self.camera.pan_y;
         let spoke_color = cx.theme().colors().border;
         let spokes = layout.spokes.clone();
+        let wheel_bounds = self.wheel_bounds.clone();
 
         v_flex()
             .size_full()
@@ -1545,6 +1691,7 @@ impl PlanGraph {
                             cx.notify();
                         }),
                     )
+                    .on_scroll_wheel(cx.listener(Self::handle_wheel_zoom))
                     // `gpui::canvas` has no intrinsic size, so it must be given
                     // one explicitly; otherwise its bounds are 0x0 at the pane's
                     // top-left and the spokes lose the node frame's centre.
@@ -1552,6 +1699,7 @@ impl PlanGraph {
                         gpui::canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
+                                wheel_bounds.set(Some(bounds));
                                 let center_x =
                                     bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
                                 let center_y =
@@ -2353,6 +2501,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fitting_a_subtree_centres_it_in_the_pane() {
+        let pane = size(px(1200.0), px(800.0));
+        // A branch sitting well off-centre: its middle must land at the pane's
+        // middle, and its nodes must stay inside the pane.
+        let camera = Camera::fit_bounds(300.0, -100.0, 500.0, 100.0, pane);
+        let screen_x = 400.0 * camera.zoom + camera.pan_x;
+        let screen_y = 0.0 * camera.zoom + camera.pan_y;
+        assert!((screen_x - 600.0).abs() < 0.5, "centred x: {screen_x}");
+        assert!((screen_y - 400.0).abs() < 0.5, "centred y: {screen_y}");
+        let half_width = (NODE_WIDTH + NODE_GAP) / 2.0 * camera.zoom;
+        assert!(screen_x - half_width > 0.0);
+        assert!(screen_x + half_width < 1200.0);
+    }
+
+    #[test]
+    fn recentring_keeps_the_zoom() {
+        let pane = size(px(1200.0), px(800.0));
+        let camera =
+            Camera::fit_bounds(0.0, 0.0, 100.0, 100.0, pane).centered_on(600.0, 300.0, pane);
+        assert!((600.0 * camera.zoom + camera.pan_x - 600.0).abs() < 0.5);
+        assert!((300.0 * camera.zoom + camera.pan_y - 400.0).abs() < 0.5);
+        assert!(camera.zoom > 0.0);
+    }
+
+    #[test]
+    fn subtree_keys_collects_only_the_clicked_branch() {
+        let plans = vec![
+            plan("p1", "Plan one", Some("feature/agent-core"), None),
+            plan("p2", "Plan two", Some("bug/threads"), None),
+        ];
+        let root = build_visible_wheel(
+            &taxonomy(),
+            &plans,
+            &[],
+            &HashMap::new(),
+            &expanded(&[
+                "root",
+                "cat:feature",
+                "cat:bug",
+                "sub:feature/agent-core",
+                "sub:bug/threads",
+            ]),
+            false,
+        );
+        let feature = subtree_keys(&root, "cat:feature").expect("feature subtree");
+        assert!(feature.contains(&"cat:feature".to_string()));
+        assert!(feature.contains(&"sub:feature/agent-core".to_string()));
+        assert!(feature.contains(&"plan:p1".to_string()));
+        assert!(!feature.contains(&"cat:bug".to_string()));
+        assert!(!feature.contains(&"plan:p2".to_string()));
+        assert!(subtree_keys(&root, "cat:missing").is_none());
     }
 
     #[test]
