@@ -16,7 +16,8 @@ use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, Render, Rems, Size, WeakEntity, Window, actions, point, px, size,
+    KeyDownEvent, Render, Rems, Size, StatefulInteractiveElement, WeakEntity, Window, actions,
+    point, px,
 };
 use plan_store::{
     CategoryRow, CategorizedPlanRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
@@ -1254,8 +1255,8 @@ impl PlanGraph {
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
         } else {
-            let workspace = cx.entity().downgrade();
-            let item = cx.new(|cx| PlanGraph::new(workspace, window, cx));
+            let workspace_handle = cx.entity().downgrade();
+            let item = cx.new(|cx| PlanGraph::new(workspace_handle, window, cx));
             workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
         }
     }
@@ -1454,7 +1455,6 @@ impl PlanGraph {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = node.key.clone();
-        let plan_id = node.plan_id.clone();
         let kind = node.kind;
         let expandable = node.expandable;
         let state = node.state;
@@ -1613,6 +1613,7 @@ impl PlanGraph {
                         } else {
                             Color::Success
                         },
+                        cx,
                     )),
             )
             .child(
@@ -1764,13 +1765,13 @@ fn meta(label: &str, value: &str) -> AnyElement {
         .into_any_element()
 }
 
-fn badge(label: &str, color: Color) -> AnyElement {
+fn badge(label: &str, color: Color, cx: &App) -> AnyElement {
     div()
         .px_2()
         .py_1()
         .rounded_full()
         .border_1()
-        .border_color(color)
+        .border_color(cx.theme().colors().border_variant)
         .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
         .into_any_element()
 }
@@ -1857,6 +1858,7 @@ pub fn init(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::size;
     use plan_store::{GraphSnapshot, RoadmapPlanRow};
 
     fn category(id: &str, parent: Option<&str>, name: &str, rank: i64) -> CategoryRow {

@@ -679,7 +679,7 @@ fn preceding_lines(text: &str, offset: usize, count: usize) -> Vec<String> {
     lines
 }
 
-pub(crate) struct ThreadsDatabase {
+pub struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
     /// In production, saves take real time (serialization, zstd, disk I/O) while
