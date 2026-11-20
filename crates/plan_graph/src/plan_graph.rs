@@ -1010,10 +1010,6 @@ impl PlanGraph {
         self.camera = Camera::fit(layout.extent, window.viewport_size());
     }
 
-    fn plan_has_slices(&self, plan_id: &str) -> bool {
-        self.parents.iter().any(|parent| parent.parent_id == plan_id)
-    }
-
     fn plan_display(&self, plan_id: &str) -> String {
         self.plans
             .iter()
@@ -1564,7 +1560,6 @@ impl PlanGraph {
             return div().into_any_element();
         };
         let can_go_back = self.page_stack.len() > 1;
-        let back_id = page.id.clone();
         let title = short_label(&page.name);
         let summary = page
             .detail
