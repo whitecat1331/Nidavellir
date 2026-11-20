@@ -338,7 +338,7 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
         .map(|node| {
             let failed = failed.contains(node.as_str());
             DoneEntry {
-                node: node.clone(),
+                node,
                 artifact: String::new(),
                 at: String::new(),
                 failed,
