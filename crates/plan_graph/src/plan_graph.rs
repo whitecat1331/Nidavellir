@@ -1,13 +1,13 @@
-//! Interactive radial plan wheel (1.29 re-scope).
+//! Interactive plan tree and plan page (1.29 re-scope).
 //!
-//! One main-editor-area `Item` renders the plan taxonomy as a wheel-and-spoke:
-//! the `Plans` root at the centre, the top-level categories on the first ring,
-//! subcategories outward, and plan/slice leaves at the edge. Progressive
-//! disclosure keeps it navigable: single-click expands a node's children,
-//! double-click opens a plan's page, and the camera auto-fits as the frontier
-//! grows. The page carries the plan's metadata, summary, read-only decision,
-//! related/blocking/slice chips, and a plan-scoped agent composer + thread
-//! sidebar.
+//! One main-editor-area `Item` renders the plan taxonomy as a collapsible
+//! master–detail tree: `Plans` at the root, categories, subcategories, and
+//! plan/slice leaves on the left, the plan page on the right. Progressive
+//! disclosure keeps it navigable: a click expands a branch's children, a click
+//! on a plan opens its page. The page carries the plan's metadata, summary, the
+//! read-only dev-flow decision (from `plan_flow`, the same coordinator the agent
+//! tool uses), related/blocking/slice chips, and a plan-scoped agent composer +
+//! thread sidebar.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -23,30 +23,12 @@ use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
     PlanStore,
 };
+use plan_flow::{Attempt, DoneEntry, GraphState, is_human_gate, next_ready, ROUTE, STALL_SECONDS};
 use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
 use workspace::item::Item;
 
 actions!(plan_graph, [DeployPlanGraph]);
-
-/// The dev-flow route — the same readiness table the `graph_tool` coordinator
-/// and the fleet panel use.
-const ROUTE: [&str; 11] = [
-    "plan",
-    "promote",
-    "claim",
-    "fork",
-    "implement",
-    "verify",
-    "compile",
-    "accept",
-    "merge",
-    "release",
-    "complete",
-];
-
-/// A plan with no activity for this long is visibly stalled, not "moving".
-const STALL_SECONDS: i64 = 15 * 60;
 
 /// The debugger loop's `stage→…→fix` sub-graph (1.29 D8).
 const DEBUGGER_SUB_GRAPH: [&str; 6] = ["stage", "test", "verify", "restart", "run", "fix"];
@@ -114,38 +96,10 @@ pub fn legend() -> Vec<(NodeState, &'static str, &'static str)> {
         .collect()
 }
 
-fn prerequisites(node: &str) -> &'static [&'static str] {
-    match node {
-        "plan" => &[],
-        "promote" => &["plan"],
-        "claim" => &["promote"],
-        "fork" => &["claim"],
-        "implement" => &["fork"],
-        "verify" => &["implement"],
-        "compile" => &["verify"],
-        "accept" => &["compile"],
-        "merge" => &["accept"],
-        "release" => &["merge"],
-        "complete" => &["release"],
-        _ => &[],
-    }
-}
-
-fn is_human_gate(node: &str) -> bool {
-    matches!(node, "merge" | "release" | "complete")
-}
-
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
-}
-
-fn next_ready(done: &HashSet<&str>) -> Option<&'static str> {
-    ROUTE
-        .iter()
-        .copied()
-        .find(|node| !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p)))
 }
 
 /// Derive a plan's node state from its graph-state row + done nodes.
@@ -367,51 +321,74 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
             reason: format!("blocked — {reason}"),
         };
     }
-    if let Some(active) = &plan.active_node {
-        return Decision {
-            kind: DecisionKind::Active,
-            node: active.clone(),
-            reason: "node is active".to_string(),
-        };
-    }
 
-    let done = store.done_nodes(plan_id).unwrap_or_default();
+    // The store's row is a projection of `progress.json`; rebuild just enough of
+    // the graph state for `plan_flow::coordinate` to decide with the same engine
+    // the agent tool runs. The page never mutates the plan (D2).
     let evidence = store.evidence_for(plan_id).unwrap_or_default();
-    let done_set: HashSet<&str> = done.iter().map(|node| node.as_str()).collect();
     let failed: HashSet<&str> = evidence
         .iter()
         .filter(|row| row.gate_exit_code == Some(1))
         .map(|row| row.node.as_str())
         .collect();
+    let done = store
+        .done_nodes(plan_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|node| {
+            let failed = failed.contains(node.as_str());
+            DoneEntry {
+                node: node.clone(),
+                artifact: String::new(),
+                at: String::new(),
+                failed,
+                attempts: vec![Attempt {
+                    at: String::new(),
+                    artifact: String::new(),
+                    failed,
+                    failure: None,
+                    cost: None,
+                    warnings: Vec::new(),
+                }],
+                cost: None,
+            }
+        })
+        .collect();
+    let active = plan.active_node.map(|node| plan_flow::ActiveNode {
+        node,
+        executor: plan.holder.unwrap_or_default(),
+        started_at: plan.heartbeat.clone().unwrap_or_default(),
+        last_activity_at: plan.heartbeat.unwrap_or_default(),
+    });
+    let mut state = GraphState {
+        plan: plan.id,
+        repo: plan.repo.unwrap_or_default(),
+        scope: None,
+        current: plan.current_node,
+        done,
+        next: Vec::new(),
+        blocker: None,
+        budget: None,
+        active,
+        back_edges: Vec::new(),
+        warnings: Vec::new(),
+        authorized: None,
+    };
 
-    if let Some(retry) = ROUTE
-        .iter()
-        .copied()
-        .find(|node| done_set.contains(node) && failed.contains(node))
-    {
-        return Decision {
-            kind: DecisionKind::Retry,
-            node: retry.to_string(),
-            reason: "failed — retry".to_string(),
-        };
-    }
-
-    match next_ready(&done_set) {
-        Some(node) if is_human_gate(node) => Decision {
-            kind: DecisionKind::Blocked,
-            node: node.to_string(),
-            reason: "human gate — pause and ask".to_string(),
-        },
-        Some(node) => Decision {
-            kind: DecisionKind::Next,
-            node: node.to_string(),
-            reason: "next step".to_string(),
-        },
-        None => Decision {
-            kind: DecisionKind::Paused,
-            node: "—".to_string(),
-            reason: "no ready node".to_string(),
-        },
+    let retrying = plan_flow::retry_candidate(&state);
+    let decision = plan_flow::coordinate(&mut state, false, Utc::now());
+    let node = decision.node.unwrap_or_else(|| "—".to_string());
+    let kind = match decision.action.as_str() {
+        "continue" => DecisionKind::Active,
+        "dispatch" if retrying.as_deref() == Some(node.as_str()) => DecisionKind::Retry,
+        "dispatch" => DecisionKind::Next,
+        "pause" if decision.predicate.as_deref() == Some("human_gate") => DecisionKind::Blocked,
+        _ => DecisionKind::Paused,
+    };
+    Decision {
+        kind,
+        node,
+        reason: decision.reason,
     }
 }
 

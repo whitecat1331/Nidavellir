@@ -18,6 +18,7 @@ use gpui::{
     actions, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render,
     Task, WeakEntity, Window,
 };
+use plan_flow::{is_human_gate, next_ready, STALL_SECONDS};
 use plan_store::{ClaimRow, FleetPlanRow, PlanStore};
 use ui::{Button, ButtonSize, IconName, Label, LabelSize, prelude::*};
 use workspace::Workspace;
@@ -26,16 +27,6 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 actions!(fleet, [ToggleFleetPanel]);
 
 const FLEET_PANEL_KEY: &str = "FleetPanel";
-
-/// The dev-flow route and its human gates — the same readiness table the 1.23d
-/// coordinator uses, reduced to what a read-only view needs.
-const ROUTE: [&str; 11] = [
-    "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept", "merge",
-    "release", "complete",
-];
-
-/// A plan with no activity for this long is visibly stalled, not "moving".
-const STALL_SECONDS: i64 = 15 * 60;
 
 /// A claim whose heartbeat is older than this is flagged stale (mirrors
 /// `ledger.WIP_STALE_HOURS` in the harness).
@@ -84,37 +75,10 @@ struct AgentRow {
 
 // ---- derivation ----
 
-fn prerequisites(node: &str) -> &'static [&'static str] {
-    match node {
-        "plan" => &[],
-        "promote" => &["plan"],
-        "claim" => &["promote"],
-        "fork" => &["claim"],
-        "implement" => &["fork"],
-        "verify" => &["implement"],
-        "compile" => &["verify"],
-        "accept" => &["compile"],
-        "merge" => &["accept"],
-        "release" => &["merge"],
-        "complete" => &["release"],
-        _ => &[],
-    }
-}
-
-fn is_human_gate(node: &str) -> bool {
-    matches!(node, "merge" | "release" | "complete")
-}
-
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
-}
-
-fn next_ready(done: &HashSet<&str>) -> Option<&'static str> {
-    ROUTE.iter().copied().find(|node| {
-        !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p))
-    })
 }
 
 /// (state label, blocked_on_you, breaker). The breaker maps to the Ralph
