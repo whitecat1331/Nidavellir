@@ -961,7 +961,8 @@ impl ThreadsDatabase {
             created_at,
         ))?;
 
-        let mut update_metadata = connection.exec_bound::<(Option<String>, Option<String>, Arc<str>)>(indoc! {"
+        let mut update_metadata = connection
+            .exec_bound::<(Option<String>, Option<String>, Arc<str>)>(indoc! {"
             UPDATE threads SET dedup_key = ?1, plan_path = ?2 WHERE id = ?3
         "})?;
         update_metadata((dedup_key, plan_path, id_for_dedup))?;
