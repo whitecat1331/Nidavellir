@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, Rems, Render, Size, StatefulInteractiveElement, WeakEntity, Window, actions,
-    point, px,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    Rems, Size, StatefulInteractiveElement, WeakEntity, Window, actions, point, px,
 };
 use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
@@ -766,9 +766,14 @@ pub fn build_visible_wheel(
     }
 
     let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), WheelKind::Root);
+    let root_expanded = expanded.contains("root");
     root.expandable = true;
-    root.expanded = true;
-    root.children = root_children;
+    root.expanded = root_expanded;
+    root.children = if root_expanded {
+        root_children
+    } else {
+        Vec::new()
+    };
     root
 }
 
@@ -931,6 +936,12 @@ struct PlanThread {
     updated_at: DateTime<Utc>,
 }
 
+struct DragState {
+    start: Point<Pixels>,
+    start_pan: (f32, f32),
+    moved: bool,
+}
+
 /// The wheel `Item` (main editor area, not a bottom `Panel`).
 pub struct PlanGraph {
     focus_handle: FocusHandle,
@@ -951,6 +962,8 @@ pub struct PlanGraph {
     page: Option<PageData>,
     composer: gpui::Entity<Editor>,
     threads: Vec<PlanThread>,
+    drag: Option<DragState>,
+    suppress_click: bool,
 }
 
 impl PlanGraph {
@@ -979,6 +992,8 @@ impl PlanGraph {
             page: None,
             composer,
             threads: Vec::new(),
+            drag: None,
+            suppress_click: false,
         };
         graph.refresh();
         graph
@@ -1347,7 +1362,11 @@ impl PlanGraph {
     fn single_click(&mut self, node: &WheelNode, window: &mut Window, cx: &mut Context<Self>) {
         match node.kind {
             WheelKind::Root => {
-                self.expanded.clear();
+                if self.expanded.contains("root") {
+                    self.expanded.clear();
+                } else {
+                    self.expanded.insert("root".to_string());
+                }
                 self.fit_camera(window);
             }
             WheelKind::Category
@@ -1399,7 +1418,6 @@ impl PlanGraph {
         let zoom = self.camera.zoom;
         let pan_x = self.camera.pan_x;
         let pan_y = self.camera.pan_y;
-        let canvas_extent = (layout.extent * zoom).max(1.0);
         let spoke_color = cx.theme().colors().border;
         let spokes = layout.spokes.clone();
 
@@ -1415,58 +1433,94 @@ impl PlanGraph {
             )
             .child(self.render_toolbar(cx))
             .child(
-                div().relative().flex_1().overflow_hidden().child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .relative()
-                                .w(px(0.0))
-                                .h(px(0.0))
-                                // Spokes are painted on a canvas centred on the
-                                // wheel origin; the nodes are absolutely placed
-                                // around the same origin.
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(pan_x - canvas_extent / 2.0))
-                                        .top(px(pan_y - canvas_extent / 2.0))
-                                        .w(px(canvas_extent))
-                                        .h(px(canvas_extent))
-                                        .child(gpui::canvas(
-                                            |_, _, _| {},
-                                            move |bounds, _, window, _| {
-                                                let center_x =
-                                                    bounds.origin.x + bounds.size.width / 2.0;
-                                                let center_y =
-                                                    bounds.origin.y + bounds.size.height / 2.0;
-                                                for spoke in &spokes {
-                                                    let mut builder =
-                                                        gpui::PathBuilder::stroke(px(1.0));
-                                                    builder.move_to(point(
-                                                        center_x + px(spoke.x1 * zoom),
-                                                        center_y + px(spoke.y1 * zoom),
-                                                    ));
-                                                    builder.line_to(point(
-                                                        center_x + px(spoke.x2 * zoom),
-                                                        center_y + px(spoke.y2 * zoom),
-                                                    ));
-                                                    if let Ok(path) = builder.build() {
-                                                        window.paint_path(path, spoke_color);
-                                                    }
-                                                }
-                                            },
-                                        )),
-                                )
-                                .children(layout.nodes.iter().map(|node| {
-                                    self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
-                                })),
-                        ),
-                ),
+                div()
+                    .relative()
+                    .flex_1()
+                    .overflow_hidden()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this: &mut PlanGraph, event: &MouseDownEvent, _, cx| {
+                            this.suppress_click = false;
+                            this.drag = Some(DragState {
+                                start: event.position,
+                                start_pan: (this.camera.pan_x, this.camera.pan_y),
+                                moved: false,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(
+                        |this: &mut PlanGraph, event: &MouseMoveEvent, _, cx| {
+                            if this.drag.is_none() {
+                                return;
+                            }
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                this.drag = None;
+                                return;
+                            }
+                            let Some(drag) = this.drag.as_mut() else {
+                                return;
+                            };
+                            let dx = f32::from(event.position.x - drag.start.x);
+                            let dy = f32::from(event.position.y - drag.start.y);
+                            if dx.abs() + dy.abs() > 3.0 {
+                                drag.moved = true;
+                            }
+                            let (start_x, start_y) = drag.start_pan;
+                            let moved = drag.moved;
+                            this.camera.pan_x = start_x + dx;
+                            this.camera.pan_y = start_y + dy;
+                            this.suppress_click = moved;
+                            cx.notify();
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this: &mut PlanGraph, _: &MouseUpEvent, _, cx| {
+                            this.drag = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(gpui::canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let center_x =
+                                    bounds.origin.x + bounds.size.width / 2.0 + px(pan_x);
+                                let center_y =
+                                    bounds.origin.y + bounds.size.height / 2.0 + px(pan_y);
+                                for spoke in &spokes {
+                                    let mut builder = gpui::PathBuilder::stroke(px(1.0));
+                                    builder.move_to(point(
+                                        center_x + px(spoke.x1 * zoom),
+                                        center_y + px(spoke.y1 * zoom),
+                                    ));
+                                    builder.line_to(point(
+                                        center_x + px(spoke.x2 * zoom),
+                                        center_y + px(spoke.y2 * zoom),
+                                    ));
+                                    if let Ok(path) = builder.build() {
+                                        window.paint_path(path, spoke_color);
+                                    }
+                                }
+                            },
+                        )),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div().relative().w(px(0.0)).h(px(0.0)).children(
+                                    layout.nodes.iter().map(|node| {
+                                        self.render_wheel_node(node, zoom, pan_x, pan_y, cx)
+                                    }),
+                                ),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -1533,6 +1587,10 @@ impl PlanGraph {
             )
             .on_click(cx.listener(
                 move |this: &mut PlanGraph, event: &ClickEvent, window, cx| {
+                    if this.suppress_click {
+                        this.suppress_click = false;
+                        return;
+                    }
                     if event.click_count() >= 2 {
                         if let Some(plan_id) = click_node.plan_id.clone() {
                             this.open_plan(plan_id, window, cx);
@@ -1960,12 +2018,12 @@ mod tests {
     }
 
     #[test]
-    fn wheel_starts_with_categories_and_no_children() {
+    fn wheel_starts_with_only_the_root() {
         let plans = vec![
             plan("p1", "Plan one", Some("feature/agent-core"), None),
             plan("p2", "Plan two", Some("bug/threads"), None),
         ];
-        let root = build_visible_wheel(
+        let collapsed = build_visible_wheel(
             &taxonomy(),
             &plans,
             &[],
@@ -1973,11 +2031,22 @@ mod tests {
             &expanded(&[]),
             false,
         );
-        assert_eq!(root.key, "root");
-        let labels: Vec<&str> = root.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(collapsed.key, "root");
+        assert!(collapsed.children.is_empty(), "only Plans is visible at first");
+        assert!(collapsed.expandable);
+
+        let open = build_visible_wheel(
+            &taxonomy(),
+            &plans,
+            &[],
+            &HashMap::new(),
+            &expanded(&["root"]),
+            false,
+        );
+        let labels: Vec<&str> = open.children.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["Feature · 1", "Bug · 1"]);
-        assert!(root.children.iter().all(|c| c.children.is_empty()));
-        assert!(root.children.iter().all(|c| c.expandable));
+        assert!(open.children.iter().all(|c| c.children.is_empty()));
+        assert!(open.children.iter().all(|c| c.expandable));
     }
 
     #[test]
@@ -1991,7 +2060,7 @@ mod tests {
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["cat:feature"]),
+            &expanded(&["root", "cat:feature"]),
             false,
         );
         let feature = find(&root, "cat:feature").expect("feature category");
@@ -2008,7 +2077,7 @@ mod tests {
             &[],
             &[],
             &HashMap::new(),
-            &expanded(&["cat:feature"]),
+            &expanded(&["root", "cat:feature"]),
             false,
         );
         assert_eq!(find(&root_open, "cat:feature").unwrap().children.len(), 1);
@@ -2043,7 +2112,7 @@ mod tests {
             &plans,
             &parents,
             &HashMap::new(),
-            &expanded(&["cat:feature", "sub:feature/agent-core"]),
+            &expanded(&["root", "cat:feature", "sub:feature/agent-core"]),
             false,
         );
         let parent = find(&root, "plan:parent").expect("parent plan");
@@ -2055,7 +2124,12 @@ mod tests {
             &plans,
             &parents,
             &HashMap::new(),
-            &expanded(&["cat:feature", "sub:feature/agent-core", "plan:parent"]),
+            &expanded(&[
+                "root",
+                "cat:feature",
+                "sub:feature/agent-core",
+                "plan:parent",
+            ]),
             false,
         );
         let parent = find(&root, "plan:parent").expect("parent plan");
@@ -2075,7 +2149,7 @@ mod tests {
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&[]),
+            &expanded(&["root"]),
             false,
         );
         assert!(find(&hidden, "history").is_none());
@@ -2085,7 +2159,7 @@ mod tests {
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["history"]),
+            &expanded(&["root", "history"]),
             true,
         );
         let history = find(&shown, "history").expect("history node");
@@ -2105,6 +2179,7 @@ mod tests {
             &[],
             &HashMap::new(),
             &expanded(&[
+                "root",
                 "cat:feature",
                 "cat:bug",
                 "sub:feature/agent-core",
