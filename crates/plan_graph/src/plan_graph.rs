@@ -16,8 +16,8 @@ use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable, Render,
-    WeakEntity, Window, actions, px,
+    Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, Render, SharedString, WeakEntity, Window, actions, px,
 };
 use plan_flow::{Attempt, DoneEntry, GraphState, ROUTE, STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{
@@ -29,6 +29,14 @@ use workspace::Workspace;
 use workspace::item::Item;
 
 actions!(plan_graph, [DeployPlanGraph]);
+
+/// Open a specific plan in the plan graph: reveals it in the tree and opens its
+/// page. Dispatched by thread-to-plan navigation (D21) and plan-page chips.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = plan_graph)]
+pub struct OpenPlan {
+    pub plan_id: SharedString,
+}
 
 /// The debugger loop's `stage→…→fix` sub-graph (1.29 D8).
 const DEBUGGER_SUB_GRAPH: [&str; 6] = ["stage", "test", "verify", "restart", "run", "fix"];
@@ -684,6 +692,46 @@ pub fn plan_id_from_path(path: &str) -> String {
     stem.to_ascii_lowercase().replace('_', "-")
 }
 
+/// Reveal a plan in the tree by expanding the `root` to category to subcategory
+/// path that leads to it (or, for a slice, its parent plan's `slices` group).
+fn expand_path_to_plan(
+    expanded: &mut HashSet<String>,
+    categories: &[CategoryRow],
+    plans: &[CategorizedPlanRow],
+    parents: &[PlanParentRow],
+    plan_id: &str,
+) {
+    expanded.insert("root".to_string());
+    let Some(plan) = plans.iter().find(|plan| plan.id == plan_id) else {
+        return;
+    };
+
+    let mut category_id = plan.category_id.clone();
+    if category_id.is_none() {
+        if let Some(parent) = parents.iter().find(|parent| parent.plan_id == plan_id) {
+            expanded.insert(format!("plan:{}", parent.parent_id));
+            expanded.insert(format!("slices:{}", parent.parent_id));
+            category_id = plans
+                .iter()
+                .find(|plan| plan.id == parent.parent_id)
+                .and_then(|plan| plan.category_id.clone());
+        }
+    }
+
+    while let Some(id) = category_id {
+        let Some(category) = categories.iter().find(|category| category.id == id) else {
+            break;
+        };
+        let key = if category.parent_id.is_none() {
+            format!("cat:{}", category.id)
+        } else {
+            format!("sub:{}", category.id)
+        };
+        expanded.insert(key);
+        category_id = category.parent_id.clone();
+    }
+}
+
 fn toggle(expanded: &mut HashSet<String>, key: &str) {
     if !expanded.remove(key) {
         expanded.insert(key.to_string());
@@ -822,11 +870,22 @@ impl PlanGraph {
     }
 
     fn open_plan(&mut self, plan_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.page_stack.push(plan_id.clone());
-        self.load_page(&plan_id);
-        self.threads.clear();
+        self.navigate_to_plan(&plan_id, cx);
         self.composer
             .update(cx, |editor, cx| editor.clear(window, cx));
+    }
+
+    fn navigate_to_plan(&mut self, plan_id: &str, cx: &mut Context<Self>) {
+        expand_path_to_plan(
+            &mut self.expanded,
+            &self.categories,
+            &self.plans,
+            &self.parents,
+            plan_id,
+        );
+        self.page_stack.push(plan_id.to_string());
+        self.load_page(plan_id);
+        self.threads.clear();
         self.load_threads(cx);
         cx.notify();
     }
@@ -1046,14 +1105,16 @@ impl PlanGraph {
         cx.notify();
     }
 
-    fn deploy(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    fn deploy(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<Self> {
         let existing = workspace.items_of_type::<PlanGraph>(cx).next();
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
+            existing
         } else {
             let workspace_handle = cx.entity().downgrade();
             let item = cx.new(|cx| PlanGraph::new(workspace_handle, window, cx));
-            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
         }
     }
 
@@ -1631,6 +1692,15 @@ pub fn init(cx: &mut App) {
                 PlanGraph::deploy(workspace, window, cx);
             },
         );
+        workspace.register_action(
+            |workspace: &mut Workspace, action: &OpenPlan, window, cx| {
+                let item = PlanGraph::deploy(workspace, window, cx);
+                let plan_id = action.plan_id.clone();
+                item.update(cx, |graph, cx| {
+                    graph.navigate_to_plan(plan_id.as_ref(), cx);
+                });
+            },
+        );
     })
     .detach();
 }
@@ -2080,5 +2150,34 @@ mod tests {
         let plans = store.categorized_plans().unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].id, "PLAN_A");
+    }
+
+    #[test]
+    fn expanding_a_path_reveals_the_plan_under_its_categories() {
+        let plans = vec![plan("p1", "Plan one", Some("feature/agent-core"), None)];
+        let mut expanded = HashSet::new();
+        expand_path_to_plan(&mut expanded, &taxonomy(), &plans, &[], "p1");
+        assert!(expanded.contains("root"));
+        assert!(expanded.contains("cat:feature"));
+        assert!(expanded.contains("sub:feature/agent-core"));
+    }
+
+    #[test]
+    fn expanding_a_slice_reveals_its_parent_slices_group() {
+        let plans = vec![
+            plan("parent", "Parent", Some("feature/agent-core"), None),
+            plan("slice", "Slice", None, None),
+        ];
+        let parents = vec![PlanParentRow {
+            plan_id: "slice".to_string(),
+            parent_id: "parent".to_string(),
+        }];
+        let mut expanded = HashSet::new();
+        expand_path_to_plan(&mut expanded, &taxonomy(), &plans, &parents, "slice");
+        assert!(expanded.contains("root"));
+        assert!(expanded.contains("cat:feature"));
+        assert!(expanded.contains("sub:feature/agent-core"));
+        assert!(expanded.contains("plan:parent"));
+        assert!(expanded.contains("slices:parent"));
     }
 }
