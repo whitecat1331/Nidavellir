@@ -2723,6 +2723,7 @@ fn run_multi_workspace_sidebar_visual_tests(
                     store.save_thread(
                         acp::SessionId::new(Arc::from(session_id)),
                         agent::DbThread {
+                            driver: false,
                             title: title.to_string().into(),
                             messages: Vec::new(),
                             updated_at,

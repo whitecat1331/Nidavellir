@@ -14199,6 +14199,7 @@ mod tests {
         let source_session_id = acp::SessionId::new("source-thread-session");
         let source_title: SharedString = "Source Thread Title".into();
         let db_thread = agent::DbThread {
+            driver: false,
             title: source_title.clone(),
             messages: Vec::new(),
             updated_at: Utc::now(),

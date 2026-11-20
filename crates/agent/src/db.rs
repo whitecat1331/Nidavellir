@@ -41,6 +41,10 @@ pub struct DbThreadMetadata {
     /// The dev-flow plan this thread is executing (`graph_tool`'s `plan_path`).
     /// Lets the plan page scope its thread sidebar to one plan.
     pub plan_path: Option<String>,
+    /// Whether this thread is the plan's persistent driver thread (D15). A plan
+    /// has at most one driver; side threads share `plan_path` but are not the
+    /// driver.
+    pub driver: bool,
 }
 
 impl From<&DbThreadMetadata> for acp_thread::AgentSessionInfo {
@@ -82,6 +86,9 @@ pub struct DbThread {
     /// plan-state banner instead of losing the thread's role.
     #[serde(default)]
     pub plan_path: Option<String>,
+    /// Whether this thread is the plan's persistent driver thread (D15).
+    #[serde(default)]
+    pub driver: bool,
     #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
     #[serde(default)]
@@ -167,6 +174,7 @@ impl SharedThread {
 
     pub fn to_db_thread(self) -> DbThread {
         DbThread {
+            driver: false,
             title: format!("🔗 {}", self.title).into(),
             messages: self.messages,
             updated_at: self.updated_at,
@@ -809,6 +817,13 @@ impl ThreadsDatabase {
             s().ok();
         }
 
+        if let Ok(mut s) = connection.exec(indoc! {"
+            ALTER TABLE threads ADD COLUMN driver INTEGER NOT NULL DEFAULT 0
+        "})
+        {
+            s().ok();
+        }
+
         // `list_threads` orders by `updated_at DESC, created_at DESC`; without an
         // index SQLite full-scans the blob-heavy `threads` table and temp-sorts it
         // on every sidebar refresh / thread activation (ISSUE-0063).
@@ -893,6 +908,7 @@ impl ThreadsDatabase {
 
         let title = thread.title.to_string();
         let plan_path = thread.plan_path.clone();
+        let driver = thread.driver;
         let updated_at = thread.updated_at.to_rfc3339();
         let parent_id = thread
             .subagent_context
@@ -962,10 +978,10 @@ impl ThreadsDatabase {
         ))?;
 
         let mut update_metadata = connection
-            .exec_bound::<(Option<String>, Option<String>, Arc<str>)>(indoc! {"
-            UPDATE threads SET dedup_key = ?1, plan_path = ?2 WHERE id = ?3
+            .exec_bound::<(Option<String>, Option<String>, i64, Arc<str>)>(indoc! {"
+            UPDATE threads SET dedup_key = ?1, plan_path = ?2, driver = ?3 WHERE id = ?4
         "})?;
-        update_metadata((dedup_key, plan_path, id_for_dedup))?;
+        update_metadata((dedup_key, plan_path, i64::from(driver), id_for_dedup))?;
 
         Ok(json_data.len())
     }
@@ -977,14 +993,14 @@ impl ThreadsDatabase {
             let connection = connection.lock();
 
             let mut select = connection
-                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<String>)>(indoc! {"
-                SELECT id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at, plan_path FROM threads WHERE merged_into IS NULL ORDER BY updated_at DESC, created_at DESC
+                .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<String>, i64)>(indoc! {"
+                SELECT id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at, plan_path, driver FROM threads WHERE merged_into IS NULL ORDER BY updated_at DESC, created_at DESC
             "})?;
 
             let rows = select(())?;
             let mut threads = Vec::new();
 
-            for (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at, plan_path) in rows {
+            for (id, parent_id, folder_paths, folder_paths_order, workspace_id, summary, updated_at, created_at, plan_path, driver) in rows {
                 let folder_paths = folder_paths
                     .map(|paths| {
                         PathList::deserialize(&util::path_list::SerializedPathList {
@@ -1008,6 +1024,7 @@ impl ThreadsDatabase {
                     folder_paths,
                     workspace_id,
                     plan_path,
+                    driver: driver != 0,
                 });
             }
 
@@ -1904,6 +1921,7 @@ mod tests {
 
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
+            driver: false,
             title: title.to_string().into(),
             messages: Vec::new(),
             updated_at,
