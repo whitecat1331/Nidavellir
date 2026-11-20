@@ -2083,7 +2083,7 @@ mod tests {
             &[],
             &[],
             &HashMap::new(),
-            &expanded(&[]),
+            &expanded(&["root"]),
             false,
         );
         assert!(
