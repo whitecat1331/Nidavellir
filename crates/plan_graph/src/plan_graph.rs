@@ -10,6 +10,7 @@
 //! sidebar.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
@@ -1223,6 +1224,15 @@ impl PlanGraph {
         });
         self.composer.update(cx, |editor, cx| editor.clear(window, cx));
         self.load_threads(cx);
+        // The new thread is persisted asynchronously; reload once the save has
+        // landed so it appears in this plan's sidebar without reopening the page.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(900)).await;
+            if let Err(error) = this.update(cx, |this, cx| this.load_threads(cx)) {
+                log::debug!("[GRAPH] plan page closed before thread refresh: {error:#}");
+            }
+        })
+        .detach();
         cx.notify();
     }
 
