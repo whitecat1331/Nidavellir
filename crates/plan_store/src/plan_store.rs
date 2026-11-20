@@ -95,6 +95,117 @@ pub struct EvidenceRow {
     pub negative_control: Option<i64>,
 }
 
+/// A node in the plan taxonomy (`Feature / Bug / QOL / Process` + subcategories).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRow {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub rank: i64,
+}
+
+/// A plan's category assignment. `source` records whether a human override or
+/// the batch categorizer produced it; `input_hash` lets an incremental re-run
+/// tell whether the plan changed since the assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCategoryRow {
+    pub plan_id: String,
+    pub category_id: String,
+    pub source: String,
+    pub input_hash: String,
+}
+
+/// A slice's parent link (`PLAN_OF_ACTION-*` → the plan it was sliced from).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanParentRow {
+    pub plan_id: String,
+    pub parent_id: String,
+}
+
+/// A plan joined with its category assignment and the state the wheel groups by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategorizedPlanRow {
+    pub id: String,
+    pub name: String,
+    pub repo: Option<String>,
+    pub stage: Option<String>,
+    pub status: Option<String>,
+    pub current_node: Option<String>,
+    pub category_id: Option<String>,
+    pub category_source: Option<String>,
+    pub category_input_hash: Option<String>,
+}
+
+impl CategorizedPlanRow {
+    pub fn lifecycle(&self) -> Lifecycle {
+        classify_lifecycle(
+            self.stage.as_deref(),
+            self.status.as_deref(),
+            self.current_node.as_deref(),
+        )
+    }
+}
+
+/// Whether a plan is still live or belongs behind the History toggle (D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    Live,
+    History,
+}
+
+const HISTORY_HEADS: &[&str] = &[
+    "done",
+    "rejected",
+    "completed",
+    "complete",
+    "cancelled",
+    "canceled",
+    "superseded",
+];
+
+fn status_head(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let head = value
+        .split(" — ")
+        .next()
+        .unwrap_or(value)
+        .split(" - ")
+        .next()
+        .unwrap_or(value)
+        .split(':')
+        .next()
+        .unwrap_or(value)
+        .trim();
+    Some(head.to_ascii_lowercase())
+}
+
+/// Classify lifecycle from the same fields the harness categorizer reads.
+/// Status/`stage` values are prose (`done — …`, `in progress — …`), so only the
+/// leading word is significant; `current_node == complete` is the tool's own
+/// end marker.
+pub fn classify_lifecycle(
+    stage: Option<&str>,
+    status: Option<&str>,
+    current_node: Option<&str>,
+) -> Lifecycle {
+    let node_complete = current_node
+        .map(|node| node.trim().eq_ignore_ascii_case("complete"))
+        .unwrap_or(false);
+    let head_is_history = |value: Option<&str>| {
+        status_head(value)
+            .map(|head| HISTORY_HEADS.contains(&head.as_str()))
+            .unwrap_or(false)
+    };
+    if node_complete || head_is_history(stage) || head_is_history(status) {
+        Lifecycle::History
+    } else {
+        Lifecycle::Live
+    }
+}
+
 /// Everything the graph tool can project into the store at save time.
 #[derive(Debug, Clone, Default)]
 pub struct GraphSnapshot {
@@ -203,6 +314,31 @@ impl PlanStore {
                 negative_control INTEGER,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (plan_id, node)
+            )
+        "})?()?;
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS categories (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                name TEXT NOT NULL,
+                rank INTEGER NOT NULL DEFAULT 0
+            )
+        "})?()?;
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS plan_categories (
+                plan_id TEXT PRIMARY KEY,
+                category_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'auto',
+                input_hash TEXT NOT NULL DEFAULT '',
+                assigned_at TEXT NOT NULL
+            )
+        "})?()?;
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS plan_parents (
+                plan_id TEXT PRIMARY KEY,
+                parent_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'parent',
+                updated_at TEXT NOT NULL
             )
         "})?()?;
         Ok(())
@@ -584,6 +720,132 @@ impl PlanStore {
             .collect())
     }
 
+    pub fn categories(&self) -> Result<Vec<CategoryRow>> {
+        let mut select = self
+            .connection
+            .select_bound::<(), (String, Option<String>, String, i64)>(indoc! {"
+                SELECT id, parent_id, name, rank FROM categories ORDER BY rank, name
+            "})?;
+        let rows = select(())?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, parent_id, name, rank)| CategoryRow {
+                id,
+                parent_id,
+                name,
+                rank,
+            })
+            .collect())
+    }
+
+    pub fn plan_categories(&self) -> Result<Vec<PlanCategoryRow>> {
+        let mut select = self.connection.select_bound::<(), (
+            String,
+            String,
+            String,
+            String,
+        )>(indoc! {"
+            SELECT plan_id, category_id, source, input_hash
+            FROM plan_categories ORDER BY plan_id
+        "})?;
+        let rows = select(())?;
+        Ok(rows
+            .into_iter()
+            .map(|(plan_id, category_id, source, input_hash)| PlanCategoryRow {
+                plan_id,
+                category_id,
+                source,
+                input_hash,
+            })
+            .collect())
+    }
+
+    pub fn plan_category(&self, plan_id: &str) -> Result<Option<PlanCategoryRow>> {
+        let plan_id = normalize_plan_id(plan_id);
+        let mut select = self.connection.select_bound::<String, (
+            String,
+            String,
+            String,
+            String,
+        )>(indoc! {"
+            SELECT plan_id, category_id, source, input_hash
+            FROM plan_categories WHERE plan_id = ?1
+        "})?;
+        let rows = select(plan_id)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|(plan_id, category_id, source, input_hash)| PlanCategoryRow {
+                plan_id,
+                category_id,
+                source,
+                input_hash,
+            }))
+    }
+
+    pub fn plan_parents(&self) -> Result<Vec<PlanParentRow>> {
+        let mut select = self
+            .connection
+            .select_bound::<(), (String, String)>(indoc! {"
+                SELECT plan_id, parent_id FROM plan_parents ORDER BY plan_id
+            "})?;
+        let rows = select(())?;
+        Ok(rows
+            .into_iter()
+            .map(|(plan_id, parent_id)| PlanParentRow { plan_id, parent_id })
+            .collect())
+    }
+
+    /// Every plan with its category assignment joined in — the wheel's single
+    /// read. `category_*` are `None` for a slice (attached to a parent instead)
+    /// or a plan the categorizer has not seen yet.
+    pub fn categorized_plans(&self) -> Result<Vec<CategorizedPlanRow>> {
+        let mut select = self.connection.select_bound::<(), (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(indoc! {"
+            SELECT p.id, p.name, p.repo, p.stage, p.status, p.current_node,
+                   c.category_id, c.source, c.input_hash
+            FROM plans p
+            LEFT JOIN plan_categories c ON c.plan_id = p.id
+            ORDER BY p.name
+        "})?;
+        let rows = select(())?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    name,
+                    repo,
+                    stage,
+                    status,
+                    current_node,
+                    category_id,
+                    category_source,
+                    category_input_hash,
+                )| CategorizedPlanRow {
+                    id,
+                    name,
+                    repo,
+                    stage,
+                    status,
+                    current_node,
+                    category_id,
+                    category_source,
+                    category_input_hash,
+                },
+            )
+            .collect())
+    }
+
     /// Whether the plan is debugger-scoped — the marker the graph tool co-writes
     /// (1.29 D8) so the plan graph renders the conditional `stage→…→fix`
     /// sub-graph. `false` for an unknown plan id.
@@ -808,6 +1070,95 @@ impl PlanStore {
             normalize_plan_id(&edge.to_plan),
             edge.kind.clone(),
             edge.order_rank,
+        ))
+    }
+
+    pub fn upsert_category(&self, category: &CategoryRow) -> Result<()> {
+        let mut upsert = self.connection.exec_bound::<(
+            String,
+            Option<String>,
+            String,
+            i64,
+        )>(indoc! {"
+            INSERT INTO categories (id, parent_id, name, rank)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                name = excluded.name,
+                rank = excluded.rank
+        "})?;
+        upsert((
+            category.id.clone(),
+            category.parent_id.clone(),
+            category.name.clone(),
+            category.rank,
+        ))
+    }
+
+    /// Write an assignment only when it actually changed, so a re-run over
+    /// unchanged input leaves the row (including `assigned_at`) byte-identical.
+    /// Returns whether the row was written.
+    pub fn upsert_plan_category(&self, row: &PlanCategoryRow) -> Result<bool> {
+        if let Some(existing) = self.plan_category(&row.plan_id)? {
+            if existing.category_id == row.category_id
+                && existing.source == row.source
+                && existing.input_hash == row.input_hash
+            {
+                return Ok(false);
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut upsert = self.connection.exec_bound::<(
+            String,
+            String,
+            String,
+            String,
+            String,
+        )>(indoc! {"
+            INSERT INTO plan_categories (plan_id, category_id, source, input_hash, assigned_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(plan_id) DO UPDATE SET
+                category_id = excluded.category_id,
+                source = excluded.source,
+                input_hash = excluded.input_hash,
+                assigned_at = excluded.assigned_at
+        "})?;
+        upsert((
+            normalize_plan_id(&row.plan_id),
+            row.category_id.clone(),
+            row.source.clone(),
+            row.input_hash.clone(),
+            now,
+        ))?;
+        Ok(true)
+    }
+
+    pub fn delete_plan_category(&self, plan_id: &str) -> Result<()> {
+        let plan_id = normalize_plan_id(plan_id);
+        let mut delete = self
+            .connection
+            .exec_bound::<String>("DELETE FROM plan_categories WHERE plan_id = ?1")?;
+        delete(plan_id)
+    }
+
+    pub fn upsert_plan_parent(&self, parent: &PlanParentRow) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut upsert = self.connection.exec_bound::<(
+            String,
+            String,
+            String,
+        )>(indoc! {"
+            INSERT INTO plan_parents (plan_id, parent_id, source, updated_at)
+            VALUES (?1, ?2, 'parent', ?3)
+            ON CONFLICT(plan_id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                updated_at = excluded.updated_at
+        "})?;
+        upsert((
+            normalize_plan_id(&parent.plan_id),
+            normalize_plan_id(&parent.parent_id),
+            now,
         ))
     }
 }
@@ -1214,5 +1565,140 @@ mod tests {
         assert!(!store.debugger_scoped("OLD").unwrap());
         store.set_debugger_scoped("OLD", true).unwrap();
         assert!(store.debugger_scoped("OLD").unwrap());
+    }
+
+    #[test]
+    fn lifecycle_classifier_reads_prose_statuses() {
+        assert_eq!(
+            classify_lifecycle(None, Some("done — 3/3 phases accepted"), None),
+            Lifecycle::History
+        );
+        assert_eq!(
+            classify_lifecycle(None, Some("rejected"), None),
+            Lifecycle::History
+        );
+        assert_eq!(
+            classify_lifecycle(Some("done"), None, None),
+            Lifecycle::History
+        );
+        assert_eq!(
+            classify_lifecycle(None, None, Some("complete")),
+            Lifecycle::History
+        );
+
+        assert_eq!(
+            classify_lifecycle(Some("plan"), Some("in progress — all five phases"), None),
+            Lifecycle::Live
+        );
+        assert_eq!(
+            classify_lifecycle(Some("draft"), None, Some("fork")),
+            Lifecycle::Live
+        );
+        assert_eq!(
+            classify_lifecycle(None, Some("2026-10-13 (parked — waiting on upstream)"), None),
+            Lifecycle::Live
+        );
+        assert_eq!(
+            classify_lifecycle(Some("plan  (promoted from draft)"), None, None),
+            Lifecycle::Live
+        );
+    }
+
+    #[test]
+    fn categories_and_assignments_round_trip() {
+        let store = store();
+        store
+            .upsert_category(&CategoryRow {
+                id: "feature".to_string(),
+                parent_id: None,
+                name: "Feature".to_string(),
+                rank: 100,
+            })
+            .unwrap();
+        store
+            .upsert_category(&CategoryRow {
+                id: "feature/agent-core".to_string(),
+                parent_id: Some("feature".to_string()),
+                name: "Agent Core".to_string(),
+                rank: 110,
+            })
+            .unwrap();
+        store
+            .upsert_plan_metadata(&RoadmapPlanRow {
+                id: "PLAN_A".to_string(),
+                name: "PLAN_A".to_string(),
+                repo: Some("zed".to_string()),
+                stage: Some("plan".to_string()),
+                status: None,
+                order_rank: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .upsert_plan_category(&PlanCategoryRow {
+                    plan_id: "PLAN_A".to_string(),
+                    category_id: "feature/agent-core".to_string(),
+                    source: "auto".to_string(),
+                    input_hash: "h1".to_string(),
+                })
+                .unwrap()
+        );
+
+        let categories = store.categories().unwrap();
+        assert_eq!(categories.len(), 2);
+        assert_eq!(categories[0].id, "feature");
+        assert_eq!(categories[1].parent_id.as_deref(), Some("feature"));
+
+        let plans = store.categorized_plans().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].category_id.as_deref(), Some("feature/agent-core"));
+        assert_eq!(plans[0].category_source.as_deref(), Some("auto"));
+        assert_eq!(plans[0].lifecycle(), Lifecycle::Live);
+    }
+
+    #[test]
+    fn plan_category_write_is_idempotent() {
+        let store = store();
+        let category = PlanCategoryRow {
+            plan_id: "PLAN_A".to_string(),
+            category_id: "feature".to_string(),
+            source: "auto".to_string(),
+            input_hash: "h1".to_string(),
+        };
+        assert!(store.upsert_plan_category(&category).unwrap());
+
+        let mut select = store
+            .connection
+            .select_bound::<String, String>(
+                "SELECT assigned_at FROM plan_categories WHERE plan_id = ?1",
+            )
+            .unwrap();
+        let timestamp_before = select("PLAN_A".to_string()).unwrap().remove(0);
+
+        assert!(!store.upsert_plan_category(&category).unwrap());
+        let timestamp_after = select("PLAN_A".to_string()).unwrap().remove(0);
+        assert_eq!(timestamp_before, timestamp_after);
+
+        let changed = PlanCategoryRow {
+            category_id: "feature/agent-core".to_string(),
+            ..category
+        };
+        assert!(store.upsert_plan_category(&changed).unwrap());
+    }
+
+    #[test]
+    fn plan_parents_round_trip() {
+        let store = store();
+        store
+            .upsert_plan_parent(&PlanParentRow {
+                plan_id: "PLAN_OF_ACTION-x.md".to_string(),
+                parent_id: "parent-plan".to_string(),
+            })
+            .unwrap();
+
+        let parents = store.plan_parents().unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].plan_id, "plan-of-action-x");
+        assert_eq!(parents[0].parent_id, "parent-plan");
     }
 }
