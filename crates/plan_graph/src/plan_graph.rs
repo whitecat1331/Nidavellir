@@ -1124,7 +1124,7 @@ impl PlanGraph {
             current_node: plan.current_node.clone(),
             lifecycle: plan.lifecycle(),
             summary: plan.summary.clone(),
-            detail: plan.detail.clone(),
+            detail: plan.detail,
             decision: project_decision(&store, plan_id),
             related,
             blocking,
