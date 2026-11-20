@@ -649,7 +649,11 @@ fn evaluate_stop(state: &GraphState, now: DateTime<Utc>) -> Option<Decision> {
         }
         let latest = &entry.attempts[entry.attempts.len() - 1];
         let previous = &entry.attempts[entry.attempts.len() - 2];
-        let latest_output = latest.cost.as_ref().map(|cost| cost.output_tokens).unwrap_or(0);
+        let latest_output = latest
+            .cost
+            .as_ref()
+            .map(|cost| cost.output_tokens)
+            .unwrap_or(0);
         let previous_output = previous
             .cost
             .as_ref()
@@ -923,7 +927,11 @@ pub fn heartbeat(state: &mut GraphState, now: DateTime<Utc>) -> Result<(), Strin
     Ok(())
 }
 
-pub fn resume(state: &mut GraphState, artifact: &str, now: DateTime<Utc>) -> Result<String, String> {
+pub fn resume(
+    state: &mut GraphState,
+    artifact: &str,
+    now: DateTime<Utc>,
+) -> Result<String, String> {
     if artifact.trim().is_empty() {
         return Err(
             "resuming a stopped plan needs a non-empty artifact naming the human decision"
@@ -1147,7 +1155,7 @@ pub fn advance(
             });
             if failed_gate {
                 return Err(
-                    "protected change: a verification gate failed — merge blocked".to_string()
+                    "protected change: a verification gate failed — merge blocked".to_string(),
                 );
             }
         }

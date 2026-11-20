@@ -19,11 +19,11 @@ use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable, Render,
     WeakEntity, Window, actions, px,
 };
+use plan_flow::{Attempt, DoneEntry, GraphState, ROUTE, STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
     PlanStore,
 };
-use plan_flow::{Attempt, DoneEntry, GraphState, is_human_gate, next_ready, ROUTE, STALL_SECONDS};
 use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
 use workspace::item::Item;
