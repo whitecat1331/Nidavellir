@@ -2243,18 +2243,56 @@ mod tests {
     #[test]
     fn decision_projection_stops_at_human_gates_and_retries_failed_gates() {
         let store = PlanStore::open_in_memory().expect("in-memory store");
-        store
-            .apply_graph_snapshot(&snapshot("PLAN_A", "implement"))
-            .unwrap();
-        let decision = project_decision(&store, "PLAN_A");
-        assert_eq!(decision.kind, DecisionKind::Active);
 
-        store
-            .apply_graph_snapshot(&snapshot("PLAN_B", "verify"))
-            .unwrap();
+        let mut active = snapshot("PLAN_A", "implement");
+        active.active_node = Some("implement".to_string());
+        store.apply_graph_snapshot(&active).unwrap();
+        assert_eq!(project_decision(&store, "PLAN_A").kind, DecisionKind::Active);
+
+        let mut next = snapshot("PLAN_B", "verify");
+        next.done_nodes = [
+            "plan", "promote", "claim", "fork", "implement", "verify",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        store.apply_graph_snapshot(&next).unwrap();
         let decision = project_decision(&store, "PLAN_B");
         assert_eq!(decision.kind, DecisionKind::Next);
         assert_eq!(decision.node, "compile");
+
+        let mut gate = snapshot("PLAN_C", "accept");
+        gate.done_nodes = [
+            "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        store.apply_graph_snapshot(&gate).unwrap();
+        let decision = project_decision(&store, "PLAN_C");
+        assert_eq!(decision.kind, DecisionKind::Blocked);
+        assert_eq!(decision.node, "merge");
+
+        let mut retry = snapshot("PLAN_D", "verify");
+        retry.done_nodes = ["plan", "promote", "claim", "fork", "implement", "verify"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        retry.evidence = vec![EvidenceRow {
+            plan_id: "PLAN_D".to_string(),
+            node: "compile".to_string(),
+            artifact_sha: None,
+            gate_exit_code: Some(1),
+            report_path: None,
+            falsifying_condition: None,
+            negative_control: None,
+        }];
+        retry.done_nodes.push("compile".to_string());
+        store.apply_graph_snapshot(&retry).unwrap();
+        assert_eq!(
+            project_decision(&store, "PLAN_D").kind,
+            DecisionKind::Retry
+        );
     }
 
     #[test]
