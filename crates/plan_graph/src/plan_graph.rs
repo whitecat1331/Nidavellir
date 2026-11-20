@@ -1259,200 +1259,292 @@ impl PlanGraph {
             DecisionKind::Next => Color::Accent,
             DecisionKind::Paused => Color::Muted,
         };
+        let has_relations =
+            !page.related.is_empty() || !page.blocking.is_empty() || !page.slices.is_empty();
 
         v_flex()
             .id(ElementId::Name("plan-page".into()))
             .size_full()
-            .p_4()
-            .gap_3()
             .overflow_y_scroll()
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .when(can_go_back, |this| {
-                        this.child(Button::new("page-back", "← Back").on_click(cx.listener(
-                            |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                                this.back(window, cx)
-                            },
-                        )))
-                    })
-                    .child(Button::new("page-close", "Close").on_click(cx.listener(
-                        |this: &mut PlanGraph, _: &ClickEvent, _, cx| this.close_page(cx),
-                    )))
-                    .child(Label::new(title).size(LabelSize::Large))
-                    .child(badge(
-                        if page.lifecycle == Lifecycle::History {
-                            "history"
-                        } else {
-                            "live"
-                        },
-                        if page.lifecycle == Lifecycle::History {
-                            Color::Muted
-                        } else {
-                            Color::Success
-                        },
-                        cx,
-                    )),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .flex_wrap()
-                    .child(meta("id", &page.id))
-                    .when_some(page.repo.clone(), |this, repo| {
-                        this.child(meta("repo", &repo))
-                    })
-                    .when_some(page.stage.clone(), |this, stage| {
-                        this.child(meta("stage", &stage))
-                    })
-                    .when_some(page.status.clone(), |this, status| {
-                        this.child(meta("status", &status))
-                    })
-                    .when_some(page.current_node.clone(), |this, node| {
-                        this.child(meta("current", &node))
-                    }),
-            )
-            .child(
-                div().w_full().child(
-                    Label::new(summary)
-                        .size(LabelSize::Small)
-                        .color(Color::Default),
-                ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().colors().element_background)
-                    .child(
-                        Label::new(decision_text(&page.decision))
-                            .size(LabelSize::Small)
-                            .color(decision_color),
-                    ),
-            )
-            .child(
                 v_flex()
-                    .gap_2()
-                    .when(!page.related.is_empty(), |this| {
-                        this.child(chip_row("Related", &page.related, cx))
-                    })
-                    .when(!page.blocking.is_empty(), |this| {
-                        this.child(chip_row("Blocked by", &page.blocking, cx))
-                    })
-                    .when(!page.slices.is_empty(), |this| {
-                        this.child(chip_row("Slices", &page.slices, cx))
-                    }),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .flex_wrap()
-                    .children(page.dev_flow.iter().map(|node| {
-                        let (glyph, color) = dev_flow_visual(node);
-                        Label::new(format!("{glyph} {}", node.node))
-                            .size(LabelSize::XSmall)
-                            .color(color)
-                    })),
-            )
-            .when(page.debugger_scoped, |this| {
-                this.child(
-                    Label::new("Debugger loop (stage → test → verify → restart → run → fix)")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            })
-            .child(
-                h_flex()
-                    .gap_4()
-                    .items_start()
+                    .w_full()
+                    .max_w(px(980.0))
+                    .p_8()
+                    .gap_6()
                     .child(
+                        h_flex()
+                            .w_full()
+                            .gap_4()
+                            .items_start()
+                            .justify_between()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_3()
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(Label::new(title).size(LabelSize::Large))
+                                            .child(badge(
+                                                if page.lifecycle == Lifecycle::History {
+                                                    "history"
+                                                } else {
+                                                    "live"
+                                                },
+                                                if page.lifecycle == Lifecycle::History {
+                                                    Color::Muted
+                                                } else {
+                                                    Color::Success
+                                                },
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .flex_wrap()
+                                            .child(meta_chip("id", &page.id, cx))
+                                            .when_some(page.repo.clone(), |this, repo| {
+                                                this.child(meta_chip("repo", &repo, cx))
+                                            })
+                                            .when_some(page.stage.clone(), |this, stage| {
+                                                this.child(meta_chip("stage", &stage, cx))
+                                            })
+                                            .when_some(page.status.clone(), |this, status| {
+                                                this.child(meta_chip("status", &status, cx))
+                                            })
+                                            .when_some(page.current_node.clone(), |this, node| {
+                                                this.child(meta_chip("current", &node, cx))
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .when(can_go_back, |this| {
+                                        this.child(Button::new("page-back", "← Back").on_click(
+                                            cx.listener(
+                                                |this: &mut PlanGraph,
+                                                 _: &ClickEvent,
+                                                 window,
+                                                 cx| { this.back(window, cx) },
+                                            ),
+                                        ))
+                                    })
+                                    .child(Button::new("page-close", "Close").on_click(
+                                        cx.listener(|this: &mut PlanGraph, _: &ClickEvent, _, cx| {
+                                            this.close_page(cx)
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .bg(cx.theme().colors().element_background)
+                            .px_4()
+                            .py_3()
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        Label::new("Decision")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(decision_text(&page.decision))
+                                            .color(decision_color),
+                                    ),
+                            ),
+                    )
+                    .child(section(
+                        "Summary",
+                        div()
+                            .w_full()
+                            .child(Label::new(summary).color(Color::Default))
+                            .into_any_element(),
+                    ))
+                    .when(has_relations, |this| {
+                        this.child(section(
+                            "Relationships",
+                            v_flex()
+                                .gap_4()
+                                .when(!page.related.is_empty(), |this| {
+                                    this.child(chip_row("Related", &page.related, cx))
+                                })
+                                .when(!page.blocking.is_empty(), |this| {
+                                    this.child(chip_row("Blocked by", &page.blocking, cx))
+                                })
+                                .when(!page.slices.is_empty(), |this| {
+                                    this.child(chip_row("Slices", &page.slices, cx))
+                                })
+                                .into_any_element(),
+                        ))
+                    })
+                    .child(section(
+                        "Dev flow",
                         v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(Label::new("Threads for this plan").size(LabelSize::Small))
+                            .gap_3()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .flex_wrap()
+                                    .children(page.dev_flow.iter().map(|node| flow_pill(node, cx))),
+                            )
+                            .when(page.debugger_scoped, |this| {
+                                this.child(
+                                    Label::new(
+                                        "Debugger loop (stage → test → verify → restart → run → fix)",
+                                    )
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                )
+                            })
+                            .into_any_element(),
+                    ))
+                    .child(section(
+                        "Threads for this plan",
+                        v_flex()
+                            .gap_2()
                             .when(self.threads.is_empty(), |this| {
                                 this.child(
                                     Label::new("No threads started from this plan yet.")
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
                             })
                             .children(self.threads.iter().map(|thread| {
                                 let session = thread.session_id.clone();
-                                div()
+                                h_flex()
                                     .id(ElementId::Name(
                                         format!("plan-thread:{}", thread.session_id).into(),
                                     ))
-                                    .px_2()
-                                    .py_1()
+                                    .w_full()
+                                    .gap_3()
+                                    .items_center()
+                                    .px_3()
+                                    .py_2()
                                     .rounded_md()
                                     .cursor_pointer()
                                     .hover(|this| this.bg(cx.theme().colors().element_hover))
                                     .on_click(cx.listener(
-                                        move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                                        move |this: &mut PlanGraph,
+                                              _: &ClickEvent,
+                                              window,
+                                              cx| {
                                             this.open_thread(session.clone(), window, cx)
                                         },
                                     ))
+                                    .child(Label::new(thread.title.clone()).size(LabelSize::Small))
                                     .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                Label::new(thread.title.clone())
-                                                    .size(LabelSize::Small),
-                                            )
-                                            .child(
-                                                Label::new(
-                                                    thread
-                                                        .updated_at
-                                                        .format("%Y-%m-%d %H:%M")
-                                                        .to_string(),
-                                                )
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                            ),
+                                        Label::new(
+                                            thread
+                                                .updated_at
+                                                .format("%Y-%m-%d %H:%M")
+                                                .to_string(),
+                                        )
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
                                     )
-                            })),
-                    )
+                            }))
+                            .into_any_element(),
+                    ))
                     .child(
                         v_flex()
-                            .w(px(340.0))
+                            .w_full()
                             .gap_2()
                             .child(
-                                div()
-                                    .w_full()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border_variant)
-                                    .bg(cx.theme().colors().editor_background)
-                                    .child(self.composer.clone()),
+                                Label::new("Ask the agent about this plan")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
                             )
-                            .child(Button::new("plan-send", "Send").on_click(cx.listener(
-                                |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                                    this.send_composer(window, cx)
-                                },
-                            ))),
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(cx.theme().colors().border_variant)
+                                            .bg(cx.theme().colors().editor_background)
+                                            .child(self.composer.clone()),
+                                    )
+                                    .child(Button::new("plan-send", "Send").on_click(cx.listener(
+                                        |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                                            this.send_composer(window, cx)
+                                        },
+                                    ))),
+                            ),
                     ),
             )
             .into_any_element()
     }
 }
 
-fn meta(label: &str, value: &str) -> AnyElement {
+fn section(title: &str, body: AnyElement) -> AnyElement {
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(
+            Label::new(title.to_string())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+fn meta_chip(label: &str, value: &str, cx: &App) -> AnyElement {
     h_flex()
-        .gap_1()
+        .gap_2()
+        .items_center()
+        .px_3()
+        .py_1p5()
+        .rounded_full()
+        .bg(cx.theme().colors().element_background)
         .child(
             Label::new(label.to_string())
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
-        .child(Label::new(value.to_string()).size(LabelSize::XSmall))
+        .child(Label::new(value.to_string()).size(LabelSize::Small))
+        .into_any_element()
+}
+
+fn flow_pill(node: &DevFlowNode, cx: &App) -> AnyElement {
+    let (glyph, color) = dev_flow_visual(node);
+    h_flex()
+        .gap_2()
+        .items_center()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .bg(cx.theme().colors().element_background)
+        .child(Label::new(glyph).size(LabelSize::Small).color(color))
+        .child(
+            Label::new(node.node.clone())
+                .size(LabelSize::Small)
+                .color(if node.is_human_gate {
+                    Color::Muted
+                } else {
+                    Color::Default
+                }),
+        )
         .into_any_element()
 }
 
@@ -1473,7 +1565,8 @@ fn badge(label: &str, color: Color, cx: &App) -> AnyElement {
 
 fn chip_row(title: &str, chips: &[RelationChip], cx: &mut Context<PlanGraph>) -> AnyElement {
     v_flex()
-        .gap_1()
+        .w_full()
+        .gap_2()
         .child(
             Label::new(title.to_string())
                 .size(LabelSize::XSmall)
@@ -1481,7 +1574,7 @@ fn chip_row(title: &str, chips: &[RelationChip], cx: &mut Context<PlanGraph>) ->
         )
         .child(
             h_flex()
-                .gap_1()
+                .gap_2()
                 .flex_wrap()
                 .children(chips.iter().map(|chip| {
                     let id = chip.id.clone();
@@ -1494,11 +1587,12 @@ fn chip_row(title: &str, chips: &[RelationChip], cx: &mut Context<PlanGraph>) ->
                         .id(ElementId::Name(
                             format!("chip:{}:{}:{}", title, chip.id, chip.incoming).into(),
                         ))
-                        .px_2()
-                        .py_1()
+                        .px_3()
+                        .py_1p5()
                         .rounded_full()
                         .border_1()
                         .border_color(cx.theme().colors().border_variant)
+                        .bg(cx.theme().colors().element_background)
                         .cursor_pointer()
                         .hover(|this| this.bg(cx.theme().colors().element_hover))
                         .on_click(cx.listener(
@@ -1506,7 +1600,7 @@ fn chip_row(title: &str, chips: &[RelationChip], cx: &mut Context<PlanGraph>) ->
                                 this.open_plan(id.clone(), window, cx)
                             },
                         ))
-                        .child(Label::new(label).size(LabelSize::XSmall))
+                        .child(Label::new(label).size(LabelSize::Small))
                         .into_any_element()
                 })),
         )
