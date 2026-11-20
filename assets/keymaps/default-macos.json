@@ -702,6 +702,8 @@
       "f6": "workspace::FocusNextPart",
       "shift-f6": "workspace::FocusPreviousPart",
       "cmd-f6": "workspace::FocusNextPart",
+      // Open the interactive plan wheel (plan_graph item).
+      "ctrl-alt-shift-m": "plan_graph::DeployPlanGraph",
       "fn-f": "zed::ToggleFullScreen",
       "ctrl-cmd-f": "zed::ToggleFullScreen",
       // Change the default action on `menu::Confirm` by setting the parameter

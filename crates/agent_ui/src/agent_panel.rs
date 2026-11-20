@@ -1017,6 +1017,9 @@ pub struct CreateThreadOptions {
     /// sibling can't yank focus out from under an in-progress turn; the
     /// fork-and-continue paths set it so the user lands in the continuation.
     pub focus: bool,
+    /// Tag the new thread as executing this dev-flow plan. The plan page's
+    /// composer sets it so the plan-scoped thread sidebar can find the thread.
+    pub plan_path: Option<String>,
 }
 
 pub(crate) struct AgentThread {
@@ -3348,6 +3351,13 @@ impl AgentPanel {
         }
         let conversation_view = thread.conversation_view;
         let thread_id = conversation_view.read(cx).thread_id;
+        if let Some(plan_path) = options.plan_path {
+            if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
+                native_thread.update(cx, |thread, cx| {
+                    thread.set_plan_path(Some(plan_path), cx);
+                });
+            }
+        }
         self.insert_retained_thread(thread_id, conversation_view.clone(), cx);
         if let Some(blocks) = seed_draft {
             crate::draft_prompt_store::write(thread_id, &blocks, cx).detach_and_log_err(cx);
@@ -5660,6 +5670,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 model: request.model.clone(),
                 work_dirs: None,
                 focus: request.focus,
+                plan_path: None,
             };
 
             // If the caller asked for a fresh worktree, open a new workspace

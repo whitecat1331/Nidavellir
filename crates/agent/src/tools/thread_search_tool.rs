@@ -579,6 +579,7 @@ mod tests {
             created_at: None,
             folder_paths: PathList::default(),
             workspace_id: None,
+            plan_path: None,
         }
     }
 
