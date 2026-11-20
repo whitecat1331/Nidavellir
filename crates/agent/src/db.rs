@@ -456,6 +456,7 @@ impl DbThread {
         }
 
         Ok(Self {
+            driver: false,
             title: thread.summary,
             messages,
             updated_at: thread.updated_at,
