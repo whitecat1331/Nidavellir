@@ -24,6 +24,8 @@ use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
     PlanStore,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
 use workspace::item::Item;
@@ -32,7 +34,7 @@ actions!(plan_graph, [DeployPlanGraph]);
 
 /// Open a specific plan in the plan graph: reveals it in the tree and opens its
 /// page. Dispatched by thread-to-plan navigation (D21) and plan-page chips.
-#[derive(Clone, PartialEq, Debug, Action)]
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = plan_graph)]
 pub struct OpenPlan {
     pub plan_id: SharedString,

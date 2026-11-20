@@ -22,5 +22,7 @@ gpui.workspace = true
 log.workspace = true
 plan_flow.workspace = true
 plan_store.workspace = true
+schemars.workspace = true
+serde.workspace = true
 ui.workspace = true
 workspace.workspace = true
