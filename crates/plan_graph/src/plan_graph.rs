@@ -17,6 +17,7 @@ use gpui::{
     Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, Render, SharedString, WeakEntity, Window, actions, px,
 };
+use notifications::status_toast::StatusToast;
 use plan_flow::{Attempt, DoneEntry, GraphState, ROUTE, STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
@@ -420,6 +421,36 @@ pub fn decision_text(decision: &Decision) -> String {
         DecisionKind::Retry => format!("retry {} — {}", decision.node, decision.reason),
         DecisionKind::Next => format!("next step: {}", decision.node),
         DecisionKind::Paused => format!("paused — {}", decision.reason),
+    }
+}
+
+fn human_gate_label(node: &str) -> (&'static str, &'static str, &'static str) {
+    match node {
+        "accept" => (
+            "Launch acceptance",
+            "Launch",
+            "Launch a fresh build and verify the artifact end-to-end before merging.",
+        ),
+        "merge" => (
+            "Merge + rebuild",
+            "Merge",
+            "Merge the branch into feature and rebuild the shared slot.",
+        ),
+        "release" => (
+            "Release",
+            "Release",
+            "Ship feature → dev and rebuild the release slots.",
+        ),
+        "complete" => (
+            "Complete",
+            "Complete",
+            "Mark the plan complete and archive it.",
+        ),
+        _ => (
+            "Human gate",
+            "Perform",
+            "A human decision is required before the plan can advance.",
+        ),
     }
 }
 
@@ -1101,6 +1132,18 @@ impl PlanGraph {
         cx.notify();
     }
 
+    fn notify_human_gate(&mut self, node: String, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let (label, _action, _description) = human_gate_label(&node);
+        let message = format!("{label} is a human gate — perform it via the normal tooling.");
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| this.dismiss_button(true));
+            workspace.toggle_status_toast(toast, cx);
+        });
+    }
+
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
         self.history_visible = !self.history_visible;
         cx.notify();
@@ -1323,6 +1366,9 @@ impl PlanGraph {
         };
         let has_relations =
             !page.related.is_empty() || !page.blocking.is_empty() || !page.slices.is_empty();
+        let human_gate_node = (page.decision.kind == DecisionKind::Blocked
+            && page.decision.predicate.as_deref() == Some("human_gate"))
+        .then(|| page.decision.node.clone());
 
         v_flex()
             .id(ElementId::Name("plan-page".into()))
@@ -1491,6 +1537,52 @@ impl PlanGraph {
                                     ),
                             ),
                     )
+                    .when_some(human_gate_node, |this, node| {
+                        let (label, action, description) = human_gate_label(&node);
+                        this.child(
+                            div()
+                                .w_full()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .bg(cx.theme().colors().element_background)
+                                .px_4()
+                                .py_3()
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .gap_3()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    Label::new(label)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Accent),
+                                                )
+                                                .child(Button::new("plan-gate", action).on_click(
+                                                    cx.listener(
+                                                        move |this: &mut PlanGraph,
+                                                              _: &ClickEvent,
+                                                              _window,
+                                                              cx| {
+                                                            this.notify_human_gate(
+                                                                node.clone(),
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ),
+                                                )),
+                                        )
+                                        .child(
+                                            Label::new(description)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(section(
                         "Summary",
                         div()

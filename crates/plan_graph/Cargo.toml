@@ -20,6 +20,7 @@ chrono.workspace = true
 editor.workspace = true
 gpui.workspace = true
 log.workspace = true
+notifications.workspace = true
 plan_flow.workspace = true
 plan_store.workspace = true
 schemars.workspace = true
