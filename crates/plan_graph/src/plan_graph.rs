@@ -10,9 +10,11 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
+use fs::Fs;
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, Render, SharedString, WeakEntity, Window, actions, px,
@@ -23,6 +25,7 @@ use plan_store::{
     CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
     PlanStore,
 };
+use project::Project;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use ui::{Button, Color, Label, LabelSize, prelude::*};
@@ -813,6 +816,8 @@ struct PageData {
 pub struct PlanGraph {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    fs: Arc<dyn Fs>,
+    project: Entity<Project>,
     categories: Vec<CategoryRow>,
     plans: Vec<CategorizedPlanRow>,
     parents: Vec<PlanParentRow>,
@@ -828,10 +833,18 @@ pub struct PlanGraph {
 }
 
 impl PlanGraph {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        fs: Arc<dyn Fs>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut graph = Self {
             focus_handle: cx.focus_handle(),
             workspace,
+            fs,
+            project,
             categories: Vec::new(),
             plans: Vec::new(),
             parents: Vec::new(),
@@ -1032,17 +1045,17 @@ impl PlanGraph {
         let Some(plan_id) = self.current_plan_id() else {
             return;
         };
-        let Some(workspace) = self.workspace.upgrade() else {
+        if self.workspace.upgrade().is_none() {
             return;
-        };
-        let fs = workspace.read(cx).app_state().fs.clone();
-        let project = workspace.read(cx).project().clone();
+        }
+        let fs = self.fs.clone();
+        let project = self.project.clone();
         let thread_store = agent::ThreadStore::global(cx);
         let agent = agent_ui::Agent::NativeAgent;
         let server = agent.server(fs, thread_store.clone());
         let connection_store =
             cx.new(|cx| agent_ui::AgentConnectionStore::new(project.clone(), cx));
-        let workspace_handle = workspace.downgrade();
+        let workspace_handle = self.workspace.clone();
         let conversation_view = cx.new(|cx| {
             agent_ui::ConversationView::new(
                 server,
@@ -1153,17 +1166,17 @@ impl PlanGraph {
         if self.coordinator_view.is_some() {
             return;
         }
-        let Some(workspace) = self.workspace.upgrade() else {
+        if self.workspace.upgrade().is_none() {
             return;
-        };
-        let fs = workspace.read(cx).app_state().fs.clone();
-        let project = workspace.read(cx).project().clone();
+        }
+        let fs = self.fs.clone();
+        let project = self.project.clone();
         let thread_store = agent::ThreadStore::global(cx);
         let agent = agent_ui::Agent::NativeAgent;
         let server = agent.server(fs, thread_store.clone());
         let connection_store =
             cx.new(|cx| agent_ui::AgentConnectionStore::new(project.clone(), cx));
-        let workspace_handle = workspace.downgrade();
+        let workspace_handle = self.workspace.clone();
         let coordinator_view = cx.new(|cx| {
             agent_ui::ConversationView::new(
                 server,
@@ -1215,7 +1228,9 @@ impl PlanGraph {
             existing
         } else {
             let workspace_handle = cx.entity().downgrade();
-            let item = cx.new(|cx| PlanGraph::new(workspace_handle, window, cx));
+            let fs = workspace.app_state().fs.clone();
+            let project = workspace.project().clone();
+            let item = cx.new(|cx| PlanGraph::new(workspace_handle, fs, project, window, cx));
             workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
             item
         }
