@@ -6,15 +6,12 @@
 //! disclosure keeps it navigable: a click expands a branch's children, a click
 //! on a plan opens its page. The page carries the plan's metadata, summary, the
 //! read-only dev-flow decision (from `plan_flow`, the same coordinator the agent
-//! tool uses), related/blocking/slice chips, and a plan-scoped agent composer +
-//! thread sidebar.
+//! tool uses), related/blocking/slice chips, and a contained plan-scoped chat.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
-use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
-use editor::Editor;
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, Render, SharedString, WeakEntity, Window, actions, px,
@@ -768,12 +765,6 @@ struct PageData {
     debugger_scoped: bool,
 }
 
-struct PlanThread {
-    session_id: acp::SessionId,
-    title: String,
-    updated_at: DateTime<Utc>,
-}
-
 /// The plan navigation `Item` (main editor area, not a bottom `Panel`).
 pub struct PlanGraph {
     focus_handle: FocusHandle,
@@ -787,17 +778,11 @@ pub struct PlanGraph {
     history_visible: bool,
     page_stack: Vec<String>,
     page: Option<PageData>,
-    composer: gpui::Entity<Editor>,
-    threads: Vec<PlanThread>,
+    conversation_view: Option<Entity<agent_ui::ConversationView>>,
 }
 
 impl PlanGraph {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let composer = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Ask the agent about this plan…", window, cx);
-            editor
-        });
+    fn new(workspace: WeakEntity<Workspace>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut graph = Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -810,8 +795,7 @@ impl PlanGraph {
             history_visible: false,
             page_stack: Vec::new(),
             page: None,
-            composer,
-            threads: Vec::new(),
+            conversation_view: None,
         };
         graph.refresh();
         graph
@@ -872,12 +856,10 @@ impl PlanGraph {
     }
 
     fn open_plan(&mut self, plan_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.navigate_to_plan(&plan_id, cx);
-        self.composer
-            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.navigate_to_plan(&plan_id, window, cx);
     }
 
-    fn navigate_to_plan(&mut self, plan_id: &str, cx: &mut Context<Self>) {
+    fn navigate_to_plan(&mut self, plan_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         expand_path_to_plan(
             &mut self.expanded,
             &self.categories,
@@ -887,8 +869,8 @@ impl PlanGraph {
         );
         self.page_stack.push(plan_id.to_string());
         self.load_page(plan_id);
-        self.threads.clear();
-        self.load_threads(cx);
+        self.conversation_view = None;
+        self.ensure_conversation_view(window, cx);
         cx.notify();
     }
 
@@ -897,15 +879,14 @@ impl PlanGraph {
         match self.page_stack.last().cloned() {
             Some(plan_id) => {
                 self.load_page(&plan_id);
-                self.threads.clear();
-                self.load_threads(cx);
+                self.conversation_view = None;
+                self.ensure_conversation_view(window, cx);
             }
             None => {
                 self.page = None;
-                self.threads.clear();
+                self.conversation_view = None;
             }
         }
-        let _ = window;
         cx.notify();
     }
 
@@ -915,7 +896,7 @@ impl PlanGraph {
         }
         self.page_stack.clear();
         self.page = None;
-        self.threads.clear();
+        self.conversation_view = None;
         cx.notify();
     }
 
@@ -985,57 +966,8 @@ impl PlanGraph {
         self.page.as_ref().map(|page| page.id.clone())
     }
 
-    fn load_threads(&mut self, cx: &mut Context<Self>) {
-        let Some(plan_id) = self.current_plan_id() else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let database = cx.update(|cx| agent::ThreadsDatabase::connect(cx)).await;
-            let database = match database {
-                Ok(database) => database,
-                Err(error) => {
-                    log::error!("[GRAPH] thread database unavailable: {error:#}");
-                    return;
-                }
-            };
-            let threads = match database.list_threads().await {
-                Ok(threads) => threads,
-                Err(error) => {
-                    log::error!("[GRAPH] failed to list threads: {error:#}");
-                    return;
-                }
-            };
-            let scoped: Vec<PlanThread> = threads
-                .into_iter()
-                .filter(|thread| {
-                    thread
-                        .plan_path
-                        .as_deref()
-                        .map(plan_id_from_path)
-                        .as_deref()
-                        == Some(plan_id.as_str())
-                })
-                .map(|thread| PlanThread {
-                    session_id: thread.id,
-                    title: thread.title.to_string(),
-                    updated_at: thread.updated_at,
-                })
-                .collect();
-            if let Err(error) = this.update(cx, |this, cx| {
-                if this.current_plan_id().as_deref() == Some(plan_id.as_str()) {
-                    this.threads = scoped;
-                    cx.notify();
-                }
-            }) {
-                log::debug!("[GRAPH] plan page closed before threads loaded: {error:#}");
-            }
-        })
-        .detach();
-    }
-
-    fn send_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text(cx).trim().to_string();
-        if text.is_empty() {
+    fn ensure_conversation_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conversation_view.is_some() {
             return;
         }
         let Some(plan_id) = self.current_plan_id() else {
@@ -1044,62 +976,52 @@ impl PlanGraph {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let panel = workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx)
-        });
-        let Some(panel) = panel else {
-            return;
-        };
-        panel.update(cx, |panel, cx| {
-            panel.create_thread_with_options(
-                agent_ui::CreateThreadOptions {
-                    initial_content: Some(agent_ui::AgentInitialContent::ContentBlock {
-                        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-                        auto_submit: true,
-                    }),
-                    focus: true,
-                    plan_path: Some(plan_id),
-                    ..Default::default()
-                },
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let project = workspace.read(cx).project().clone();
+        let thread_store = agent::ThreadStore::global(cx);
+        let agent = agent_ui::Agent::NativeAgent;
+        let server = agent.server(fs, thread_store.clone());
+        let connection_store =
+            cx.new(|cx| agent_ui::AgentConnectionStore::new(project.clone(), cx));
+        let workspace_handle = workspace.downgrade();
+        let conversation_view = cx.new(|cx| {
+            agent_ui::ConversationView::new(
+                server,
+                connection_store,
+                agent,
+                None,
+                None,
+                None,
+                None,
+                None,
+                workspace_handle,
+                project,
+                Some(thread_store),
                 agent_ui::AgentThreadSource::AgentPanel,
                 window,
                 cx,
-            );
+            )
         });
-        self.composer
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        self.load_threads(cx);
-        // The new thread is persisted asynchronously; reload once the save has
-        // landed so it appears in this plan's sidebar without reopening the page.
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(900))
-                .await;
-            if let Err(error) = this.update(cx, |this, cx| this.load_threads(cx)) {
-                log::debug!("[GRAPH] plan page closed before thread refresh: {error:#}");
+
+        // The native thread only exists once the connection establishes. Apply
+        // the plan link on the first update that exposes it, so this embedded
+        // thread is plan-scoped (badge + page linkage) without a full panel.
+        let applied = Cell::new(false);
+        cx.observe(&conversation_view, move |_this, view, cx| {
+            if applied.get() {
+                return;
             }
+            let Some(native_thread) = view.as_native_thread(cx) else {
+                return;
+            };
+            native_thread.update(cx, |thread, cx| {
+                thread.set_plan_path(Some(plan_id.clone()), cx);
+            });
+            applied.set(true);
         })
         .detach();
-        cx.notify();
-    }
 
-    fn open_thread(
-        &mut self,
-        session_id: acp::SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let panel = workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx)
-        });
-        if let Some(panel) = panel {
-            panel.update(cx, |panel, cx| {
-                panel.open_thread(session_id, None, None, window, cx);
-            });
-        }
+        self.conversation_view = Some(conversation_view);
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -1268,7 +1190,26 @@ impl PlanGraph {
 
     fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.page.is_some() {
-            self.render_page(window, cx)
+            h_flex()
+                .size_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_page(window, cx)),
+                )
+                .when_some(self.conversation_view.clone(), |this, view| {
+                    this.child(
+                        div()
+                            .w(px(440.0))
+                            .h_full()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(view),
+                    )
+                })
+                .into_any_element()
         } else {
             v_flex()
                 .id(ElementId::Name("plan-empty".into()))
@@ -1454,85 +1395,6 @@ impl PlanGraph {
                             })
                             .into_any_element(),
                     ))
-                    .child(section(
-                        "Threads for this plan",
-                        v_flex()
-                            .gap_2()
-                            .when(self.threads.is_empty(), |this| {
-                                this.child(
-                                    Label::new("No threads started from this plan yet.")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                            })
-                            .children(self.threads.iter().map(|thread| {
-                                let session = thread.session_id.clone();
-                                h_flex()
-                                    .id(ElementId::Name(
-                                        format!("plan-thread:{}", thread.session_id).into(),
-                                    ))
-                                    .w_full()
-                                    .gap_3()
-                                    .items_center()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
-                                    .on_click(cx.listener(
-                                        move |this: &mut PlanGraph,
-                                              _: &ClickEvent,
-                                              window,
-                                              cx| {
-                                            this.open_thread(session.clone(), window, cx)
-                                        },
-                                    ))
-                                    .child(Label::new(thread.title.clone()).size(LabelSize::Small))
-                                    .child(
-                                        Label::new(
-                                            thread
-                                                .updated_at
-                                                .format("%Y-%m-%d %H:%M")
-                                                .to_string(),
-                                        )
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                            }))
-                            .into_any_element(),
-                    ))
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(
-                                Label::new("Ask the agent about this plan")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().colors().border_variant)
-                                            .bg(cx.theme().colors().editor_background)
-                                            .child(self.composer.clone()),
-                                    )
-                                    .child(Button::new("plan-send", "Send").on_click(cx.listener(
-                                        |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                                            this.send_composer(window, cx)
-                                        },
-                                    ))),
-                            ),
-                    ),
             )
             .into_any_element()
     }
@@ -1702,7 +1564,7 @@ pub fn init(cx: &mut App) {
             let item = PlanGraph::deploy(workspace, window, cx);
             let plan_id = action.plan_id.clone();
             item.update(cx, |graph, cx| {
-                graph.navigate_to_plan(plan_id.as_ref(), cx);
+                graph.navigate_to_plan(plan_id.as_ref(), window, cx);
             });
         });
     })
