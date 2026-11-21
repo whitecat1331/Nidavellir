@@ -1018,7 +1018,6 @@ impl PlanGraph {
                 None,
                 None,
                 None,
-                None,
                 initial_content,
                 workspace_handle,
                 project,
