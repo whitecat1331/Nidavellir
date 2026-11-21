@@ -1457,6 +1457,9 @@ impl PlanGraph {
                                     .clone()
                                     .unwrap_or_else(|| "—".to_string());
                                 h_flex()
+                                    .id(ElementId::Name(
+                                        format!("dashboard-plan:{plan_id}").into(),
+                                    ))
                                     .w_full()
                                     .gap_3()
                                     .items_center()
