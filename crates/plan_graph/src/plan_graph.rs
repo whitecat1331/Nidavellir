@@ -1447,43 +1447,27 @@ impl PlanGraph {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .children(plans.into_iter().map(|plan| {
-                                let plan_id = plan.id.clone();
-                                let node = plan
-                                    .current_node
-                                    .clone()
-                                    .unwrap_or_else(|| "—".to_string());
-                                h_flex()
-                                    .id(ElementId::Name(
-                                        format!("dashboard-plan:{plan_id}").into(),
-                                    ))
-                                    .w_full()
-                                    .gap_3()
-                                    .items_center()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
-                                    .on_click(cx.listener(
-                                        move |this: &mut PlanGraph,
-                                              _: &ClickEvent,
-                                              window,
-                                              cx| {
-                                            this.open_plan(plan_id.clone(), window, cx);
-                                        },
-                                    ))
-                                    .child(Label::new(plan_label(plan)).size(LabelSize::Small))
-                                    .child(
-                                        Label::new(node)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                            })),
-                    ),
+                    .child(v_flex().gap_1().children(plans.into_iter().map(|plan| {
+                        let plan_id = plan.id.clone();
+                        let node = plan.current_node.clone().unwrap_or_else(|| "—".to_string());
+                        h_flex()
+                            .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
+                            .w_full()
+                            .gap_3()
+                            .items_center()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                            .on_click(cx.listener(
+                                move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                                    this.open_plan(plan_id.clone(), window, cx);
+                                },
+                            ))
+                            .child(Label::new(plan_label(plan)).size(LabelSize::Small))
+                            .child(Label::new(node).size(LabelSize::XSmall).color(Color::Muted))
+                    }))),
             )
             .into_any_element()
     }
