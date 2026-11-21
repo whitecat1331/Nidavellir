@@ -1011,7 +1011,7 @@ impl PlanGraph {
             if applied.get() {
                 return;
             }
-            let Some(native_thread) = view.as_native_thread(cx) else {
+            let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
                 return;
             };
             native_thread.update(cx, |thread, cx| {
