@@ -823,11 +823,12 @@ pub struct PlanGraph {
     page_stack: Vec<String>,
     page: Option<PageData>,
     conversation_view: Option<Entity<agent_ui::ConversationView>>,
+    coordinator_view: Option<Entity<agent_ui::ConversationView>>,
     driver_started: bool,
 }
 
 impl PlanGraph {
-    fn new(workspace: WeakEntity<Workspace>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut graph = Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -841,9 +842,11 @@ impl PlanGraph {
             page_stack: Vec::new(),
             page: None,
             conversation_view: None,
+            coordinator_view: None,
             driver_started: false,
         };
         graph.refresh();
+        graph.ensure_coordinator_view(window, cx);
         graph
     }
 
@@ -1115,8 +1118,10 @@ impl PlanGraph {
              acceptance-ready: run `implement` → `verify` → `compile` yourself, using the \
              `graph` tool to `coordinate` before each step and `advance` each gate only once \
              its artifact is produced and verified. Stop when `accept` is the ready node — \
-             never advance `accept` yourself, it is a human gate. When you stop, report the \
-             plan's current node and spend."
+             never advance `accept` yourself, it is a human gate. If the plan itself is wrong \
+             (a missing step, a wrong acceptance criterion, a bad re-slice), propose the \
+             amendment as an edit-file diff the operator accepts — never rewrite or complete \
+             the plan unilaterally. When you stop, report the plan's current node and spend."
         )
     }
 
@@ -1142,6 +1147,56 @@ impl PlanGraph {
             let toast = StatusToast::new(message, cx, |this, _cx| this.dismiss_button(true));
             workspace.toggle_status_toast(toast, cx);
         });
+    }
+
+    fn ensure_coordinator_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.coordinator_view.is_some() {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let project = workspace.read(cx).project().clone();
+        let thread_store = agent::ThreadStore::global(cx);
+        let agent = agent_ui::Agent::NativeAgent;
+        let server = agent.server(fs, thread_store.clone());
+        let connection_store =
+            cx.new(|cx| agent_ui::AgentConnectionStore::new(project.clone(), cx));
+        let workspace_handle = workspace.downgrade();
+        let coordinator_view = cx.new(|cx| {
+            agent_ui::ConversationView::new(
+                server,
+                connection_store,
+                agent,
+                None,
+                None,
+                None,
+                None,
+                Some(agent_ui::AgentInitialContent::ContentBlock {
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        Self::coordinator_brief(),
+                    ))],
+                    auto_submit: true,
+                }),
+                workspace_handle,
+                project,
+                Some(thread_store),
+                agent_ui::AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+        self.coordinator_view = Some(coordinator_view);
+    }
+
+    fn coordinator_brief() -> String {
+        "You are the plan coordinator (plan-manager) for this workspace's plans. \
+         Create new plans, maintain coherence between plans, and enforce plan integrity \
+         — every plan has the required information. You may implement, but your real job is \
+         plan management. Use the `graph` tool to inspect and coordinate the plans in the \
+         plans namespace."
+            .to_string()
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -1331,18 +1386,103 @@ impl PlanGraph {
                 })
                 .into_any_element()
         } else {
-            v_flex()
-                .id(ElementId::Name("plan-empty".into()))
-                .flex_1()
-                .items_center()
-                .justify_center()
+            h_flex()
+                .size_full()
                 .child(
-                    Label::new("Select a plan to see its detail.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_dashboard(cx)),
                 )
+                .when_some(self.coordinator_view.clone(), |this, view| {
+                    this.child(
+                        div()
+                            .w(px(440.0))
+                            .h_full()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(view),
+                    )
+                })
                 .into_any_element()
         }
+    }
+
+    fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.plans.len();
+        let live = self
+            .plans
+            .iter()
+            .filter(|plan| plan.lifecycle() == Lifecycle::Live)
+            .count();
+        let mut plans: Vec<&CategorizedPlanRow> = self.plans.iter().collect();
+        plans.sort_by(|a, b| a.name.cmp(&b.name));
+        v_flex()
+            .id(ElementId::Name("plans-dashboard".into()))
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(980.0))
+                    .p_8()
+                    .gap_6()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(Label::new("Plans").size(LabelSize::Large))
+                            .child(
+                                Label::new(format!("{live} live of {total}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        Label::new(
+                            "Drive the whole plan set from the coordinator chat on the right, \
+                             or open a plan below to drive its implementation.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .children(plans.into_iter().map(|plan| {
+                                let plan_id = plan.id.clone();
+                                let node = plan
+                                    .current_node
+                                    .clone()
+                                    .unwrap_or_else(|| "—".to_string());
+                                h_flex()
+                                    .w_full()
+                                    .gap_3()
+                                    .items_center()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                    .on_click(cx.listener(
+                                        move |this: &mut PlanGraph,
+                                              _: &ClickEvent,
+                                              window,
+                                              cx| {
+                                            this.open_plan(plan_id.clone(), window, cx);
+                                        },
+                                    ))
+                                    .child(Label::new(plan_label(plan)).size(LabelSize::Small))
+                                    .child(
+                                        Label::new(node)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_page(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
