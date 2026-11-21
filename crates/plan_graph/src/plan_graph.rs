@@ -11,6 +11,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
+use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
@@ -291,6 +292,8 @@ pub struct Decision {
     pub kind: DecisionKind,
     pub node: String,
     pub reason: String,
+    pub spent_tokens: u64,
+    pub predicate: Option<String>,
 }
 
 /// Project the coordinator's decision order as a read-only view over the store.
@@ -302,6 +305,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
                 kind: DecisionKind::Paused,
                 node: "—".to_string(),
                 reason: "plan not found".to_string(),
+                spent_tokens: 0,
+                predicate: None,
             };
         }
         Err(error) => {
@@ -310,6 +315,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
                 kind: DecisionKind::Paused,
                 node: "—".to_string(),
                 reason: "plan store unavailable".to_string(),
+                spent_tokens: 0,
+                predicate: None,
             };
         }
     };
@@ -319,6 +326,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
             kind: DecisionKind::Done,
             node: "complete".to_string(),
             reason: "plan complete".to_string(),
+            spent_tokens: 0,
+            predicate: None,
         };
     }
     if let Some(reason) = &plan.blocked_reason {
@@ -326,6 +335,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
             kind: DecisionKind::Blocked,
             node: plan.current_node.clone().unwrap_or_default(),
             reason: format!("blocked — {reason}"),
+            spent_tokens: 0,
+            predicate: None,
         };
     }
 
@@ -396,6 +407,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
         kind,
         node,
         reason: decision.reason,
+        spent_tokens: decision.spent_tokens,
+        predicate: decision.predicate,
     }
 }
 
@@ -779,6 +792,7 @@ pub struct PlanGraph {
     page_stack: Vec<String>,
     page: Option<PageData>,
     conversation_view: Option<Entity<agent_ui::ConversationView>>,
+    driver_started: bool,
 }
 
 impl PlanGraph {
@@ -796,6 +810,7 @@ impl PlanGraph {
             page_stack: Vec::new(),
             page: None,
             conversation_view: None,
+            driver_started: false,
         };
         graph.refresh();
         graph
@@ -870,7 +885,8 @@ impl PlanGraph {
         self.page_stack.push(plan_id.to_string());
         self.load_page(plan_id);
         self.conversation_view = None;
-        self.ensure_conversation_view(window, cx);
+        self.driver_started = false;
+        self.ensure_conversation_view(None, false, window, cx);
         cx.notify();
     }
 
@@ -880,11 +896,13 @@ impl PlanGraph {
             Some(plan_id) => {
                 self.load_page(&plan_id);
                 self.conversation_view = None;
-                self.ensure_conversation_view(window, cx);
+                self.driver_started = false;
+                self.ensure_conversation_view(None, false, window, cx);
             }
             None => {
                 self.page = None;
                 self.conversation_view = None;
+                self.driver_started = false;
             }
         }
         cx.notify();
@@ -897,6 +915,7 @@ impl PlanGraph {
         self.page_stack.clear();
         self.page = None;
         self.conversation_view = None;
+        self.driver_started = false;
         cx.notify();
     }
 
@@ -966,7 +985,13 @@ impl PlanGraph {
         self.page.as_ref().map(|page| page.id.clone())
     }
 
-    fn ensure_conversation_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn ensure_conversation_view(
+        &mut self,
+        initial_content: Option<agent_ui::AgentInitialContent>,
+        is_driver: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.conversation_view.is_some() {
             return;
         }
@@ -994,6 +1019,7 @@ impl PlanGraph {
                 None,
                 None,
                 None,
+                initial_content,
                 workspace_handle,
                 project,
                 Some(thread_store),
@@ -1004,8 +1030,8 @@ impl PlanGraph {
         });
 
         // The native thread only exists once the connection establishes. Apply
-        // the plan link on the first update that exposes it, so this embedded
-        // thread is plan-scoped (badge + page linkage) without a full panel.
+        // the plan link (and the driver marker) on the first update that exposes
+        // it, so this embedded thread is plan-scoped and resumable.
         let applied = Cell::new(false);
         cx.observe(&conversation_view, move |_this, view, cx| {
             if applied.get() {
@@ -1016,12 +1042,64 @@ impl PlanGraph {
             };
             native_thread.update(cx, |thread, cx| {
                 thread.set_plan_path(Some(plan_id.clone()), cx);
+                if is_driver {
+                    thread.set_driver(true, cx);
+                }
             });
             applied.set(true);
         })
         .detach();
 
+        // Re-project the decision whenever the thread turns, so the page's node
+        // and spend stay current without reopening the page.
+        cx.observe(&conversation_view, |this, _view, cx| {
+            this.refresh_decision(cx);
+        })
+        .detach();
+
         self.conversation_view = Some(conversation_view);
+    }
+
+    fn start_driver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan_id) = self.current_plan_id() else {
+            return;
+        };
+        let brief = Self::driver_brief(&plan_id);
+        self.conversation_view = None;
+        self.driver_started = true;
+        self.ensure_conversation_view(
+            Some(agent_ui::AgentInitialContent::ContentBlock {
+                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(brief))],
+                auto_submit: true,
+            }),
+            true,
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn driver_brief(plan_id: &str) -> String {
+        format!(
+            "You are the driver thread for plan `{plan_id}`. Drive its dev-flow to \
+             acceptance-ready: run `implement` → `verify` → `compile` yourself, using the \
+             `graph` tool to `coordinate` before each step and `advance` each gate only once \
+             its artifact is produced and verified. Stop when `accept` is the ready node — \
+             never advance `accept` yourself, it is a human gate. When you stop, report the \
+             plan's current node and spend."
+        )
+    }
+
+    fn refresh_decision(&mut self, cx: &mut Context<Self>) {
+        let Some(plan_id) = self.current_plan_id() else {
+            return;
+        };
+        let store = Self::open_store();
+        let decision = project_decision(&store, &plan_id);
+        if let Some(page) = self.page.as_mut() {
+            page.decision = decision;
+        }
+        cx.notify();
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -1336,17 +1414,81 @@ impl PlanGraph {
                             .px_4()
                             .py_3()
                             .child(
-                                h_flex()
-                                    .gap_3()
-                                    .items_center()
+                                v_flex()
+                                    .gap_2()
                                     .child(
-                                        Label::new("Decision")
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                Label::new("Decision")
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(decision_text(&page.decision))
+                                                    .color(decision_color),
+                                            ),
                                     )
                                     .child(
-                                        Label::new(decision_text(&page.decision))
-                                            .color(decision_color),
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                Label::new("Spend")
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(format!(
+                                                    "{} tokens",
+                                                    page.decision.spent_tokens
+                                                ))
+                                                .size(LabelSize::Small),
+                                            ),
+                                    )
+                                    .when_some(page.decision.predicate.clone(), |this, predicate| {
+                                        this.child(
+                                            h_flex()
+                                                .gap_3()
+                                                .items_center()
+                                                .child(
+                                                    Label::new("Break predicate")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(predicate)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Warning),
+                                                ),
+                                        )
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .when(self.driver_started, |this| {
+                                                this.child(
+                                                    Label::new("Driver running")
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Success),
+                                                )
+                                            })
+                                            .when(!self.driver_started, |this| {
+                                                this.child(
+                                                    Button::new("plan-start", "Start").on_click(
+                                                        cx.listener(
+                                                            |this: &mut PlanGraph,
+                                                             _: &ClickEvent,
+                                                             window,
+                                                             cx| {
+                                                                this.start_driver(window, cx)
+                                                            },
+                                                        ),
+                                                    ),
+                                                )
+                                            }),
                                     ),
                             ),
                     )
