@@ -1048,6 +1048,20 @@ impl PlanGraph {
         if self.workspace.upgrade().is_none() {
             return;
         }
+        let initial_content = initial_content.unwrap_or_else(|| {
+            let name = self.plan_display(&plan_id);
+            let node = self
+                .page
+                .as_ref()
+                .and_then(|page| page.current_node.clone())
+                .unwrap_or_else(|| "—".to_string());
+            agent_ui::AgentInitialContent::ContentBlock {
+                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    Self::plan_scope_brief(&plan_id, &name, &node),
+                ))],
+                auto_submit: true,
+            }
+        });
         let fs = self.fs.clone();
         let project = self.project.clone();
         let thread_store = agent::ThreadStore::global(cx);
@@ -1065,7 +1079,7 @@ impl PlanGraph {
                 None,
                 None,
                 None,
-                initial_content,
+                Some(initial_content),
                 workspace_handle,
                 project,
                 Some(thread_store),
@@ -1210,6 +1224,12 @@ impl PlanGraph {
          plan management. Use the `graph` tool to inspect and coordinate the plans in the \
          plans namespace."
             .to_string()
+    }
+
+    fn plan_scope_brief(plan_id: &str, plan_name: &str, current_node: &str) -> String {
+        format!(
+            "You are the plan-scoped assistant for the plan \"{plan_name}\" ({plan_id}), shown in this plan page. When the user refers to \"this plan\" or \"the plan\", they mean {plan_id}. Its current node is {current_node}. To answer questions about its progress, read its progress.json with the graph tool. Stay within this plan only: do not work on, modify, or drive any other plan. Answer the user's questions; do not advance or change this plan unless the user explicitly asks."
+        )
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
