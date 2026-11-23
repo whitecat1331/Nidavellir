@@ -954,6 +954,17 @@ impl PlanGraph {
             driver_started: false,
             threads: Vec::new(),
         };
+        // Keep this plan's thread history current: a chat turn creates or
+        // updates a thread whose plan_path links it here, and the thread store
+        // reloads (and notifies) after each save.
+        let thread_store = agent::ThreadStore::global(cx);
+        cx.observe(&thread_store, |this, _store, cx| {
+            if this.page.is_some() {
+                this.refresh_threads(cx);
+                cx.notify();
+            }
+        })
+        .detach();
         graph.refresh();
         graph.ensure_coordinator_view(window, cx);
         graph
@@ -1878,27 +1889,32 @@ impl PlanGraph {
                             })
                             .into_any_element(),
                     ))
-                    .when(!self.threads.is_empty(), |this| {
-                        this.child(section(
-                            "Threads",
-                            v_flex()
-                                .gap_1()
-                                .children(self.threads.iter().map(|thread| {
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child(
-                                            Label::new(thread.title.clone())
-                                                .size(LabelSize::Small),
-                                        )
-                                        .when(thread.driver, |this| {
-                                            this.child(badge("driver", Color::Accent, cx))
-                                        })
-                                        .into_any_element()
-                                }))
-                                .into_any_element(),
-                        ))
-                    })
+                    .child(section(
+                        "Threads",
+                        v_flex()
+                            .gap_1()
+                            .when(self.threads.is_empty(), |this| {
+                                this.child(
+                                    Label::new("No threads linked to this plan yet.")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                            })
+                            .children(self.threads.iter().map(|thread| {
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Label::new(thread.title.clone())
+                                            .size(LabelSize::Small),
+                                    )
+                                    .when(thread.driver, |this| {
+                                        this.child(badge("driver", Color::Accent, cx))
+                                    })
+                                    .into_any_element()
+                            }))
+                            .into_any_element(),
+                    ))
             )
             .into_any_element()
     }
