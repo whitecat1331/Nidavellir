@@ -1041,7 +1041,7 @@ impl PlanGraph {
         self.refresh_threads(cx);
         self.conversation_view = None;
         self.driver_started = false;
-        self.ensure_conversation_view(None, false, window, cx);
+        self.ensure_conversation_view(None, false, None, window, cx);
         cx.notify();
     }
 
@@ -1053,7 +1053,7 @@ impl PlanGraph {
                 self.refresh_threads(cx);
                 self.conversation_view = None;
                 self.driver_started = false;
-                self.ensure_conversation_view(None, false, window, cx);
+                self.ensure_conversation_view(None, false, None, window, cx);
             }
             None => {
                 self.page = None;
@@ -1163,6 +1163,7 @@ impl PlanGraph {
         &mut self,
         initial_content: Option<agent_ui::AgentInitialContent>,
         is_driver: bool,
+        resume_session_id: Option<acp::SessionId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1188,7 +1189,7 @@ impl PlanGraph {
                 server,
                 connection_store,
                 agent,
-                None,
+                resume_session_id,
                 None,
                 None,
                 None,
@@ -1238,6 +1239,18 @@ impl PlanGraph {
         self.conversation_view = Some(conversation_view);
     }
 
+    fn open_thread_in_chat(
+        &mut self,
+        session_id: acp::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversation_view = None;
+        self.driver_started = false;
+        self.ensure_conversation_view(None, false, Some(session_id), window, cx);
+        cx.notify();
+    }
+
     fn start_driver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(plan_id) = self.current_plan_id() else {
             return;
@@ -1251,6 +1264,7 @@ impl PlanGraph {
                 auto_submit: true,
             }),
             true,
+            None,
             window,
             cx,
         );
@@ -1901,9 +1915,18 @@ impl PlanGraph {
                                 )
                             })
                             .children(self.threads.iter().map(|thread| {
+                                let session_id = thread.id.clone();
                                 h_flex()
                                     .gap_2()
                                     .items_center()
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.open_thread_in_chat(session_id.clone(), window, cx);
+                                        },
+                                    ))
                                     .child(
                                         Label::new(thread.title.clone())
                                             .size(LabelSize::Small),
