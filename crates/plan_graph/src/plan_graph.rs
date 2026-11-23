@@ -464,6 +464,7 @@ fn human_gate_label(node: &str) -> (&'static str, &'static str, &'static str) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeKind {
     Root,
+    Project,
     History,
     Category,
     Subcategory,
@@ -551,6 +552,20 @@ fn slices_for<'a>(parents: &'a [PlanParentRow], plan_id: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Map a plan's `repo` to its project facet: the tree key and the human label.
+/// The two known repos get named facets; anything else falls into one "Other"
+/// facet so an unrecognized or missing repo never spawns a root per typo.
+fn project_facet(repo: Option<&str>) -> (String, String) {
+    match repo {
+        Some("zed") => ("project:zed".to_string(), "Fork (zed)".to_string()),
+        Some("zed-debugger-demo") => (
+            "project:zed-debugger-demo".to_string(),
+            "Harness (zed-debugger-demo)".to_string(),
+        ),
+        _ => ("project:other".to_string(), "Other".to_string()),
+    }
+}
+
 /// Build the visible wheel tree from the taxonomy, assignments, parent links
 /// and expansion state. Pure so the disclosure rules are testable.
 pub fn build_visible_tree(
@@ -563,15 +578,92 @@ pub fn build_visible_tree(
 ) -> VisibleNode {
     let plan_by_id: HashMap<&str, &CategorizedPlanRow> =
         plans.iter().map(|plan| (plan.id.as_str(), plan)).collect();
-    let live: Vec<&CategorizedPlanRow> = plans
-        .iter()
-        .filter(|plan| plan.lifecycle() == Lifecycle::Live)
-        .collect();
-    let history: Vec<&CategorizedPlanRow> = plans
-        .iter()
-        .filter(|plan| plan.lifecycle() == Lifecycle::History)
-        .collect();
 
+    // Group plans into project facets (fork vs harness, and anything else),
+    // ordered by label so the tree is stable across reloads.
+    let mut project_groups: HashMap<String, (String, Vec<&CategorizedPlanRow>)> = HashMap::new();
+    for plan in plans {
+        let (key, label) = project_facet(plan.repo.as_deref());
+        project_groups
+            .entry(key)
+            .or_insert_with(|| (label, Vec::new()))
+            .1
+            .push(plan);
+    }
+    let mut projects: Vec<(String, String, Vec<&CategorizedPlanRow>)> = project_groups
+        .into_iter()
+        .map(|(key, (label, plans))| (key, label, plans))
+        .collect();
+    projects.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut root_children = Vec::new();
+    for (project_key, project_label, project_plans) in projects {
+        let live: Vec<&CategorizedPlanRow> = project_plans
+            .iter()
+            .filter(|plan| plan.lifecycle() == Lifecycle::Live)
+            .copied()
+            .collect();
+        let history: Vec<&CategorizedPlanRow> = project_plans
+            .iter()
+            .filter(|plan| plan.lifecycle() == Lifecycle::History)
+            .copied()
+            .collect();
+
+        let mut project_children = build_category_children(
+            categories,
+            &live,
+            parents,
+            &plan_by_id,
+            fleet,
+            expanded,
+            &project_key,
+        );
+        if history_visible {
+            if let Some(history_node) = build_history_node(&history, expanded, &project_key) {
+                project_children.push(history_node);
+            }
+        }
+
+        let project_expanded = expanded.contains(&project_key);
+        let mut node = VisibleNode::new(
+            project_key,
+            format!("{project_label} · {}", project_plans.len()),
+            TreeKind::Project,
+        );
+        node.expandable = !project_children.is_empty();
+        node.expanded = project_expanded;
+        node.children = if project_expanded {
+            project_children
+        } else {
+            Vec::new()
+        };
+        root_children.push(node);
+    }
+
+    let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), TreeKind::Root);
+    let root_expanded = expanded.contains("root");
+    root.expandable = true;
+    root.expanded = root_expanded;
+    root.children = if root_expanded {
+        root_children
+    } else {
+        Vec::new()
+    };
+    root
+}
+
+/// Build the category -> subcategory -> plan subtree for one project's live plans.
+/// Every node key is prefixed with the project key so a category that spans
+/// projects never collides on the global key.
+fn build_category_children(
+    categories: &[CategoryRow],
+    live: &[&CategorizedPlanRow],
+    parents: &[PlanParentRow],
+    plan_by_id: &HashMap<&str, &CategorizedPlanRow>,
+    fleet: &HashMap<String, FleetPlanRow>,
+    expanded: &HashSet<String>,
+    prefix: &str,
+) -> Vec<VisibleNode> {
     let mut top_categories: Vec<&CategoryRow> = categories
         .iter()
         .filter(|category| category.parent_id.is_none())
@@ -600,18 +692,18 @@ pub fn build_visible_tree(
             let mut sub_children = Vec::new();
             for plan in members {
                 let slices = slices_for(parents, &plan.id);
-                let plan_key = format!("plan:{}", plan.id);
+                let plan_key = format!("{prefix}/plan:{}", plan.id);
                 let plan_expanded = expanded.contains(&plan_key);
                 let mut children = Vec::new();
                 if plan_expanded && !slices.is_empty() {
-                    let group_key = format!("slices:{}", plan.id);
+                    let group_key = format!("{prefix}/slices:{}", plan.id);
                     let group_expanded = expanded.contains(&group_key);
                     let mut slice_children = Vec::new();
                     if group_expanded {
                         for slice_id in &slices {
                             if let Some(slice) = plan_by_id.get(slice_id) {
                                 let mut node = VisibleNode::new(
-                                    format!("slice:{slice_id}"),
+                                    format!("{prefix}/slice:{slice_id}"),
                                     plan_label(slice),
                                     TreeKind::Slice,
                                 );
@@ -644,7 +736,7 @@ pub fn build_visible_tree(
                 sub_children.push(node);
             }
 
-            let sub_key = format!("sub:{}", sub.id);
+            let sub_key = format!("{prefix}/sub:{}", sub.id);
             let sub_expanded = expanded.contains(&sub_key);
             let mut node = VisibleNode::new(
                 sub_key,
@@ -661,7 +753,7 @@ pub fn build_visible_tree(
             cat_children.push(node);
         }
 
-        let cat_key = format!("cat:{}", category.id);
+        let cat_key = format!("{prefix}/cat:{}", category.id);
         let cat_expanded = expanded.contains(&cat_key);
         let mut node = VisibleNode::new(
             cat_key,
@@ -677,50 +769,48 @@ pub fn build_visible_tree(
         };
         root_children.push(node);
     }
+    root_children
+}
 
-    if history_visible {
-        let key = "history".to_string();
-        let is_expanded = expanded.contains(&key);
-        let mut history_nodes: Vec<VisibleNode> = history
-            .iter()
-            .map(|plan| {
-                let mut node = VisibleNode::new(
-                    format!("hist:{}", plan.id),
-                    plan_label(plan),
-                    TreeKind::Plan,
-                );
-                node.plan_id = Some(plan.id.clone());
-                node.state = NodeState::Done;
-                node
-            })
-            .collect();
-        history_nodes.sort_by(|a, b| a.label.cmp(&b.label));
-        let mut node = VisibleNode::new(
-            key,
-            format!("History · {}", history_nodes.len()),
-            TreeKind::History,
-        );
-        node.state = NodeState::Done;
-        node.expandable = !history_nodes.is_empty();
-        node.expanded = is_expanded;
-        node.children = if is_expanded {
-            history_nodes
-        } else {
-            Vec::new()
-        };
-        root_children.push(node);
+/// Build one project's history subtree, if it has any history plans.
+fn build_history_node(
+    history: &[&CategorizedPlanRow],
+    expanded: &HashSet<String>,
+    prefix: &str,
+) -> Option<VisibleNode> {
+    if history.is_empty() {
+        return None;
     }
-
-    let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), TreeKind::Root);
-    let root_expanded = expanded.contains("root");
-    root.expandable = true;
-    root.expanded = root_expanded;
-    root.children = if root_expanded {
-        root_children
+    let key = format!("{prefix}/history");
+    let is_expanded = expanded.contains(&key);
+    let mut history_nodes: Vec<VisibleNode> = history
+        .iter()
+        .map(|plan| {
+            let mut node = VisibleNode::new(
+                format!("{prefix}/hist:{}", plan.id),
+                plan_label(plan),
+                TreeKind::Plan,
+            );
+            node.plan_id = Some(plan.id.clone());
+            node.state = NodeState::Done;
+            node
+        })
+        .collect();
+    history_nodes.sort_by(|a, b| a.label.cmp(&b.label));
+    let mut node = VisibleNode::new(
+        key,
+        format!("History · {}", history_nodes.len()),
+        TreeKind::History,
+    );
+    node.state = NodeState::Done;
+    node.expandable = true;
+    node.expanded = is_expanded;
+    node.children = if is_expanded {
+        history_nodes
     } else {
         Vec::new()
     };
-    root
+    Some(node)
 }
 
 /// Strip directories and plan-file suffixes from a thread's `plan_path` and
@@ -752,11 +842,14 @@ fn expand_path_to_plan(
         return;
     };
 
+    let (prefix, _) = project_facet(plan.repo.as_deref());
+    expanded.insert(prefix.clone());
+
     let mut category_id = plan.category_id.clone();
     if category_id.is_none() {
         if let Some(parent) = parents.iter().find(|parent| parent.plan_id == plan_id) {
-            expanded.insert(format!("plan:{}", parent.parent_id));
-            expanded.insert(format!("slices:{}", parent.parent_id));
+            expanded.insert(format!("{prefix}/plan:{}", parent.parent_id));
+            expanded.insert(format!("{prefix}/slices:{}", parent.parent_id));
             category_id = plans
                 .iter()
                 .find(|plan| plan.id == parent.parent_id)
@@ -769,9 +862,9 @@ fn expand_path_to_plan(
             break;
         };
         let key = if category.parent_id.is_none() {
-            format!("cat:{}", category.id)
+            format!("{prefix}/cat:{}", category.id)
         } else {
-            format!("sub:{}", category.id)
+            format!("{prefix}/sub:{}", category.id)
         };
         expanded.insert(key);
         category_id = category.parent_id.clone();
@@ -1289,7 +1382,8 @@ impl PlanGraph {
                     self.expanded.clear();
                 }
             }
-            TreeKind::Category
+            TreeKind::Project
+            | TreeKind::Category
             | TreeKind::Subcategory
             | TreeKind::History
             | TreeKind::SliceGroup => {
@@ -2065,9 +2159,24 @@ mod tests {
             false,
         );
         let labels: Vec<&str> = open.children.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(labels, vec!["Feature · 1", "Bug · 1"]);
+        assert_eq!(labels, vec!["Fork (zed) · 2"]);
         assert!(open.children.iter().all(|c| c.children.is_empty()));
         assert!(open.children.iter().all(|c| c.expandable));
+
+        let open_project = build_visible_tree(
+            &taxonomy(),
+            &plans,
+            &[],
+            &HashMap::new(),
+            &expanded(&["root", "project:zed"]),
+            false,
+        );
+        let category_labels: Vec<&str> = open_project.children[0]
+            .children
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(category_labels, vec!["Feature · 1", "Bug · 1"]);
     }
 
     #[test]
@@ -2081,37 +2190,44 @@ mod tests {
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root", "cat:feature"]),
+            &expanded(&["root", "project:zed", "project:zed/cat:feature"]),
             false,
         );
-        let feature = find(&root, "cat:feature").expect("feature category");
-        let bug = find(&root, "cat:bug").expect("bug category");
+        let feature = find(&root, "project:zed/cat:feature").expect("feature category");
+        let bug = find(&root, "project:zed/cat:bug").expect("bug category");
         assert_eq!(feature.children.len(), 1);
         assert!(bug.children.is_empty(), "siblings stay collapsed");
-        assert_eq!(feature.children[0].key, "sub:feature/agent-core");
+        assert_eq!(feature.children[0].key, "project:zed/sub:feature/agent-core");
     }
 
     #[test]
     fn expanding_a_category_collapses_cleanly() {
+        let plans = vec![plan("p1", "Plan one", Some("feature/agent-core"), None)];
         let root_open = build_visible_tree(
             &taxonomy(),
-            &[],
+            &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root", "cat:feature"]),
+            &expanded(&["root", "project:zed", "project:zed/cat:feature"]),
             false,
         );
-        assert_eq!(find(&root_open, "cat:feature").unwrap().children.len(), 1);
+        assert_eq!(
+            find(&root_open, "project:zed/cat:feature")
+                .unwrap()
+                .children
+                .len(),
+            1
+        );
         let root_closed = build_visible_tree(
             &taxonomy(),
-            &[],
+            &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root"]),
+            &expanded(&["root", "project:zed"]),
             false,
         );
         assert!(
-            find(&root_closed, "cat:feature")
+            find(&root_closed, "project:zed/cat:feature")
                 .unwrap()
                 .children
                 .is_empty()
@@ -2133,10 +2249,15 @@ mod tests {
             &plans,
             &parents,
             &HashMap::new(),
-            &expanded(&["root", "cat:feature", "sub:feature/agent-core"]),
+            &expanded(&[
+                "root",
+                "project:zed",
+                "project:zed/cat:feature",
+                "project:zed/sub:feature/agent-core",
+            ]),
             false,
         );
-        let parent = find(&root, "plan:parent").expect("parent plan");
+        let parent = find(&root, "project:zed/plan:parent").expect("parent plan");
         assert!(parent.expandable);
         assert!(parent.children.is_empty(), "slices are behind a toggle");
 
@@ -2147,15 +2268,16 @@ mod tests {
             &HashMap::new(),
             &expanded(&[
                 "root",
-                "cat:feature",
-                "sub:feature/agent-core",
-                "plan:parent",
+                "project:zed",
+                "project:zed/cat:feature",
+                "project:zed/sub:feature/agent-core",
+                "project:zed/plan:parent",
             ]),
             false,
         );
-        let parent = find(&root, "plan:parent").expect("parent plan");
+        let parent = find(&root, "project:zed/plan:parent").expect("parent plan");
         assert_eq!(parent.children.len(), 1);
-        assert_eq!(parent.children[0].key, "slices:parent");
+        assert_eq!(parent.children[0].key, "project:zed/slices:parent");
         assert_eq!(parent.children[0].label, "slices (1)");
     }
 
@@ -2173,19 +2295,65 @@ mod tests {
             &expanded(&["root"]),
             false,
         );
-        assert!(find(&hidden, "history").is_none());
+        assert!(find(&hidden, "project:zed/history").is_none());
 
         let shown = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root", "history"]),
+            &expanded(&["root", "project:zed", "project:zed/history"]),
             true,
         );
-        let history = find(&shown, "history").expect("history node");
+        let history = find(&shown, "project:zed/history").expect("history node");
         assert_eq!(history.children.len(), 1);
         assert_eq!(history.children[0].plan_id.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn plans_are_grouped_into_project_facets() {
+        let fork = plan("fork-plan", "Fork plan", Some("feature/agent-core"), None);
+        let mut harness = plan(
+            "harness-plan",
+            "Harness plan",
+            Some("process/debugger-loop"),
+            None,
+        );
+        harness.repo = Some("zed-debugger-demo".to_string());
+
+        let root = build_visible_tree(
+            &taxonomy(),
+            &[fork.clone(), harness.clone()],
+            &[],
+            &HashMap::new(),
+            &expanded(&["root"]),
+            false,
+        );
+        let labels: Vec<&str> = root.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Fork (zed) · 1", "Harness (zed-debugger-demo) · 1"]
+        );
+
+        let open = build_visible_tree(
+            &taxonomy(),
+            &[fork, harness],
+            &[],
+            &HashMap::new(),
+            &expanded(&[
+                "root",
+                "project:zed",
+                "project:zed/cat:feature",
+                "project:zed/sub:feature/agent-core",
+            ]),
+            false,
+        );
+        let fork_plan = find(&open, "project:zed/plan:fork-plan").expect("fork plan");
+        assert_eq!(fork_plan.plan_id.as_deref(), Some("fork-plan"));
+        assert!(
+            find(&open, "project:zed-debugger-demo/plan:harness-plan").is_none(),
+            "harness plan lives under its own facet"
+        );
     }
 
     #[test]
@@ -2435,8 +2603,9 @@ mod tests {
         let mut expanded = HashSet::new();
         expand_path_to_plan(&mut expanded, &taxonomy(), &plans, &[], "p1");
         assert!(expanded.contains("root"));
-        assert!(expanded.contains("cat:feature"));
-        assert!(expanded.contains("sub:feature/agent-core"));
+        assert!(expanded.contains("project:zed"));
+        assert!(expanded.contains("project:zed/cat:feature"));
+        assert!(expanded.contains("project:zed/sub:feature/agent-core"));
     }
 
     #[test]
@@ -2452,9 +2621,10 @@ mod tests {
         let mut expanded = HashSet::new();
         expand_path_to_plan(&mut expanded, &taxonomy(), &plans, &parents, "slice");
         assert!(expanded.contains("root"));
-        assert!(expanded.contains("cat:feature"));
-        assert!(expanded.contains("sub:feature/agent-core"));
-        assert!(expanded.contains("plan:parent"));
-        assert!(expanded.contains("slices:parent"));
+        assert!(expanded.contains("project:zed"));
+        assert!(expanded.contains("project:zed/cat:feature"));
+        assert!(expanded.contains("project:zed/sub:feature/agent-core"));
+        assert!(expanded.contains("project:zed/plan:parent"));
+        assert!(expanded.contains("project:zed/slices:parent"));
     }
 }
