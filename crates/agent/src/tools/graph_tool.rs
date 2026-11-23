@@ -335,19 +335,20 @@ fn load_state(path: &Path) -> Result<GraphState, GraphToolOutput> {
 
 fn save_state(path: &Path, state: &GraphState) -> Result<(), GraphToolOutput> {
     plan_flow::save_state(path, state).map_err(|error| GraphToolOutput::Error { error })?;
-    persist_to_store(state);
+    persist_to_store(state, path);
     Ok(())
 }
 
 /// Project the in-memory graph state into the store's snapshot shape. This is
 /// the state-of-record write: co-persisted at save time from the same
 /// `GraphState` that writes `progress.json`, never re-ingested from it later.
-fn graph_snapshot(state: &GraphState) -> plan_store::GraphSnapshot {
+fn graph_snapshot(state: &GraphState, path: &Path) -> plan_store::GraphSnapshot {
     plan_store::GraphSnapshot {
         plan_id: state.plan.clone(),
         name: state.plan.clone(),
         repo: Some(state.repo.clone()),
         current_node: state.current.clone(),
+        path: Some(path.to_string_lossy().into_owned()),
         active_node: state.active.as_ref().map(|active| active.node.clone()),
         holder: state.active.as_ref().map(|active| active.executor.clone()),
         heartbeat: state.active.as_ref().map(|active| {
@@ -380,8 +381,8 @@ fn graph_snapshot(state: &GraphState) -> plan_store::GraphSnapshot {
 /// remains the hard truth for the traversal, so a store write failure must not
 /// fail the graph operation — it is logged and the next save retries.
 #[cfg(not(test))]
-fn persist_to_store(state: &GraphState) {
-    let snapshot = graph_snapshot(state);
+fn persist_to_store(state: &GraphState, path: &Path) {
+    let snapshot = graph_snapshot(state, path);
     let debugger_scoped = state.scope.as_deref() == Some(DEBUGGER_SCOPE);
     if let Err(error) = (|| -> Result<()> {
         let store = plan_store::PlanStore::open_default()?;
@@ -394,7 +395,7 @@ fn persist_to_store(state: &GraphState) {
 }
 
 #[cfg(test)]
-fn persist_to_store(_state: &GraphState) {}
+fn persist_to_store(_state: &GraphState, _path: &Path) {}
 
 fn state_json(state: &GraphState) -> String {
     serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string())
@@ -1703,10 +1704,11 @@ mod tests {
         step(&mut state, "plan");
         step(&mut state, "promote");
 
-        let snapshot = graph_snapshot(&state);
+        let snapshot = graph_snapshot(&state, Path::new("progress.json"));
         assert_eq!(snapshot.plan_id, "TRIVIAL");
         assert_eq!(snapshot.name, "TRIVIAL");
         assert_eq!(snapshot.repo.as_deref(), Some("zed"));
+        assert_eq!(snapshot.path.as_deref(), Some("progress.json"));
         assert_eq!(snapshot.done_nodes, vec!["plan", "promote"]);
         assert_eq!(snapshot.spent_tokens, spent_tokens(&state));
 

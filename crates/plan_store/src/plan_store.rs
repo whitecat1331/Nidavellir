@@ -216,6 +216,7 @@ pub struct GraphSnapshot {
     pub name: String,
     pub repo: Option<String>,
     pub current_node: Option<String>,
+    pub path: Option<String>,
     pub active_node: Option<String>,
     pub holder: Option<String>,
     pub heartbeat: Option<String>,
@@ -268,6 +269,7 @@ impl PlanStore {
                 stage TEXT,
                 status TEXT,
                 current_node TEXT,
+                path TEXT,
                 active_node TEXT,
                 holder TEXT,
                 heartbeat TEXT,
@@ -384,6 +386,9 @@ impl PlanStore {
         }
         if !columns.contains("detail") {
             connection.exec("ALTER TABLE plans ADD COLUMN detail TEXT")?()?;
+        }
+        if !columns.contains("path") {
+            connection.exec("ALTER TABLE plans ADD COLUMN path TEXT")?()?;
         }
         Ok(())
     }
@@ -868,6 +873,17 @@ impl PlanStore {
         Ok(rows.into_iter().next().unwrap_or(false))
     }
 
+    /// The filesystem path to the plan's `progress.json` (the graph tool's
+    /// `plan_path`). `None` for a plan the graph tool has not yet driven.
+    pub fn plan_path(&self, plan_id: &str) -> Result<Option<String>> {
+        let plan_id = normalize_plan_id(plan_id);
+        let mut select = self.connection.select_bound::<String, Option<String>>(indoc! {"
+                SELECT path FROM plans WHERE id = ?1
+            "})?;
+        let rows = select(plan_id)?;
+        Ok(rows.into_iter().next().flatten())
+    }
+
     // ---- write API (the state-of-record) ----
 
     /// Apply the graph tool's state at save time: plan row + done nodes +
@@ -876,6 +892,7 @@ impl PlanStore {
     pub fn apply_graph_snapshot(&self, snapshot: &GraphSnapshot) -> Result<()> {
         let plan_id = normalize_plan_id(&snapshot.plan_id);
         self.upsert_plan(&plan_id, snapshot)?;
+        self.set_plan_path(&plan_id, snapshot.path.as_deref())?;
         self.replace_plan_nodes(&plan_id, &snapshot.done_nodes)?;
         for evidence in &snapshot.evidence {
             self.upsert_evidence(&plan_id, evidence)?;
@@ -897,6 +914,19 @@ impl PlanStore {
             UPDATE plans SET debugger_scoped = ?1, updated_at = ?2 WHERE id = ?3
         "})?;
         update((scoped, now, plan_id))
+    }
+
+    /// Set the plan's `progress.json` path. The graph tool calls this as part of
+    /// `apply_graph_snapshot`, so the path rides the same state-of-record write.
+    pub fn set_plan_path(&self, plan_id: &str, path: Option<&str>) -> Result<()> {
+        let plan_id = normalize_plan_id(plan_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut update = self
+            .connection
+            .exec_bound::<(Option<String>, String, String)>(indoc! {"
+            UPDATE plans SET path = ?1, updated_at = ?2 WHERE id = ?3
+        "})?;
+        update((path.map(|value| value.to_string()), now, plan_id))
     }
 
     fn upsert_plan(&self, plan_id: &str, snapshot: &GraphSnapshot) -> Result<()> {
@@ -1178,6 +1208,7 @@ mod tests {
             name: name.to_string(),
             repo: Some("zed".to_string()),
             current_node: Some(current.to_string()),
+            path: None,
             active_node: None,
             holder: None,
             heartbeat: None,

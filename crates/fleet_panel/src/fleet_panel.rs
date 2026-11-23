@@ -479,6 +479,7 @@ mod tests {
             name: name.to_string(),
             repo: Some("zed".to_string()),
             current_node: current.map(|s| s.to_string()),
+            path: None,
             active_node: active.map(|s| s.to_string()),
             holder: None,
             heartbeat: heartbeat.map(|s| s.to_string()),

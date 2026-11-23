@@ -801,6 +801,7 @@ struct PageData {
     stage: Option<String>,
     status: Option<String>,
     current_node: Option<String>,
+    path: Option<String>,
     lifecycle: Lifecycle,
     summary: Option<String>,
     detail: Option<String>,
@@ -830,6 +831,7 @@ pub struct PlanGraph {
     conversation_view: Option<Entity<agent_ui::ConversationView>>,
     coordinator_view: Option<Entity<agent_ui::ConversationView>>,
     driver_started: bool,
+    threads: Vec<agent::DbThreadMetadata>,
 }
 
 impl PlanGraph {
@@ -857,6 +859,7 @@ impl PlanGraph {
             conversation_view: None,
             coordinator_view: None,
             driver_started: false,
+            threads: Vec::new(),
         };
         graph.refresh();
         graph.ensure_coordinator_view(window, cx);
@@ -931,6 +934,7 @@ impl PlanGraph {
         );
         self.page_stack.push(plan_id.to_string());
         self.load_page(plan_id);
+        self.refresh_threads(cx);
         self.conversation_view = None;
         self.driver_started = false;
         self.ensure_conversation_view(None, false, window, cx);
@@ -942,6 +946,7 @@ impl PlanGraph {
         match self.page_stack.last().cloned() {
             Some(plan_id) => {
                 self.load_page(&plan_id);
+                self.refresh_threads(cx);
                 self.conversation_view = None;
                 self.driver_started = false;
                 self.ensure_conversation_view(None, false, window, cx);
@@ -1016,6 +1021,7 @@ impl PlanGraph {
             stage: plan.stage.clone(),
             status: plan.status.clone(),
             current_node: plan.current_node.clone(),
+            path: store.plan_path(plan_id).unwrap_or(None),
             lifecycle: plan.lifecycle(),
             summary: plan.summary.clone(),
             detail: plan.detail,
@@ -1030,6 +1036,23 @@ impl PlanGraph {
 
     fn current_plan_id(&self) -> Option<String> {
         self.page.as_ref().map(|page| page.id.clone())
+    }
+
+    fn refresh_threads(&mut self, cx: &mut Context<Self>) {
+        let Some(plan_path) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.path.clone().or_else(|| Some(page.id.clone())))
+        else {
+            self.threads.clear();
+            return;
+        };
+        let thread_store = agent::ThreadStore::global(cx);
+        self.threads = thread_store
+            .read(cx)
+            .entries()
+            .filter(|thread| thread.plan_path == Some(plan_path.clone()))
+            .collect();
     }
 
     fn ensure_conversation_view(
@@ -1078,6 +1101,11 @@ impl PlanGraph {
         // The native thread only exists once the connection establishes. Apply
         // the plan link (and the driver marker) on the first update that exposes
         // it, so this embedded thread is plan-scoped and resumable.
+        let plan_path = self
+            .page
+            .as_ref()
+            .and_then(|page| page.path.clone())
+            .or_else(|| Some(plan_id.clone()));
         let applied = Cell::new(false);
         cx.observe(&conversation_view, move |_this, view, cx| {
             if applied.get() {
@@ -1087,7 +1115,7 @@ impl PlanGraph {
                 return;
             };
             native_thread.update(cx, |thread, cx| {
-                thread.set_plan_path(Some(plan_id.clone()), cx);
+                thread.set_plan_path(plan_path.clone(), cx);
                 if is_driver {
                     thread.set_driver(true, cx);
                 }
@@ -1186,12 +1214,7 @@ impl PlanGraph {
                 None,
                 None,
                 None,
-                Some(agent_ui::AgentInitialContent::ContentBlock {
-                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                        Self::coordinator_brief(),
-                    ))],
-                    auto_submit: true,
-                }),
+                None,
                 workspace_handle,
                 project,
                 Some(thread_store),
@@ -1201,15 +1224,6 @@ impl PlanGraph {
             )
         });
         self.coordinator_view = Some(coordinator_view);
-    }
-
-    fn coordinator_brief() -> String {
-        "You are the plan coordinator (plan-manager) for this workspace's plans. \
-         Create new plans, maintain coherence between plans, and enforce plan integrity \
-         — every plan has the required information. You may implement, but your real job is \
-         plan management. Use the `graph` tool to inspect and coordinate the plans in the \
-         plans namespace."
-            .to_string()
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -1770,6 +1784,27 @@ impl PlanGraph {
                             })
                             .into_any_element(),
                     ))
+                    .when(!self.threads.is_empty(), |this| {
+                        this.child(section(
+                            "Threads",
+                            v_flex()
+                                .gap_1()
+                                .children(self.threads.iter().map(|thread| {
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            Label::new(thread.title.clone())
+                                                .size(LabelSize::Small),
+                                        )
+                                        .when(thread.driver, |this| {
+                                            this.child(badge("driver", Color::Accent, cx))
+                                        })
+                                        .into_any_element()
+                                }))
+                                .into_any_element(),
+                        ))
+                    })
             )
             .into_any_element()
     }
@@ -2193,6 +2228,7 @@ mod tests {
             name: name.to_string(),
             repo: Some("zed".to_string()),
             current_node: Some(current.to_string()),
+            path: None,
             active_node: None,
             holder: None,
             heartbeat: None,
