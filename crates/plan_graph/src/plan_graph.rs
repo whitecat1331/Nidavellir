@@ -2197,7 +2197,10 @@ mod tests {
         let bug = find(&root, "project:zed/cat:bug").expect("bug category");
         assert_eq!(feature.children.len(), 1);
         assert!(bug.children.is_empty(), "siblings stay collapsed");
-        assert_eq!(feature.children[0].key, "project:zed/sub:feature/agent-core");
+        assert_eq!(
+            feature.children[0].key,
+            "project:zed/sub:feature/agent-core"
+        );
     }
 
     #[test]
