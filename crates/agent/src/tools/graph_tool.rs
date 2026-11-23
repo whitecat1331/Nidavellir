@@ -271,13 +271,12 @@ pub fn plan_state_banner(path: Option<&str>) -> Option<String> {
         // Degrade, don't vanish: a recorded-but-unreadable plan still tells the
         // agent to consult the graph instead of silently dropping the banner.
         Err(_) => {
-            return Some(
+            return Some(format!(
                 "## Plan state (forced)\n\n\
-                 You are executing a plan through the dev-flow graph, but the plan's \
-                 `progress.json` could not be read. Run `graph read` on it before making \
-                 any change."
-                    .to_string(),
-            );
+                 You are linked to the plan at {path} through the dev-flow graph, but its \
+                 progress.json could not be read. Run graph read on it before making any \
+                 change."
+            ));
         }
     };
     let done: Vec<String> = state.done.iter().map(|entry| entry.node.clone()).collect();
