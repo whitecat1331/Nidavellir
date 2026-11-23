@@ -1917,6 +1917,7 @@ impl PlanGraph {
                             .children(self.threads.iter().map(|thread| {
                                 let session_id = thread.id.clone();
                                 h_flex()
+                                    .id(ElementId::Name(format!("plan-thread:{}", thread.id).into()))
                                     .gap_2()
                                     .items_center()
                                     .cursor_pointer()
