@@ -1996,20 +1996,11 @@ impl PlanGraph {
                                                 .child(
                                                     Button::new("plan-amend-reject", "Reject")
                                                         .label_size(LabelSize::Small)
-                                                        .on_click({
-                                                            let id = id.clone();
-                                                            cx.listener(
-                                                                move |this,
-                                                                      _: &ClickEvent,
-                                                                      _,
-                                                                      cx| {
-                                                                    this.reject_amendment(
-                                                                        id.clone(),
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            )
-                                                        }),
+                                                        .on_click(cx.listener(
+                                                            move |this, _: &ClickEvent, _, cx| {
+                                                                this.reject_amendment(id.clone(), cx);
+                                                            },
+                                                        )),
                                                 ),
                                         )
                                         .into_any_element()
