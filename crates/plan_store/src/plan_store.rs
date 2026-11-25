@@ -1421,6 +1421,32 @@ mod tests {
     }
 
     #[test]
+    fn amendments_round_trip_and_status() {
+        let store = store();
+        store
+            .upsert_amendment(&AmendmentRow {
+                id: "amend-1".to_string(),
+                plan_id: "PLAN_A".to_string(),
+                reason: "add a missing step".to_string(),
+                old_text: "old".to_string(),
+                new_text: "new".to_string(),
+                status: "pending".to_string(),
+            })
+            .unwrap();
+
+        let amendments = store.amendments("PLAN_A").unwrap();
+        assert_eq!(amendments.len(), 1);
+        assert_eq!(amendments[0].reason, "add a missing step");
+        assert_eq!(amendments[0].old_text, "old");
+        assert_eq!(amendments[0].new_text, "new");
+        assert_eq!(amendments[0].status, "pending");
+
+        store.set_amendment_status("amend-1", "accepted").unwrap();
+        let amendments = store.amendments("PLAN_A").unwrap();
+        assert_eq!(amendments[0].status, "accepted");
+    }
+
+    #[test]
     fn claims_round_trip() {
         let store = store();
         store

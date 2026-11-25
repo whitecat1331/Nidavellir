@@ -2593,6 +2593,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plan_markdown_path_derives_from_a_progress_path() {
+        assert_eq!(
+            plan_markdown_path(
+                "/home/me/plans/in-progress-plans/PLAN_OF_ACTION-2026-11-19-x.progress.json"
+            ),
+            Some(PathBuf::from(
+                "/home/me/plans/in-progress-plans/PLAN_OF_ACTION-2026-11-19-x.md"
+            ))
+        );
+        assert_eq!(
+            plan_markdown_path("/tmp/scratch.json"),
+            Some(PathBuf::from("/tmp/scratch.md"))
+        );
+        assert_eq!(plan_markdown_path("no-suffix"), None);
+    }
+
     fn row(id: &str, current: &str, spent: u64) -> FleetPlanRow {
         FleetPlanRow {
             id: id.to_string(),
