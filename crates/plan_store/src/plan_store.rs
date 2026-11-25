@@ -401,9 +401,9 @@ impl PlanStore {
         )?;
         let columns: HashSet<String> = select()?.into_iter().map(|(_, name, ..)| name).collect();
         if !columns.contains("debugger_scoped") {
-            connection.exec(
-                "ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0",
-            )?()?;
+            connection
+                .exec("ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0")?(
+            )?;
         }
         if !columns.contains("summary") {
             connection.exec("ALTER TABLE plans ADD COLUMN summary TEXT")?()?;
@@ -901,7 +901,9 @@ impl PlanStore {
     /// `plan_path`). `None` for a plan the graph tool has not yet driven.
     pub fn plan_path(&self, plan_id: &str) -> Result<Option<String>> {
         let plan_id = normalize_plan_id(plan_id);
-        let mut select = self.connection.select_bound::<String, Option<String>>(indoc! {"
+        let mut select = self
+            .connection
+            .select_bound::<String, Option<String>>(indoc! {"
                 SELECT path FROM plans WHERE id = ?1
             "})?;
         let rows = select(plan_id)?;
@@ -912,14 +914,9 @@ impl PlanStore {
     /// first so the operator reviews them in the order the driver proposed them.
     pub fn amendments(&self, plan_id: &str) -> Result<Vec<AmendmentRow>> {
         let plan_id = normalize_plan_id(plan_id);
-        let mut select = self.connection.select_bound::<String, (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )>(indoc! {"
+        let mut select = self
+            .connection
+            .select_bound::<String, (String, String, String, String, String, String)>(indoc! {"
             SELECT id, plan_id, reason, old_text, new_text, status
             FROM amendments WHERE plan_id = ?1 ORDER BY rowid
         "})?;
@@ -941,15 +938,9 @@ impl PlanStore {
 
     pub fn upsert_amendment(&self, amendment: &AmendmentRow) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let mut upsert = self.connection.exec_bound::<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )>(indoc! {"
+        let mut upsert = self
+            .connection
+            .exec_bound::<(String, String, String, String, String, String, String)>(indoc! {"
             INSERT INTO amendments (id, plan_id, reason, old_text, new_text, status, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(id) DO UPDATE SET
@@ -972,7 +963,9 @@ impl PlanStore {
 
     pub fn set_amendment_status(&self, id: &str, status: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let mut update = self.connection.exec_bound::<(String, String, String)>(indoc! {"
+        let mut update = self
+            .connection
+            .exec_bound::<(String, String, String)>(indoc! {"
             UPDATE amendments SET status = ?1, created_at = ?2 WHERE id = ?3
         "})?;
         update((status.to_string(), now, id.to_string()))
