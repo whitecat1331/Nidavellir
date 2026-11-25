@@ -549,7 +549,11 @@ fn run_operation(
             })?;
             let plan_id = plan_id_from_progress_path(&path);
             let id = format!("amend-{plan_id}-{}", Utc::now().timestamp_micros());
-            let store = plan_store::PlanStore::open_default();
+            let store = plan_store::PlanStore::open_default().map_err(|error| {
+                GraphToolOutput::Error {
+                    error: format!("failed to open plan store: {error:#}"),
+                }
+            })?;
             store
                 .upsert_amendment(&plan_store::AmendmentRow {
                     id,
