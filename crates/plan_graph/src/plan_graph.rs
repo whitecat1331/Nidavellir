@@ -1925,7 +1925,9 @@ impl PlanGraph {
                                     )
                                     .child(
                                         Button::new("plan-new-thread", "New thread")
+                                            .style(ButtonStyle::Outlined)
                                             .label_size(LabelSize::Small)
+                                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.new_thread_in_chat(window, cx);
