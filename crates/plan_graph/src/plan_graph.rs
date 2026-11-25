@@ -1251,6 +1251,13 @@ impl PlanGraph {
         cx.notify();
     }
 
+    fn new_thread_in_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversation_view = None;
+        self.driver_started = false;
+        self.ensure_conversation_view(None, false, None, window, cx);
+        cx.notify();
+    }
+
     fn start_driver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(plan_id) = self.current_plan_id() else {
             return;
@@ -1903,42 +1910,66 @@ impl PlanGraph {
                             })
                             .into_any_element(),
                     ))
-                    .child(section(
-                        "Threads",
+                    .child(
                         v_flex()
-                            .gap_1()
-                            .when(self.threads.is_empty(), |this| {
-                                this.child(
-                                    Label::new("No threads linked to this plan yet.")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                            })
-                            .children(self.threads.iter().map(|thread| {
-                                let session_id = thread.id.clone();
+                            .w_full()
+                            .gap_3()
+                            .child(
                                 h_flex()
-                                    .id(ElementId::Name(format!("plan-thread:{}", thread.id).into()))
-                                    .gap_2()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .rounded_md()
-                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.open_thread_in_chat(session_id.clone(), window, cx);
-                                        },
-                                    ))
+                                    .w_full()
+                                    .justify_between()
                                     .child(
-                                        Label::new(thread.title.clone())
-                                            .size(LabelSize::Small),
+                                        Label::new("Threads".to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
                                     )
-                                    .when(thread.driver, |this| {
-                                        this.child(badge("driver", Color::Accent, cx))
+                                    .child(
+                                        Button::new("plan-new-thread", "New thread")
+                                            .label_size(LabelSize::Small)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.new_thread_in_chat(window, cx);
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .when(self.threads.is_empty(), |this| {
+                                        this.child(
+                                            Label::new("No threads linked to this plan yet.")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
                                     })
-                                    .into_any_element()
-                            }))
+                                    .children(self.threads.iter().map(|thread| {
+                                        let session_id = thread.id.clone();
+                                        h_flex()
+                                            .id(ElementId::Name(format!("plan-thread:{}", thread.id).into()))
+                                            .gap_2()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, window, cx| {
+                                                    this.open_thread_in_chat(session_id.clone(), window, cx);
+                                                },
+                                            ))
+                                            .child(
+                                                Label::new(thread.title.clone())
+                                                    .size(LabelSize::Small),
+                                            )
+                                            .when(thread.driver, |this| {
+                                                this.child(badge("driver", Color::Accent, cx))
+                                            })
+                                            .into_any_element()
+                                    }))
+                                    .into_any_element(),
+                            )
                             .into_any_element(),
-                    ))
+                    )
             )
             .into_any_element()
     }
