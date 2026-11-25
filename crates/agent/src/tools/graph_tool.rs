@@ -34,6 +34,9 @@ pub enum GraphOperation {
     /// Clear a recorded blocker. A stop is resumable only through this explicit
     /// operation; the automatic loop never resumes itself.
     Resume,
+    /// Propose an edit to the plan file as a pending amendment the operator
+    /// accepts or rejects (Phase J / D17); never edits the plan file directly.
+    ProposeAmendment,
 }
 
 /// Read, advance, and coordinate a plan's dev-flow progress state.
@@ -116,6 +119,15 @@ pub struct GraphToolInput {
     /// conditional `stage→…→fix` sub-graph (1.29 D8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// For propose_amendment: why the plan should change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// For propose_amendment: the exact text to replace in the plan file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    /// For propose_amendment: the replacement text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,6 +205,7 @@ impl AgentTool for GraphTool {
                 GraphOperation::Heartbeat => "Recording dev-flow activity".into(),
                 GraphOperation::Coordinate => "Computing the next dev-flow decision".into(),
                 GraphOperation::Resume => "Resuming a stopped dev-flow plan".into(),
+                GraphOperation::ProposeAmendment => "Proposing a plan amendment".into(),
             },
             Err(_) => "Dev-flow graph".into(),
         }
@@ -401,6 +414,18 @@ fn state_json(state: &GraphState) -> String {
     serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string())
 }
 
+fn plan_id_from_progress_path(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let mut stem = name;
+    for suffix in [".json", ".progress", ".md"] {
+        stem = stem.strip_suffix(suffix).unwrap_or(stem);
+    }
+    stem.to_ascii_lowercase().replace('_', "-")
+}
+
 fn run_operation(
     input: GraphToolInput,
     path: PathBuf,
@@ -510,6 +535,36 @@ fn run_operation(
             save_state(&path, &state)?;
             Ok(GraphToolOutput::Success {
                 message: format!("{message}\nstate: {}", state_json(&state)),
+            })
+        }
+        GraphOperation::ProposeAmendment => {
+            let reason = input.reason.ok_or_else(|| GraphToolOutput::Error {
+                error: "reason is required for propose_amendment".to_string(),
+            })?;
+            let old_text = input.old_text.ok_or_else(|| GraphToolOutput::Error {
+                error: "old_text is required for propose_amendment".to_string(),
+            })?;
+            let new_text = input.new_text.ok_or_else(|| GraphToolOutput::Error {
+                error: "new_text is required for propose_amendment".to_string(),
+            })?;
+            let plan_id = plan_id_from_progress_path(&path);
+            let id = format!("amend-{plan_id}-{}", Utc::now().timestamp_micros());
+            let store = plan_store::PlanStore::open_default();
+            store
+                .upsert_amendment(&plan_store::AmendmentRow {
+                    id,
+                    plan_id,
+                    reason,
+                    old_text,
+                    new_text,
+                    status: "pending".to_string(),
+                })
+                .map_err(|error| GraphToolOutput::Error {
+                    error: format!("failed to record amendment: {error:#}"),
+                })?;
+            Ok(GraphToolOutput::Success {
+                message: "Amendment proposed; it awaits operator accept/reject on the plan page."
+                    .to_string(),
             })
         }
     }

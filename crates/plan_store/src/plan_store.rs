@@ -226,6 +226,19 @@ pub struct GraphSnapshot {
     pub evidence: Vec<EvidenceRow>,
 }
 
+/// A proposed edit to a plan file, emitted by the plan's driver and awaiting an
+/// operator accept/reject (Phase J / D17). `old_text` to `new_text` is the exact
+/// replacement; `status` is `pending` until the operator accepts or rejects it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmendmentRow {
+    pub id: String,
+    pub plan_id: String,
+    pub reason: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub status: String,
+}
+
 pub struct PlanStore {
     connection: Connection,
 }
@@ -346,6 +359,17 @@ impl PlanStore {
                 parent_id TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'parent',
                 updated_at TEXT NOT NULL
+            )
+        "})?()?;
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS amendments (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                old_text TEXT NOT NULL,
+                new_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
             )
         "})?()?;
         Ok(())
@@ -882,6 +906,76 @@ impl PlanStore {
             "})?;
         let rows = select(plan_id)?;
         Ok(rows.into_iter().next().flatten())
+    }
+
+    /// Pending/accepted/rejected amendments for a plan (Phase J / D17), oldest
+    /// first so the operator reviews them in the order the driver proposed them.
+    pub fn amendments(&self, plan_id: &str) -> Result<Vec<AmendmentRow>> {
+        let plan_id = normalize_plan_id(plan_id);
+        let mut select = self.connection.select_bound::<String, (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )>(indoc! {"
+            SELECT id, plan_id, reason, old_text, new_text, status
+            FROM amendments WHERE plan_id = ?1 ORDER BY rowid
+        "})?;
+        let rows = select(plan_id)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, plan_id, reason, old_text, new_text, status)| AmendmentRow {
+                    id,
+                    plan_id,
+                    reason,
+                    old_text,
+                    new_text,
+                    status,
+                },
+            )
+            .collect())
+    }
+
+    pub fn upsert_amendment(&self, amendment: &AmendmentRow) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut upsert = self.connection.exec_bound::<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )>(indoc! {"
+            INSERT INTO amendments (id, plan_id, reason, old_text, new_text, status, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                reason = excluded.reason,
+                old_text = excluded.old_text,
+                new_text = excluded.new_text,
+                status = excluded.status,
+                created_at = excluded.created_at
+        "})?;
+        upsert((
+            amendment.id.clone(),
+            normalize_plan_id(&amendment.plan_id),
+            amendment.reason.clone(),
+            amendment.old_text.clone(),
+            amendment.new_text.clone(),
+            amendment.status.clone(),
+            now,
+        ))
+    }
+
+    pub fn set_amendment_status(&self, id: &str, status: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut update = self.connection.exec_bound::<(String, String, String)>(indoc! {"
+            UPDATE amendments SET status = ?1, created_at = ?2 WHERE id = ?3
+        "})?;
+        update((status.to_string(), now, id.to_string()))
     }
 
     // ---- write API (the state-of-record) ----

@@ -10,6 +10,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
@@ -22,8 +23,8 @@ use gpui::{
 use notifications::status_toast::StatusToast;
 use plan_flow::{Attempt, DoneEntry, GraphState, ROUTE, STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{
-    CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
-    PlanStore,
+    AmendmentRow, CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle,
+    PlanParentRow, PlanStore,
 };
 use project::Project;
 use schemars::JsonSchema;
@@ -816,6 +817,16 @@ fn build_history_node(
 /// Strip directories and plan-file suffixes from a thread's `plan_path` and
 /// normalize it to the store's plan id, so a graph-tool tag and a plan-page tag
 /// match the same plan.
+fn plan_markdown_path(progress_path: &str) -> Option<PathBuf> {
+    let path = Path::new(progress_path);
+    let file = path.file_name()?.to_str()?;
+    let stem = file
+        .strip_suffix(".progress.json")
+        .or_else(|| file.strip_suffix(".progress"))
+        .or_else(|| file.strip_suffix(".json"))?;
+    Some(path.with_file_name(format!("{stem}.md")))
+}
+
 pub fn plan_id_from_path(path: &str) -> String {
     let name = path
         .rsplit(|c| c == '/' || c == '\\')
@@ -925,6 +936,7 @@ pub struct PlanGraph {
     coordinator_view: Option<Entity<agent_ui::ConversationView>>,
     driver_started: bool,
     threads: Vec<agent::DbThreadMetadata>,
+    amendments: Vec<AmendmentRow>,
 }
 
 impl PlanGraph {
@@ -953,6 +965,7 @@ impl PlanGraph {
             coordinator_view: None,
             driver_started: false,
             threads: Vec::new(),
+            amendments: Vec::new(),
         };
         // Keep this plan's thread history current: a chat turn creates or
         // updates a thread whose plan_path links it here, and the thread store
@@ -1039,6 +1052,7 @@ impl PlanGraph {
         self.page_stack.push(plan_id.to_string());
         self.load_page(plan_id);
         self.refresh_threads(cx);
+        self.refresh_amendments();
         self.conversation_view = None;
         self.driver_started = false;
         self.ensure_conversation_view(None, false, None, window, cx);
@@ -1051,6 +1065,7 @@ impl PlanGraph {
             Some(plan_id) => {
                 self.load_page(&plan_id);
                 self.refresh_threads(cx);
+                self.refresh_amendments();
                 self.conversation_view = None;
                 self.driver_started = false;
                 self.ensure_conversation_view(None, false, None, window, cx);
@@ -1157,6 +1172,60 @@ impl PlanGraph {
             .entries()
             .filter(|thread| thread.plan_path == Some(plan_path.clone()))
             .collect();
+    }
+
+    fn refresh_amendments(&mut self) {
+        let Some(plan_id) = self.current_plan_id() else {
+            self.amendments.clear();
+            return;
+        };
+        let store = Self::open_store();
+        self.amendments = store
+            .amendments(&plan_id)
+            .unwrap_or_else(|error| {
+                log::error!("[GRAPH] failed to read amendments: {error:#}");
+                Vec::new()
+            })
+            .into_iter()
+            .filter(|amendment| amendment.status == "pending")
+            .collect();
+    }
+
+    fn accept_amendment(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(progress_path) = self.page.as_ref().and_then(|page| page.path.clone()) else {
+            return;
+        };
+        let Some(markdown_path) = plan_markdown_path(&progress_path) else {
+            return;
+        };
+        let Some(amendment) = self.amendments.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let applied = std::fs::read_to_string(&markdown_path)
+            .ok()
+            .filter(|content| content.contains(&amendment.old_text))
+            .map(|content| {
+                let updated = content.replacen(&amendment.old_text, &amendment.new_text, 1);
+                std::fs::write(&markdown_path, updated).is_ok()
+            })
+            .unwrap_or(false);
+        if applied {
+            let store = Self::open_store();
+            if let Err(error) = store.set_amendment_status(&id, "accepted") {
+                log::error!("[GRAPH] failed to mark amendment accepted: {error:#}");
+            }
+        }
+        self.refresh_amendments();
+        cx.notify();
+    }
+
+    fn reject_amendment(&mut self, id: String, cx: &mut Context<Self>) {
+        let store = Self::open_store();
+        if let Err(error) = store.set_amendment_status(&id, "rejected") {
+            log::error!("[GRAPH] failed to mark amendment rejected: {error:#}");
+        }
+        self.refresh_amendments();
+        cx.notify();
     }
 
     fn ensure_conversation_view(
@@ -1872,6 +1941,82 @@ impl PlanGraph {
                             .child(Label::new(summary).color(Color::Default))
                             .into_any_element(),
                     ))
+                    .when(!self.amendments.is_empty(), |this| {
+                        this.child(section(
+                            "Amendments",
+                            v_flex()
+                                .gap_2()
+                                .children(self.amendments.iter().map(|amendment| {
+                                    let id = amendment.id.clone();
+                                    v_flex()
+                                        .gap_2()
+                                        .p_2()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .rounded_md()
+                                        .child(
+                                            Label::new(amendment.reason.clone())
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Label::new(amendment.old_text.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(amendment.new_text.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Accent),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(
+                                                    Button::new("plan-amend-accept", "Accept")
+                                                        .label_size(LabelSize::Small)
+                                                        .on_click({
+                                                            let id = id.clone();
+                                                            cx.listener(
+                                                                move |this,
+                                                                      _: &ClickEvent,
+                                                                      _,
+                                                                      cx| {
+                                                                    this.accept_amendment(
+                                                                        id.clone(),
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )
+                                                        }),
+                                                )
+                                                .child(
+                                                    Button::new("plan-amend-reject", "Reject")
+                                                        .label_size(LabelSize::Small)
+                                                        .on_click({
+                                                            let id = id.clone();
+                                                            cx.listener(
+                                                                move |this,
+                                                                      _: &ClickEvent,
+                                                                      _,
+                                                                      cx| {
+                                                                    this.reject_amendment(
+                                                                        id.clone(),
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )
+                                                        }),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                }))
+                                .into_any_element(),
+                        ))
+                    })
                     .when(has_relations, |this| {
                         this.child(section(
                             "Relationships",
