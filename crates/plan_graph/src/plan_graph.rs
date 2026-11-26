@@ -531,6 +531,7 @@ fn plan_label(plan: &CategorizedPlanRow) -> String {
 /// `name`, `id`, `status`, `current_node`, and `summary`. An empty query
 /// matches everything (current behavior).
 fn plan_matches_query(plan: &CategorizedPlanRow, query: &str) -> bool {
+    let query = query.to_lowercase();
     if query.is_empty() {
         return true;
     }
@@ -542,7 +543,7 @@ fn plan_matches_query(plan: &CategorizedPlanRow, query: &str) -> bool {
         plan.summary.as_deref().unwrap_or(""),
     ]
     .iter()
-    .any(|haystack| haystack.to_lowercase().contains(query))
+    .any(|haystack| haystack.to_lowercase().contains(query.as_str()))
 }
 
 fn plan_state(plan: &CategorizedPlanRow, fleet: Option<&FleetPlanRow>) -> NodeState {
