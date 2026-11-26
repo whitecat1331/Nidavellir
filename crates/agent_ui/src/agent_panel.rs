@@ -43,7 +43,9 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary, NewNativeAgentThreadFromTruncate,
@@ -1017,6 +1019,9 @@ pub struct CreateThreadOptions {
     /// sibling can't yank focus out from under an in-progress turn; the
     /// fork-and-continue paths set it so the user lands in the continuation.
     pub focus: bool,
+    /// Tag the new thread as executing this dev-flow plan. The plan page's
+    /// composer sets it so the plan-scoped thread sidebar can find the thread.
+    pub plan_path: Option<String>,
 }
 
 pub(crate) struct AgentThread {
@@ -3348,6 +3353,27 @@ impl AgentPanel {
         }
         let conversation_view = thread.conversation_view;
         let thread_id = conversation_view.read(cx).thread_id;
+        if let Some(plan_path) = options.plan_path {
+            if let Some(native_thread) = conversation_view.read(cx).as_native_thread(cx) {
+                native_thread.update(cx, |thread, cx| {
+                    thread.set_plan_path(Some(plan_path.clone()), cx);
+                });
+            }
+            // Mirror the plan link into the sidebar metadata store now, so the
+            // thread's plan badge appears without waiting for a later
+            // conversation event (which may race thread creation).
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                if let Some(metadata) = store.entry(thread_id) {
+                    store.save(
+                        ThreadMetadata {
+                            plan_path: Some(plan_path),
+                            ..metadata.clone()
+                        },
+                        cx,
+                    );
+                }
+            });
+        }
         self.insert_retained_thread(thread_id, conversation_view.clone(), cx);
         if let Some(blocks) = seed_draft {
             crate::draft_prompt_store::write(thread_id, &blocks, cx).detach_and_log_err(cx);
@@ -5660,6 +5686,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 model: request.model.clone(),
                 work_dirs: None,
                 focus: request.focus,
+                plan_path: None,
             };
 
             // If the caller asked for a fresh worktree, open a new workspace
@@ -10696,6 +10723,8 @@ mod tests {
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         workspace_id: None,
+                        plan_path: None,
+                        driver: false,
                         remote_connection: None,
                         archived: false,
                     },
@@ -14188,6 +14217,7 @@ mod tests {
         let source_session_id = acp::SessionId::new("source-thread-session");
         let source_title: SharedString = "Source Thread Title".into();
         let db_thread = agent::DbThread {
+            driver: false,
             title: source_title.clone(),
             messages: Vec::new(),
             updated_at: Utc::now(),

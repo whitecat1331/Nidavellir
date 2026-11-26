@@ -154,6 +154,8 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         workspace_id: None,
+                        plan_path: None,
+                        driver: false,
                         remote_connection: None,
                         archived: true,
                     })
@@ -372,6 +374,12 @@ pub struct ThreadMetadata {
     /// Persisted so add/remove-folder keeps the thread under the same header
     /// even though its `folder_paths` change.
     pub workspace_id: Option<ManagedWorkspaceId>,
+    /// The dev-flow plan this thread is executing, if any. Mirrors
+    /// `agent::Thread::plan_path` so the sidebar can badge plan-linked threads.
+    pub plan_path: Option<String>,
+    /// Whether this thread is the plan's persistent driver thread. Mirrors
+    /// `agent::Thread::driver`.
+    pub driver: bool,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
 }
@@ -1620,6 +1628,17 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
+        let (plan_path, driver) = view
+            .as_native_thread(cx)
+            .map(|native| {
+                let native = native.read(cx);
+                (
+                    native.plan_path().map(|plan_path| plan_path.to_owned()),
+                    native.is_driver(),
+                )
+            })
+            .unwrap_or((None, false));
+
         let metadata = ThreadMetadata {
             thread_id,
             session_id,
@@ -1631,6 +1650,8 @@ impl ThreadMetadataStore {
             updated_at,
             worktree_paths,
             workspace_id,
+            plan_path,
+            driver,
             remote_connection,
             archived,
         };
@@ -1770,6 +1791,12 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN workspace_id TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN plan_path TEXT;
+        ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN driver INTEGER DEFAULT 0;
+        ),
     ];
 }
 
@@ -1786,7 +1813,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override, workspace_id \
+        main_worktree_paths_order, remote_connection, title_override, workspace_id, plan_path, driver \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1855,6 +1882,8 @@ impl ThreadMetadataDb {
             .context("serialize thread metadata remote connection")?;
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let workspace_id = row.workspace_id.map(|id| id.to_key_string());
+        let plan_path = row.plan_path.clone();
+        let driver = row.driver;
         let thread_id = row.thread_id;
         let archived = row.archived;
 
@@ -1873,8 +1902,8 @@ impl ThreadMetadataDb {
                 delete.exec()?;
             }
 
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, workspace_id) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, workspace_id, plan_path, driver) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1889,7 +1918,9 @@ impl ThreadMetadataDb {
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override, \
-                           workspace_id = COALESCE(excluded.workspace_id, sidebar_threads.workspace_id)";
+                           workspace_id = COALESCE(excluded.workspace_id, sidebar_threads.workspace_id), \
+                           plan_path = excluded.plan_path, \
+                           driver = excluded.driver";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1905,7 +1936,9 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&title_override, i)?;
-            stmt.bind(&workspace_id, i)?;
+            i = stmt.bind(&workspace_id, i)?;
+            i = stmt.bind(&plan_path, i)?;
+            stmt.bind(&driver, i)?;
             stmt.exec()
         })
         .await
@@ -2064,6 +2097,8 @@ impl Column for ThreadMetadata {
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (workspace_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (plan_path, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (driver, next): (bool, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -2132,6 +2167,8 @@ impl Column for ThreadMetadata {
                     .as_deref()
                     .map(ManagedWorkspaceId::from_key_string)
                     .transpose()?,
+                plan_path,
+                driver,
                 remote_connection,
                 archived,
             },
@@ -2182,6 +2219,7 @@ mod tests {
 
     fn make_db_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
+            driver: false,
             title: title.to_string().into(),
             messages: Vec::new(),
             updated_at,
@@ -2227,6 +2265,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             workspace_id: None,
+            plan_path: None,
+            driver: false,
             remote_connection: None,
         }
     }
@@ -2716,6 +2756,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             workspace_id: None,
+            plan_path: None,
+            driver: false,
             remote_connection: None,
             archived: false,
         };
@@ -2802,6 +2844,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             workspace_id: None,
+            plan_path: None,
+            driver: false,
             remote_connection: None,
             archived: false,
         };
@@ -2927,6 +2971,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             workspace_id: None,
+            plan_path: None,
+            driver: false,
             remote_connection: None,
             archived: false,
         };
@@ -3818,6 +3864,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
             workspace_id: None,
+            plan_path: None,
+            driver: false,
             remote_connection: None,
         };
 
@@ -3833,6 +3881,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
             workspace_id: None,
+            plan_path: None,
+            driver: false,
             remote_connection: Some(remote_a.clone()),
         };
 

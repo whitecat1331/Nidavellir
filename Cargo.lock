@@ -284,6 +284,7 @@ dependencies = [
  "lsp",
  "parking_lot",
  "paths",
+ "plan_flow",
  "plan_store",
  "pretty_assertions",
  "project",
@@ -6515,6 +6516,7 @@ dependencies = [
  "chrono",
  "gpui",
  "log",
+ "plan_flow",
  "plan_store",
  "serde",
  "serde_json",
@@ -13534,6 +13536,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plan_flow"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "plan_graph"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "agent-client-protocol",
+ "agent_ui",
+ "chrono",
+ "editor",
+ "fs",
+ "gpui",
+ "log",
+ "notifications",
+ "plan_flow",
+ "plan_store",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "plan_store"
 version = "0.1.0"
 dependencies = [
@@ -13543,17 +13577,6 @@ dependencies = [
  "paths",
  "sqlez",
  "zed_env_vars",
-]
-
-[[package]]
-name = "plan_view"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui",
- "plan_store",
- "ui",
- "workspace",
 ]
 
 [[package]]
@@ -15410,18 +15433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roadmap_panel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui",
- "log",
- "plan_store",
- "ui",
- "workspace",
-]
-
-[[package]]
 name = "rodio"
 version = "0.21.1"
 source = "git+https://github.com/RustAudio/rodio?rev=e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a#e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a"
@@ -16756,6 +16767,7 @@ dependencies = [
  "menu",
  "node_runtime",
  "notifications",
+ "plan_graph",
  "platform_title_bar",
  "pretty_assertions",
  "project",
@@ -22820,7 +22832,7 @@ dependencies = [
  "paths",
  "picker",
  "pkg-config",
- "plan_view",
+ "plan_graph",
  "pretty_assertions",
  "profiling",
  "project",
@@ -22835,7 +22847,6 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
- "roadmap_panel",
  "rope",
  "sandbox",
  "search",

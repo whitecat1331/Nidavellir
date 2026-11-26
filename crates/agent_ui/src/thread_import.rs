@@ -881,6 +881,8 @@ fn collect_importable_threads(
                 interacted_at: None,
                 worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
                 workspace_id: None,
+                plan_path: None,
+                driver: false,
                 remote_connection: remote_connection.clone(),
                 archived: true,
             });
