@@ -1074,10 +1074,6 @@ impl PlanGraph {
         )
     }
 
-    fn visible_tree(&self) -> VisibleNode {
-        self.visible_tree_from(&self.plans)
-    }
-
     fn plan_display(&self, plan_id: &str) -> String {
         self.plans
             .iter()
