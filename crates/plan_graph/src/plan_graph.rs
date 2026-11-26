@@ -1347,6 +1347,17 @@ impl PlanGraph {
         cx.notify();
     }
 
+    fn coordinator_brief() -> String {
+        "You are the coordinator chat for the Plans namespace — the plan-manager for all \
+         plans. Your job is plan management: create new plans, maintain coherence between \
+         plans, and enforce plan integrity (every plan has a summary, a status, and an owner). \
+         Read the graph with the `graph` tool to see the plan set and its dev-flow state, \
+         decide the next node for each plan, and hand the work to a per-plan driver in a \
+         fresh thread. You may implement, but your real job is coordination across the plan \
+         set."
+            .to_string()
+    }
+
     fn driver_brief(plan_id: &str) -> String {
         format!(
             "You are the driver thread for plan `{plan_id}`. Drive its dev-flow to \
@@ -1408,7 +1419,12 @@ impl PlanGraph {
                 None,
                 None,
                 None,
-                None,
+                Some(agent_ui::AgentInitialContent::ContentBlock {
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        Self::coordinator_brief(),
+                    ))],
+                    auto_submit: true,
+                }),
                 workspace_handle,
                 project,
                 Some(thread_store),
@@ -1476,6 +1492,9 @@ impl PlanGraph {
     fn click_node(&mut self, node: &VisibleNode, window: &mut Window, cx: &mut Context<Self>) {
         match node.kind {
             TreeKind::Root => {
+                // The Plans root is the dashboard's node: clicking it returns to the
+                // dashboard (clearing any open plan page) and toggles the tree.
+                self.close_page(cx);
                 let expanding = !self.expanded.contains("root");
                 if expanding {
                     self.expanded.insert("root".to_string());
@@ -2599,6 +2618,14 @@ mod tests {
             Some(PathBuf::from("/tmp/scratch.md"))
         );
         assert_eq!(plan_markdown_path("no-suffix"), None);
+    }
+
+    #[test]
+    fn coordinator_brief_names_the_plans_namespace_and_plan_management() {
+        let brief = PlanGraph::coordinator_brief();
+        assert!(brief.contains("Plans namespace"), "brief: {brief}");
+        assert!(brief.contains("plan-manager"), "brief: {brief}");
+        assert!(brief.contains("plan management"), "brief: {brief}");
     }
 
     fn row(id: &str, current: &str, spent: u64) -> FleetPlanRow {
