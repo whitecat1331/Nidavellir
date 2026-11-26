@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    actions, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render,
-    Task, WeakEntity, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Render, Task,
+    WeakEntity, Window, actions,
 };
+use plan_flow::{STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{ClaimRow, FleetPlanRow, PlanStore};
 use ui::{Button, ButtonSize, IconName, Label, LabelSize, prelude::*};
 use workspace::Workspace;
@@ -26,16 +27,6 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 actions!(fleet, [ToggleFleetPanel]);
 
 const FLEET_PANEL_KEY: &str = "FleetPanel";
-
-/// The dev-flow route and its human gates — the same readiness table the 1.23d
-/// coordinator uses, reduced to what a read-only view needs.
-const ROUTE: [&str; 11] = [
-    "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept", "merge",
-    "release", "complete",
-];
-
-/// A plan with no activity for this long is visibly stalled, not "moving".
-const STALL_SECONDS: i64 = 15 * 60;
 
 /// A claim whose heartbeat is older than this is flagged stale (mirrors
 /// `ledger.WIP_STALE_HOURS` in the harness).
@@ -84,44 +75,21 @@ struct AgentRow {
 
 // ---- derivation ----
 
-fn prerequisites(node: &str) -> &'static [&'static str] {
-    match node {
-        "plan" => &[],
-        "promote" => &["plan"],
-        "claim" => &["promote"],
-        "fork" => &["claim"],
-        "implement" => &["fork"],
-        "verify" => &["implement"],
-        "compile" => &["verify"],
-        "accept" => &["compile"],
-        "merge" => &["accept"],
-        "release" => &["merge"],
-        "complete" => &["release"],
-        _ => &[],
-    }
-}
-
-fn is_human_gate(node: &str) -> bool {
-    matches!(node, "merge" | "release" | "complete")
-}
-
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
 }
 
-fn next_ready(done: &HashSet<&str>) -> Option<&'static str> {
-    ROUTE.iter().copied().find(|node| {
-        !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p))
-    })
-}
-
 /// (state label, blocked_on_you, breaker). The breaker maps to the Ralph
 /// circuit-breaker taxonomy: closed (moving/ready/done), half-open (waiting on
 /// a human), open (stalled or blocked). A completed plan is closed — the
 /// circuit finished, it did not open.
-fn derive_state(plan: &FleetPlanRow, done_nodes: &[String], now: DateTime<Utc>) -> (String, bool, String) {
+fn derive_state(
+    plan: &FleetPlanRow,
+    done_nodes: &[String],
+    now: DateTime<Utc>,
+) -> (String, bool, String) {
     if plan.current_node.as_deref() == Some("complete") {
         return ("complete".to_string(), false, "closed".to_string());
     }
@@ -142,7 +110,11 @@ fn derive_state(plan: &FleetPlanRow, done_nodes: &[String], now: DateTime<Utc>) 
             .map(|time| (now - time).num_seconds())
             .unwrap_or(i64::MAX);
         if idle > STALL_SECONDS {
-            return (format!("stuck (stalled — {active})"), false, "open".to_string());
+            return (
+                format!("stuck (stalled — {active})"),
+                false,
+                "open".to_string(),
+            );
         }
         return (format!("moving ({active})"), false, "closed".to_string());
     }
@@ -507,6 +479,7 @@ mod tests {
             name: name.to_string(),
             repo: Some("zed".to_string()),
             current_node: current.map(|s| s.to_string()),
+            path: None,
             active_node: active.map(|s| s.to_string()),
             holder: None,
             heartbeat: heartbeat.map(|s| s.to_string()),
@@ -588,7 +561,14 @@ mod tests {
     #[test]
     fn human_gate_blocks_on_you() {
         let done = [
-            "plan", "promote", "claim", "fork", "implement", "verify", "compile", "accept",
+            "plan",
+            "promote",
+            "claim",
+            "fork",
+            "implement",
+            "verify",
+            "compile",
+            "accept",
         ];
         let (state, blocked, breaker) = derive_state(
             &FleetPlanRow {
@@ -675,7 +655,10 @@ mod tests {
         let rows = load_plans(&store, now());
         let by_name = |name: &str| rows.iter().find(|row| row.plan == name).unwrap();
         assert_eq!(by_name("MOVING").state, "moving (verify)");
-        assert_eq!(by_name("FROZEN").state, "blocked on you (resume — human gate)");
+        assert_eq!(
+            by_name("FROZEN").state,
+            "blocked on you (resume — human gate)"
+        );
         assert_eq!(by_name("MOVING").spent_tokens, 42);
         assert_eq!(by_name("FROZEN").spent_tokens, 7);
     }

@@ -1,52 +1,47 @@
-//! Interactive radial plan wheel (1.29 re-scope).
+//! Interactive plan tree and plan page (1.29 re-scope).
 //!
-//! One main-editor-area `Item` renders the plan taxonomy as a wheel-and-spoke:
-//! the `Plans` root at the centre, the top-level categories on the first ring,
-//! subcategories outward, and plan/slice leaves at the edge. Progressive
-//! disclosure keeps it navigable: single-click expands a node's children,
-//! double-click opens a plan's page, and the camera auto-fits as the frontier
-//! grows. The page carries the plan's metadata, summary, read-only decision,
-//! related/blocking/slice chips, and a plan-scoped agent composer + thread
-//! sidebar.
+//! One main-editor-area `Item` renders the plan taxonomy as a collapsible
+//! master–detail tree: `Plans` at the root, categories, subcategories, and
+//! plan/slice leaves on the left, the plan page on the right. Progressive
+//! disclosure keeps it navigable: a click expands a branch's children, a click
+//! on a plan opens its page. The page carries the plan's metadata, summary, the
+//! read-only dev-flow decision (from `plan_flow`, the same coordinator the agent
+//! tool uses), related/blocking/slice chips, and a contained plan-scoped chat.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
-use editor::Editor;
+use fs::Fs;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable, Render,
-    WeakEntity, Window, actions, px,
+    Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, Render, SharedString, WeakEntity, Window, actions, px,
 };
+use notifications::status_toast::StatusToast;
+use plan_flow::{Attempt, DoneEntry, GraphState, ROUTE, STALL_SECONDS, is_human_gate, next_ready};
 use plan_store::{
-    CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle, PlanParentRow,
-    PlanStore,
+    AmendmentRow, CategorizedPlanRow, CategoryRow, EdgeRow, EvidenceRow, FleetPlanRow, Lifecycle,
+    PlanParentRow, PlanStore,
 };
+use project::Project;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use ui::{Button, Color, Label, LabelSize, prelude::*};
 use workspace::Workspace;
 use workspace::item::Item;
 
 actions!(plan_graph, [DeployPlanGraph]);
 
-/// The dev-flow route — the same readiness table the `graph_tool` coordinator
-/// and the fleet panel use.
-const ROUTE: [&str; 11] = [
-    "plan",
-    "promote",
-    "claim",
-    "fork",
-    "implement",
-    "verify",
-    "compile",
-    "accept",
-    "merge",
-    "release",
-    "complete",
-];
-
-/// A plan with no activity for this long is visibly stalled, not "moving".
-const STALL_SECONDS: i64 = 15 * 60;
+/// Open a specific plan in the plan graph: reveals it in the tree and opens its
+/// page. Dispatched by thread-to-plan navigation (D21) and plan-page chips.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = plan_graph)]
+pub struct OpenPlan {
+    pub plan_id: SharedString,
+}
 
 /// The debugger loop's `stage→…→fix` sub-graph (1.29 D8).
 const DEBUGGER_SUB_GRAPH: [&str; 6] = ["stage", "test", "verify", "restart", "run", "fix"];
@@ -114,38 +109,10 @@ pub fn legend() -> Vec<(NodeState, &'static str, &'static str)> {
         .collect()
 }
 
-fn prerequisites(node: &str) -> &'static [&'static str] {
-    match node {
-        "plan" => &[],
-        "promote" => &["plan"],
-        "claim" => &["promote"],
-        "fork" => &["claim"],
-        "implement" => &["fork"],
-        "verify" => &["implement"],
-        "compile" => &["verify"],
-        "accept" => &["compile"],
-        "merge" => &["accept"],
-        "release" => &["merge"],
-        "complete" => &["release"],
-        _ => &[],
-    }
-}
-
-fn is_human_gate(node: &str) -> bool {
-    matches!(node, "merge" | "release" | "complete")
-}
-
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
-}
-
-fn next_ready(done: &HashSet<&str>) -> Option<&'static str> {
-    ROUTE
-        .iter()
-        .copied()
-        .find(|node| !done.contains(node) && prerequisites(node).iter().all(|p| done.contains(p)))
 }
 
 /// Derive a plan's node state from its graph-state row + done nodes.
@@ -330,6 +297,8 @@ pub struct Decision {
     pub kind: DecisionKind,
     pub node: String,
     pub reason: String,
+    pub spent_tokens: u64,
+    pub predicate: Option<String>,
 }
 
 /// Project the coordinator's decision order as a read-only view over the store.
@@ -341,6 +310,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
                 kind: DecisionKind::Paused,
                 node: "—".to_string(),
                 reason: "plan not found".to_string(),
+                spent_tokens: 0,
+                predicate: None,
             };
         }
         Err(error) => {
@@ -349,6 +320,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
                 kind: DecisionKind::Paused,
                 node: "—".to_string(),
                 reason: "plan store unavailable".to_string(),
+                spent_tokens: 0,
+                predicate: None,
             };
         }
     };
@@ -358,6 +331,8 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
             kind: DecisionKind::Done,
             node: "complete".to_string(),
             reason: "plan complete".to_string(),
+            spent_tokens: 0,
+            predicate: None,
         };
     }
     if let Some(reason) = &plan.blocked_reason {
@@ -365,53 +340,80 @@ pub fn project_decision(store: &PlanStore, plan_id: &str) -> Decision {
             kind: DecisionKind::Blocked,
             node: plan.current_node.clone().unwrap_or_default(),
             reason: format!("blocked — {reason}"),
-        };
-    }
-    if let Some(active) = &plan.active_node {
-        return Decision {
-            kind: DecisionKind::Active,
-            node: active.clone(),
-            reason: "node is active".to_string(),
+            spent_tokens: 0,
+            predicate: None,
         };
     }
 
-    let done = store.done_nodes(plan_id).unwrap_or_default();
+    // The store's row is a projection of `progress.json`; rebuild just enough of
+    // the graph state for `plan_flow::coordinate` to decide with the same engine
+    // the agent tool runs. The page never mutates the plan (D2).
     let evidence = store.evidence_for(plan_id).unwrap_or_default();
-    let done_set: HashSet<&str> = done.iter().map(|node| node.as_str()).collect();
     let failed: HashSet<&str> = evidence
         .iter()
         .filter(|row| row.gate_exit_code == Some(1))
         .map(|row| row.node.as_str())
         .collect();
+    let done = store
+        .done_nodes(plan_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|node| {
+            let failed = failed.contains(node.as_str());
+            DoneEntry {
+                node,
+                artifact: String::new(),
+                at: String::new(),
+                failed,
+                attempts: vec![Attempt {
+                    at: String::new(),
+                    artifact: String::new(),
+                    failed,
+                    failure: None,
+                    cost: None,
+                    warnings: Vec::new(),
+                }],
+                cost: None,
+            }
+        })
+        .collect();
+    let active = plan.active_node.map(|node| plan_flow::ActiveNode {
+        node,
+        executor: plan.holder.unwrap_or_default(),
+        started_at: plan.heartbeat.clone().unwrap_or_default(),
+        last_activity_at: plan.heartbeat.unwrap_or_default(),
+    });
+    let mut state = GraphState {
+        plan: plan.id,
+        repo: plan.repo.unwrap_or_default(),
+        scope: None,
+        current: plan.current_node,
+        done,
+        next: Vec::new(),
+        blocker: None,
+        budget: None,
+        active,
+        back_edges: Vec::new(),
+        warnings: Vec::new(),
+        authorized: None,
+    };
 
-    if let Some(retry) = ROUTE
-        .iter()
-        .copied()
-        .find(|node| done_set.contains(node) && failed.contains(node))
-    {
-        return Decision {
-            kind: DecisionKind::Retry,
-            node: retry.to_string(),
-            reason: "failed — retry".to_string(),
-        };
-    }
-
-    match next_ready(&done_set) {
-        Some(node) if is_human_gate(node) => Decision {
-            kind: DecisionKind::Blocked,
-            node: node.to_string(),
-            reason: "human gate — pause and ask".to_string(),
-        },
-        Some(node) => Decision {
-            kind: DecisionKind::Next,
-            node: node.to_string(),
-            reason: "next step".to_string(),
-        },
-        None => Decision {
-            kind: DecisionKind::Paused,
-            node: "—".to_string(),
-            reason: "no ready node".to_string(),
-        },
+    let retrying = plan_flow::retry_candidate(&state);
+    let decision = plan_flow::coordinate(&mut state, false, Utc::now());
+    let node = decision.node.unwrap_or_else(|| "—".to_string());
+    let kind = match decision.action.as_str() {
+        "continue" => DecisionKind::Active,
+        "dispatch" if retrying.as_deref() == Some(node.as_str()) => DecisionKind::Retry,
+        "dispatch" => DecisionKind::Next,
+        "pause" if decision.predicate.as_deref() == Some("human_gate") => DecisionKind::Blocked,
+        _ => DecisionKind::Paused,
+    };
+    Decision {
+        kind,
+        node,
+        reason: decision.reason,
+        spent_tokens: decision.spent_tokens,
+        predicate: decision.predicate,
     }
 }
 
@@ -426,6 +428,36 @@ pub fn decision_text(decision: &Decision) -> String {
     }
 }
 
+fn human_gate_label(node: &str) -> (&'static str, &'static str, &'static str) {
+    match node {
+        "accept" => (
+            "Launch acceptance",
+            "Launch",
+            "Launch a fresh build and verify the artifact end-to-end before merging.",
+        ),
+        "merge" => (
+            "Merge + rebuild",
+            "Merge",
+            "Merge the branch into feature and rebuild the shared slot.",
+        ),
+        "release" => (
+            "Release",
+            "Release",
+            "Ship feature → dev and rebuild the release slots.",
+        ),
+        "complete" => (
+            "Complete",
+            "Complete",
+            "Mark the plan complete and archive it.",
+        ),
+        _ => (
+            "Human gate",
+            "Perform",
+            "A human decision is required before the plan can advance.",
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wheel model (pure)
 // ---------------------------------------------------------------------------
@@ -433,6 +465,7 @@ pub fn decision_text(decision: &Decision) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeKind {
     Root,
+    Project,
     History,
     Category,
     Subcategory,
@@ -520,6 +553,20 @@ fn slices_for<'a>(parents: &'a [PlanParentRow], plan_id: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Map a plan's `repo` to its project facet: the tree key and the human label.
+/// The two known repos get named facets; anything else falls into one "Other"
+/// facet so an unrecognized or missing repo never spawns a root per typo.
+fn project_facet(repo: Option<&str>) -> (String, String) {
+    match repo {
+        Some("zed") => ("project:zed".to_string(), "Fork (zed)".to_string()),
+        Some("zed-debugger-demo") => (
+            "project:zed-debugger-demo".to_string(),
+            "Harness (zed-debugger-demo)".to_string(),
+        ),
+        _ => ("project:other".to_string(), "Other".to_string()),
+    }
+}
+
 /// Build the visible wheel tree from the taxonomy, assignments, parent links
 /// and expansion state. Pure so the disclosure rules are testable.
 pub fn build_visible_tree(
@@ -532,15 +579,92 @@ pub fn build_visible_tree(
 ) -> VisibleNode {
     let plan_by_id: HashMap<&str, &CategorizedPlanRow> =
         plans.iter().map(|plan| (plan.id.as_str(), plan)).collect();
-    let live: Vec<&CategorizedPlanRow> = plans
-        .iter()
-        .filter(|plan| plan.lifecycle() == Lifecycle::Live)
-        .collect();
-    let history: Vec<&CategorizedPlanRow> = plans
-        .iter()
-        .filter(|plan| plan.lifecycle() == Lifecycle::History)
-        .collect();
 
+    // Group plans into project facets (fork vs harness, and anything else),
+    // ordered by label so the tree is stable across reloads.
+    let mut project_groups: HashMap<String, (String, Vec<&CategorizedPlanRow>)> = HashMap::new();
+    for plan in plans {
+        let (key, label) = project_facet(plan.repo.as_deref());
+        project_groups
+            .entry(key)
+            .or_insert_with(|| (label, Vec::new()))
+            .1
+            .push(plan);
+    }
+    let mut projects: Vec<(String, String, Vec<&CategorizedPlanRow>)> = project_groups
+        .into_iter()
+        .map(|(key, (label, plans))| (key, label, plans))
+        .collect();
+    projects.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut root_children = Vec::new();
+    for (project_key, project_label, project_plans) in projects {
+        let live: Vec<&CategorizedPlanRow> = project_plans
+            .iter()
+            .filter(|plan| plan.lifecycle() == Lifecycle::Live)
+            .copied()
+            .collect();
+        let history: Vec<&CategorizedPlanRow> = project_plans
+            .iter()
+            .filter(|plan| plan.lifecycle() == Lifecycle::History)
+            .copied()
+            .collect();
+
+        let mut project_children = build_category_children(
+            categories,
+            &live,
+            parents,
+            &plan_by_id,
+            fleet,
+            expanded,
+            &project_key,
+        );
+        if history_visible {
+            if let Some(history_node) = build_history_node(&history, expanded, &project_key) {
+                project_children.push(history_node);
+            }
+        }
+
+        let project_expanded = expanded.contains(&project_key);
+        let mut node = VisibleNode::new(
+            project_key,
+            format!("{project_label} · {}", project_plans.len()),
+            TreeKind::Project,
+        );
+        node.expandable = !project_children.is_empty();
+        node.expanded = project_expanded;
+        node.children = if project_expanded {
+            project_children
+        } else {
+            Vec::new()
+        };
+        root_children.push(node);
+    }
+
+    let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), TreeKind::Root);
+    let root_expanded = expanded.contains("root");
+    root.expandable = true;
+    root.expanded = root_expanded;
+    root.children = if root_expanded {
+        root_children
+    } else {
+        Vec::new()
+    };
+    root
+}
+
+/// Build the category -> subcategory -> plan subtree for one project's live plans.
+/// Every node key is prefixed with the project key so a category that spans
+/// projects never collides on the global key.
+fn build_category_children(
+    categories: &[CategoryRow],
+    live: &[&CategorizedPlanRow],
+    parents: &[PlanParentRow],
+    plan_by_id: &HashMap<&str, &CategorizedPlanRow>,
+    fleet: &HashMap<String, FleetPlanRow>,
+    expanded: &HashSet<String>,
+    prefix: &str,
+) -> Vec<VisibleNode> {
     let mut top_categories: Vec<&CategoryRow> = categories
         .iter()
         .filter(|category| category.parent_id.is_none())
@@ -569,18 +693,18 @@ pub fn build_visible_tree(
             let mut sub_children = Vec::new();
             for plan in members {
                 let slices = slices_for(parents, &plan.id);
-                let plan_key = format!("plan:{}", plan.id);
+                let plan_key = format!("{prefix}/plan:{}", plan.id);
                 let plan_expanded = expanded.contains(&plan_key);
                 let mut children = Vec::new();
                 if plan_expanded && !slices.is_empty() {
-                    let group_key = format!("slices:{}", plan.id);
+                    let group_key = format!("{prefix}/slices:{}", plan.id);
                     let group_expanded = expanded.contains(&group_key);
                     let mut slice_children = Vec::new();
                     if group_expanded {
                         for slice_id in &slices {
                             if let Some(slice) = plan_by_id.get(slice_id) {
                                 let mut node = VisibleNode::new(
-                                    format!("slice:{slice_id}"),
+                                    format!("{prefix}/slice:{slice_id}"),
                                     plan_label(slice),
                                     TreeKind::Slice,
                                 );
@@ -613,7 +737,7 @@ pub fn build_visible_tree(
                 sub_children.push(node);
             }
 
-            let sub_key = format!("sub:{}", sub.id);
+            let sub_key = format!("{prefix}/sub:{}", sub.id);
             let sub_expanded = expanded.contains(&sub_key);
             let mut node = VisibleNode::new(
                 sub_key,
@@ -630,7 +754,7 @@ pub fn build_visible_tree(
             cat_children.push(node);
         }
 
-        let cat_key = format!("cat:{}", category.id);
+        let cat_key = format!("{prefix}/cat:{}", category.id);
         let cat_expanded = expanded.contains(&cat_key);
         let mut node = VisibleNode::new(
             cat_key,
@@ -646,55 +770,63 @@ pub fn build_visible_tree(
         };
         root_children.push(node);
     }
+    root_children
+}
 
-    if history_visible {
-        let key = "history".to_string();
-        let is_expanded = expanded.contains(&key);
-        let mut history_nodes: Vec<VisibleNode> = history
-            .iter()
-            .map(|plan| {
-                let mut node = VisibleNode::new(
-                    format!("hist:{}", plan.id),
-                    plan_label(plan),
-                    TreeKind::Plan,
-                );
-                node.plan_id = Some(plan.id.clone());
-                node.state = NodeState::Done;
-                node
-            })
-            .collect();
-        history_nodes.sort_by(|a, b| a.label.cmp(&b.label));
-        let mut node = VisibleNode::new(
-            key,
-            format!("History · {}", history_nodes.len()),
-            TreeKind::History,
-        );
-        node.state = NodeState::Done;
-        node.expandable = !history_nodes.is_empty();
-        node.expanded = is_expanded;
-        node.children = if is_expanded {
-            history_nodes
-        } else {
-            Vec::new()
-        };
-        root_children.push(node);
+/// Build one project's history subtree, if it has any history plans.
+fn build_history_node(
+    history: &[&CategorizedPlanRow],
+    expanded: &HashSet<String>,
+    prefix: &str,
+) -> Option<VisibleNode> {
+    if history.is_empty() {
+        return None;
     }
-
-    let mut root = VisibleNode::new("root".to_string(), "Plans".to_string(), TreeKind::Root);
-    let root_expanded = expanded.contains("root");
-    root.expandable = true;
-    root.expanded = root_expanded;
-    root.children = if root_expanded {
-        root_children
+    let key = format!("{prefix}/history");
+    let is_expanded = expanded.contains(&key);
+    let mut history_nodes: Vec<VisibleNode> = history
+        .iter()
+        .map(|plan| {
+            let mut node = VisibleNode::new(
+                format!("{prefix}/hist:{}", plan.id),
+                plan_label(plan),
+                TreeKind::Plan,
+            );
+            node.plan_id = Some(plan.id.clone());
+            node.state = NodeState::Done;
+            node
+        })
+        .collect();
+    history_nodes.sort_by(|a, b| a.label.cmp(&b.label));
+    let mut node = VisibleNode::new(
+        key,
+        format!("History · {}", history_nodes.len()),
+        TreeKind::History,
+    );
+    node.state = NodeState::Done;
+    node.expandable = true;
+    node.expanded = is_expanded;
+    node.children = if is_expanded {
+        history_nodes
     } else {
         Vec::new()
     };
-    root
+    Some(node)
 }
 
 /// Strip directories and plan-file suffixes from a thread's `plan_path` and
 /// normalize it to the store's plan id, so a graph-tool tag and a plan-page tag
 /// match the same plan.
+fn plan_markdown_path(progress_path: &str) -> Option<PathBuf> {
+    let path = Path::new(progress_path);
+    let file = path.file_name()?.to_str()?;
+    let stem = file
+        .strip_suffix(".progress.json")
+        .or_else(|| file.strip_suffix(".progress"))
+        .or_else(|| file.strip_suffix(".json"))?;
+    Some(path.with_file_name(format!("{stem}.md")))
+}
+
 pub fn plan_id_from_path(path: &str) -> String {
     let name = path
         .rsplit(|c| c == '/' || c == '\\')
@@ -705,6 +837,49 @@ pub fn plan_id_from_path(path: &str) -> String {
         stem = stem.strip_suffix(suffix).unwrap_or(stem);
     }
     stem.to_ascii_lowercase().replace('_', "-")
+}
+
+/// Reveal a plan in the tree by expanding the `root` to category to subcategory
+/// path that leads to it (or, for a slice, its parent plan's `slices` group).
+fn expand_path_to_plan(
+    expanded: &mut HashSet<String>,
+    categories: &[CategoryRow],
+    plans: &[CategorizedPlanRow],
+    parents: &[PlanParentRow],
+    plan_id: &str,
+) {
+    expanded.insert("root".to_string());
+    let Some(plan) = plans.iter().find(|plan| plan.id == plan_id) else {
+        return;
+    };
+
+    let (prefix, _) = project_facet(plan.repo.as_deref());
+    expanded.insert(prefix.clone());
+
+    let mut category_id = plan.category_id.clone();
+    if category_id.is_none() {
+        if let Some(parent) = parents.iter().find(|parent| parent.plan_id == plan_id) {
+            expanded.insert(format!("{prefix}/plan:{}", parent.parent_id));
+            expanded.insert(format!("{prefix}/slices:{}", parent.parent_id));
+            category_id = plans
+                .iter()
+                .find(|plan| plan.id == parent.parent_id)
+                .and_then(|plan| plan.category_id.clone());
+        }
+    }
+
+    while let Some(id) = category_id {
+        let Some(category) = categories.iter().find(|category| category.id == id) else {
+            break;
+        };
+        let key = if category.parent_id.is_none() {
+            format!("{prefix}/cat:{}", category.id)
+        } else {
+            format!("{prefix}/sub:{}", category.id)
+        };
+        expanded.insert(key);
+        category_id = category.parent_id.clone();
+    }
 }
 
 fn toggle(expanded: &mut HashSet<String>, key: &str) {
@@ -730,6 +905,7 @@ struct PageData {
     stage: Option<String>,
     status: Option<String>,
     current_node: Option<String>,
+    path: Option<String>,
     lifecycle: Lifecycle,
     summary: Option<String>,
     detail: Option<String>,
@@ -741,16 +917,12 @@ struct PageData {
     debugger_scoped: bool,
 }
 
-struct PlanThread {
-    session_id: acp::SessionId,
-    title: String,
-    updated_at: DateTime<Utc>,
-}
-
 /// The plan navigation `Item` (main editor area, not a bottom `Panel`).
 pub struct PlanGraph {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    fs: Arc<dyn Fs>,
+    project: Entity<Project>,
     categories: Vec<CategoryRow>,
     plans: Vec<CategorizedPlanRow>,
     parents: Vec<PlanParentRow>,
@@ -760,20 +932,26 @@ pub struct PlanGraph {
     history_visible: bool,
     page_stack: Vec<String>,
     page: Option<PageData>,
-    composer: gpui::Entity<Editor>,
-    threads: Vec<PlanThread>,
+    conversation_view: Option<Entity<agent_ui::ConversationView>>,
+    coordinator_view: Option<Entity<agent_ui::ConversationView>>,
+    driver_started: bool,
+    threads: Vec<agent::DbThreadMetadata>,
+    amendments: Vec<AmendmentRow>,
 }
 
 impl PlanGraph {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let composer = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Ask the agent about this plan…", window, cx);
-            editor
-        });
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        fs: Arc<dyn Fs>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut graph = Self {
             focus_handle: cx.focus_handle(),
             workspace,
+            fs,
+            project,
             categories: Vec::new(),
             plans: Vec::new(),
             parents: Vec::new(),
@@ -783,10 +961,25 @@ impl PlanGraph {
             history_visible: false,
             page_stack: Vec::new(),
             page: None,
-            composer,
+            conversation_view: None,
+            coordinator_view: None,
+            driver_started: false,
             threads: Vec::new(),
+            amendments: Vec::new(),
         };
+        // Keep this plan's thread history current: a chat turn creates or
+        // updates a thread whose plan_path links it here, and the thread store
+        // reloads (and notifies) after each save.
+        let thread_store = agent::ThreadStore::global(cx);
+        cx.observe(&thread_store, |this, _store, cx| {
+            if this.page.is_some() {
+                this.refresh_threads(cx);
+                cx.notify();
+            }
+        })
+        .detach();
         graph.refresh();
+        graph.ensure_coordinator_view(window, cx);
         graph
     }
 
@@ -845,12 +1038,24 @@ impl PlanGraph {
     }
 
     fn open_plan(&mut self, plan_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.page_stack.push(plan_id.clone());
-        self.load_page(&plan_id);
-        self.threads.clear();
-        self.composer
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        self.load_threads(cx);
+        self.navigate_to_plan(&plan_id, window, cx);
+    }
+
+    fn navigate_to_plan(&mut self, plan_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        expand_path_to_plan(
+            &mut self.expanded,
+            &self.categories,
+            &self.plans,
+            &self.parents,
+            plan_id,
+        );
+        self.page_stack.push(plan_id.to_string());
+        self.load_page(plan_id);
+        self.refresh_threads(cx);
+        self.refresh_amendments();
+        self.conversation_view = None;
+        self.driver_started = false;
+        self.ensure_conversation_view(None, false, None, window, cx);
         cx.notify();
     }
 
@@ -859,15 +1064,18 @@ impl PlanGraph {
         match self.page_stack.last().cloned() {
             Some(plan_id) => {
                 self.load_page(&plan_id);
-                self.threads.clear();
-                self.load_threads(cx);
+                self.refresh_threads(cx);
+                self.refresh_amendments();
+                self.conversation_view = None;
+                self.driver_started = false;
+                self.ensure_conversation_view(None, false, None, window, cx);
             }
             None => {
                 self.page = None;
-                self.threads.clear();
+                self.conversation_view = None;
+                self.driver_started = false;
             }
         }
-        let _ = window;
         cx.notify();
     }
 
@@ -877,7 +1085,8 @@ impl PlanGraph {
         }
         self.page_stack.clear();
         self.page = None;
-        self.threads.clear();
+        self.conversation_view = None;
+        self.driver_started = false;
         cx.notify();
     }
 
@@ -931,6 +1140,7 @@ impl PlanGraph {
             stage: plan.stage.clone(),
             status: plan.status.clone(),
             current_node: plan.current_node.clone(),
+            path: store.plan_path(plan_id).unwrap_or(None),
             lifecycle: plan.lifecycle(),
             summary: plan.summary.clone(),
             detail: plan.detail,
@@ -947,121 +1157,286 @@ impl PlanGraph {
         self.page.as_ref().map(|page| page.id.clone())
     }
 
-    fn load_threads(&mut self, cx: &mut Context<Self>) {
-        let Some(plan_id) = self.current_plan_id() else {
+    fn refresh_threads(&mut self, cx: &mut Context<Self>) {
+        let Some(plan_path) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.path.clone().or_else(|| Some(page.id.clone())))
+        else {
+            self.threads.clear();
             return;
         };
-        cx.spawn(async move |this, cx| {
-            let database = cx.update(|cx| agent::ThreadsDatabase::connect(cx)).await;
-            let database = match database {
-                Ok(database) => database,
-                Err(error) => {
-                    log::error!("[GRAPH] thread database unavailable: {error:#}");
-                    return;
-                }
-            };
-            let threads = match database.list_threads().await {
-                Ok(threads) => threads,
-                Err(error) => {
-                    log::error!("[GRAPH] failed to list threads: {error:#}");
-                    return;
-                }
-            };
-            let scoped: Vec<PlanThread> = threads
-                .into_iter()
-                .filter(|thread| {
-                    thread
-                        .plan_path
-                        .as_deref()
-                        .map(plan_id_from_path)
-                        .as_deref()
-                        == Some(plan_id.as_str())
-                })
-                .map(|thread| PlanThread {
-                    session_id: thread.id,
-                    title: thread.title.to_string(),
-                    updated_at: thread.updated_at,
-                })
-                .collect();
-            if let Err(error) = this.update(cx, |this, cx| {
-                if this.current_plan_id().as_deref() == Some(plan_id.as_str()) {
-                    this.threads = scoped;
-                    cx.notify();
-                }
-            }) {
-                log::debug!("[GRAPH] plan page closed before threads loaded: {error:#}");
-            }
-        })
-        .detach();
+        let thread_store = agent::ThreadStore::global(cx);
+        self.threads = thread_store
+            .read(cx)
+            .entries()
+            .filter(|thread| thread.plan_path == Some(plan_path.clone()))
+            .collect();
     }
 
-    fn send_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text(cx).trim().to_string();
-        if text.is_empty() {
+    fn refresh_amendments(&mut self) {
+        let Some(plan_id) = self.current_plan_id() else {
+            self.amendments.clear();
+            return;
+        };
+        let store = Self::open_store();
+        self.amendments = store
+            .amendments(&plan_id)
+            .unwrap_or_else(|error| {
+                log::error!("[GRAPH] failed to read amendments: {error:#}");
+                Vec::new()
+            })
+            .into_iter()
+            .filter(|amendment| amendment.status == "pending")
+            .collect();
+    }
+
+    fn accept_amendment(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(progress_path) = self.page.as_ref().and_then(|page| page.path.clone()) else {
+            return;
+        };
+        let Some(markdown_path) = plan_markdown_path(&progress_path) else {
+            return;
+        };
+        let Some(amendment) = self.amendments.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let applied = std::fs::read_to_string(&markdown_path)
+            .ok()
+            .filter(|content| content.contains(&amendment.old_text))
+            .map(|content| {
+                let updated = content.replacen(&amendment.old_text, &amendment.new_text, 1);
+                std::fs::write(&markdown_path, updated).is_ok()
+            })
+            .unwrap_or(false);
+        if applied {
+            let store = Self::open_store();
+            if let Err(error) = store.set_amendment_status(&id, "accepted") {
+                log::error!("[GRAPH] failed to mark amendment accepted: {error:#}");
+            }
+        }
+        self.refresh_amendments();
+        cx.notify();
+    }
+
+    fn reject_amendment(&mut self, id: String, cx: &mut Context<Self>) {
+        let store = Self::open_store();
+        if let Err(error) = store.set_amendment_status(&id, "rejected") {
+            log::error!("[GRAPH] failed to mark amendment rejected: {error:#}");
+        }
+        self.refresh_amendments();
+        cx.notify();
+    }
+
+    fn ensure_conversation_view(
+        &mut self,
+        initial_content: Option<agent_ui::AgentInitialContent>,
+        is_driver: bool,
+        resume_session_id: Option<acp::SessionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conversation_view.is_some() {
             return;
         }
         let Some(plan_id) = self.current_plan_id() else {
             return;
         };
-        let Some(workspace) = self.workspace.upgrade() else {
+        if self.workspace.upgrade().is_none() {
             return;
-        };
-        let panel = workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx)
-        });
-        let Some(panel) = panel else {
-            return;
-        };
-        panel.update(cx, |panel, cx| {
-            panel.create_thread_with_options(
-                agent_ui::CreateThreadOptions {
-                    initial_content: Some(agent_ui::AgentInitialContent::ContentBlock {
-                        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-                        auto_submit: true,
-                    }),
-                    focus: true,
-                    plan_path: Some(plan_id),
-                    ..Default::default()
-                },
+        }
+        let fs = self.fs.clone();
+        let project = self.project.clone();
+        let thread_store = agent::ThreadStore::global(cx);
+        let agent = agent_ui::Agent::NativeAgent;
+        let server = agent.server(fs, thread_store.clone());
+        let connection_store =
+            cx.new(|cx| agent_ui::AgentConnectionStore::new(project.clone(), cx));
+        let workspace_handle = self.workspace.clone();
+        let conversation_view = cx.new(|cx| {
+            agent_ui::ConversationView::new(
+                server,
+                connection_store,
+                agent,
+                resume_session_id,
+                None,
+                None,
+                None,
+                initial_content,
+                workspace_handle,
+                project,
+                Some(thread_store),
                 agent_ui::AgentThreadSource::AgentPanel,
                 window,
                 cx,
-            );
+            )
         });
-        self.composer
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        self.load_threads(cx);
-        // The new thread is persisted asynchronously; reload once the save has
-        // landed so it appears in this plan's sidebar without reopening the page.
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(900))
-                .await;
-            if let Err(error) = this.update(cx, |this, cx| this.load_threads(cx)) {
-                log::debug!("[GRAPH] plan page closed before thread refresh: {error:#}");
+
+        // The native thread only exists once the connection establishes. Apply
+        // the plan link (and the driver marker) on the first update that exposes
+        // it, so this embedded thread is plan-scoped and resumable.
+        let plan_path = self
+            .page
+            .as_ref()
+            .and_then(|page| page.path.clone())
+            .or_else(|| Some(plan_id.clone()));
+        let applied = Cell::new(false);
+        cx.observe(&conversation_view, move |_this, view, cx| {
+            if applied.get() {
+                return;
             }
+            let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
+                return;
+            };
+            native_thread.update(cx, |thread, cx| {
+                thread.set_plan_path(plan_path.clone(), cx);
+                if is_driver {
+                    thread.set_driver(true, cx);
+                }
+            });
+            applied.set(true);
         })
         .detach();
-        cx.notify();
+
+        // Re-project the decision whenever the thread turns, so the page's node
+        // and spend stay current without reopening the page.
+        cx.observe(&conversation_view, |this, _view, cx| {
+            this.refresh_decision(cx);
+        })
+        .detach();
+
+        self.conversation_view = Some(conversation_view);
     }
 
-    fn open_thread(
+    fn open_thread_in_chat(
         &mut self,
         session_id: acp::SessionId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.conversation_view = None;
+        self.driver_started = false;
+        self.ensure_conversation_view(None, false, Some(session_id), window, cx);
+        cx.notify();
+    }
+
+    fn new_thread_in_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversation_view = None;
+        self.driver_started = false;
+        self.ensure_conversation_view(None, false, None, window, cx);
+        cx.notify();
+    }
+
+    fn start_driver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan_id) = self.current_plan_id() else {
+            return;
+        };
+        let brief = Self::driver_brief(&plan_id);
+        self.conversation_view = None;
+        self.driver_started = true;
+        self.ensure_conversation_view(
+            Some(agent_ui::AgentInitialContent::ContentBlock {
+                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(brief))],
+                auto_submit: true,
+            }),
+            true,
+            None,
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn driver_brief(plan_id: &str) -> String {
+        format!(
+            "You are the driver thread for plan `{plan_id}`. Drive its dev-flow to \
+             acceptance-ready: run `implement` → `verify` → `compile` yourself, using the \
+             `graph` tool to `coordinate` before each step and `advance` each gate only once \
+             its artifact is produced and verified. Stop when `accept` is the ready node — \
+             never advance `accept` yourself, it is a human gate. If the plan itself is wrong \
+             (a missing step, a wrong acceptance criterion, a bad re-slice), propose the \
+             amendment as an edit-file diff the operator accepts — never rewrite or complete \
+             the plan unilaterally. When you stop, report the plan's current node and spend."
+        )
+    }
+
+    fn refresh_decision(&mut self, cx: &mut Context<Self>) {
+        let Some(plan_id) = self.current_plan_id() else {
+            return;
+        };
+        let store = Self::open_store();
+        let decision = project_decision(&store, &plan_id);
+        if let Some(page) = self.page.as_mut() {
+            page.decision = decision;
+        }
+        cx.notify();
+    }
+
+    fn notify_human_gate(&mut self, node: String, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let panel = workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx)
+        let (label, _action, _description) = human_gate_label(&node);
+        let message = format!("{label} is a human gate — perform it via the normal tooling.");
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| this.dismiss_button(true));
+            workspace.toggle_status_toast(toast, cx);
         });
-        if let Some(panel) = panel {
-            panel.update(cx, |panel, cx| {
-                panel.open_thread(session_id, None, None, window, cx);
-            });
+    }
+
+    fn ensure_coordinator_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.coordinator_view.is_some() {
+            return;
         }
+        if self.workspace.upgrade().is_none() {
+            return;
+        }
+        let fs = self.fs.clone();
+        let project = self.project.clone();
+        let thread_store = agent::ThreadStore::global(cx);
+        let agent = agent_ui::Agent::NativeAgent;
+        let server = agent.server(fs, thread_store.clone());
+        let connection_store =
+            cx.new(|cx| agent_ui::AgentConnectionStore::new(project.clone(), cx));
+        let workspace_handle = self.workspace.clone();
+        let coordinator_view = cx.new(|cx| {
+            agent_ui::ConversationView::new(
+                server,
+                connection_store,
+                agent,
+                None,
+                None,
+                None,
+                None,
+                None,
+                workspace_handle,
+                project,
+                Some(thread_store),
+                agent_ui::AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+
+        // The coordinator is the plan-manager for the Plans namespace. Put it in
+        // plan mode so the plan-manager + dev-flow skills load, but never
+        // auto-submit a prompt — it stays idle until the operator drives it.
+        let applied = Cell::new(false);
+        cx.observe(&coordinator_view, move |_this, view, cx| {
+            if applied.get() {
+                return;
+            }
+            let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
+                return;
+            };
+            native_thread.update(cx, |thread, cx| {
+                thread.set_planning(true, cx);
+            });
+            applied.set(true);
+        })
+        .detach();
+
+        self.coordinator_view = Some(coordinator_view);
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -1069,14 +1444,22 @@ impl PlanGraph {
         cx.notify();
     }
 
-    fn deploy(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    fn deploy(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
         let existing = workspace.items_of_type::<PlanGraph>(cx).next();
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
+            existing
         } else {
             let workspace_handle = cx.entity().downgrade();
-            let item = cx.new(|cx| PlanGraph::new(workspace_handle, window, cx));
-            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            let fs = workspace.app_state().fs.clone();
+            let project = workspace.project().clone();
+            let item = cx.new(|cx| PlanGraph::new(workspace_handle, fs, project, window, cx));
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
         }
     }
 
@@ -1112,6 +1495,9 @@ impl PlanGraph {
     fn click_node(&mut self, node: &VisibleNode, window: &mut Window, cx: &mut Context<Self>) {
         match node.kind {
             TreeKind::Root => {
+                // The Plans root is the dashboard's node: clicking it returns to the
+                // dashboard (clearing any open plan page) and toggles the tree.
+                self.close_page(cx);
                 let expanding = !self.expanded.contains("root");
                 if expanding {
                     self.expanded.insert("root".to_string());
@@ -1119,7 +1505,8 @@ impl PlanGraph {
                     self.expanded.clear();
                 }
             }
-            TreeKind::Category
+            TreeKind::Project
+            | TreeKind::Category
             | TreeKind::Subcategory
             | TreeKind::History
             | TreeKind::SliceGroup => {
@@ -1224,20 +1611,111 @@ impl PlanGraph {
 
     fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.page.is_some() {
-            self.render_page(window, cx)
-        } else {
-            v_flex()
-                .id(ElementId::Name("plan-empty".into()))
-                .flex_1()
-                .items_center()
-                .justify_center()
+            h_flex()
+                .size_full()
                 .child(
-                    Label::new("Select a plan to see its detail.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_page(window, cx)),
                 )
+                .when_some(self.conversation_view.clone(), |this, view| {
+                    this.child(
+                        div()
+                            .w(px(440.0))
+                            .h_full()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(view),
+                    )
+                })
+                .into_any_element()
+        } else {
+            h_flex()
+                .size_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_dashboard(cx)),
+                )
+                .when_some(self.coordinator_view.clone(), |this, view| {
+                    this.child(
+                        div()
+                            .w(px(440.0))
+                            .h_full()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(view),
+                    )
+                })
                 .into_any_element()
         }
+    }
+
+    fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.plans.len();
+        let live = self
+            .plans
+            .iter()
+            .filter(|plan| plan.lifecycle() == Lifecycle::Live)
+            .count();
+        let mut plans: Vec<&CategorizedPlanRow> = self.plans.iter().collect();
+        plans.sort_by(|a, b| a.name.cmp(&b.name));
+        v_flex()
+            .id(ElementId::Name("plans-dashboard".into()))
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(980.0))
+                    .p_8()
+                    .gap_6()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(Label::new("Plans").size(LabelSize::Large))
+                            .child(
+                                Label::new(format!("{live} live of {total}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        Label::new(
+                            "Drive the whole plan set from the coordinator chat on the right, \
+                             or open a plan below to drive its implementation.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(v_flex().gap_1().children(plans.into_iter().map(|plan| {
+                        let plan_id = plan.id.clone();
+                        let node = plan.current_node.clone().unwrap_or_else(|| "—".to_string());
+                        h_flex()
+                            .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
+                            .w_full()
+                            .gap_3()
+                            .items_center()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                            .on_click(cx.listener(
+                                move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                                    this.open_plan(plan_id.clone(), window, cx);
+                                },
+                            ))
+                            .child(Label::new(plan_label(plan)).size(LabelSize::Small))
+                            .child(Label::new(node).size(LabelSize::XSmall).color(Color::Muted))
+                    }))),
+            )
+            .into_any_element()
     }
 
     fn render_page(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1261,6 +1739,9 @@ impl PlanGraph {
         };
         let has_relations =
             !page.related.is_empty() || !page.blocking.is_empty() || !page.slices.is_empty();
+        let human_gate_node = (page.decision.kind == DecisionKind::Blocked
+            && page.decision.predicate.as_deref() == Some("human_gate"))
+        .then(|| page.decision.node.clone());
 
         v_flex()
             .id(ElementId::Name("plan-page".into()))
@@ -1351,20 +1832,130 @@ impl PlanGraph {
                             .px_4()
                             .py_3()
                             .child(
-                                h_flex()
-                                    .gap_3()
-                                    .items_center()
+                                v_flex()
+                                    .gap_2()
                                     .child(
-                                        Label::new("Decision")
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                Label::new("Decision")
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(decision_text(&page.decision))
+                                                    .color(decision_color),
+                                            ),
                                     )
                                     .child(
-                                        Label::new(decision_text(&page.decision))
-                                            .color(decision_color),
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                Label::new("Spend")
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(format!(
+                                                    "{} tokens",
+                                                    page.decision.spent_tokens
+                                                ))
+                                                .size(LabelSize::Small),
+                                            ),
+                                    )
+                                    .when_some(page.decision.predicate.clone(), |this, predicate| {
+                                        this.child(
+                                            h_flex()
+                                                .gap_3()
+                                                .items_center()
+                                                .child(
+                                                    Label::new("Break predicate")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(predicate)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Warning),
+                                                ),
+                                        )
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .when(self.driver_started, |this| {
+                                                this.child(
+                                                    Label::new("Driver running")
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Success),
+                                                )
+                                            })
+                                            .when(!self.driver_started, |this| {
+                                                this.child(
+                                                    Button::new("plan-start", "Start").on_click(
+                                                        cx.listener(
+                                                            |this: &mut PlanGraph,
+                                                             _: &ClickEvent,
+                                                             window,
+                                                             cx| {
+                                                                this.start_driver(window, cx)
+                                                            },
+                                                        ),
+                                                    ),
+                                                )
+                                            }),
                                     ),
                             ),
                     )
+                    .when_some(human_gate_node, |this, node| {
+                        let (label, action, description) = human_gate_label(&node);
+                        this.child(
+                            div()
+                                .w_full()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .bg(cx.theme().colors().element_background)
+                                .px_4()
+                                .py_3()
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .gap_3()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    Label::new(label)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Accent),
+                                                )
+                                                .child(Button::new("plan-gate", action).on_click(
+                                                    cx.listener(
+                                                        move |this: &mut PlanGraph,
+                                                              _: &ClickEvent,
+                                                              _window,
+                                                              cx| {
+                                                            this.notify_human_gate(
+                                                                node.clone(),
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ),
+                                                )),
+                                        )
+                                        .child(
+                                            Label::new(description)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(section(
                         "Summary",
                         div()
@@ -1372,6 +1963,73 @@ impl PlanGraph {
                             .child(Label::new(summary).color(Color::Default))
                             .into_any_element(),
                     ))
+                    .when(!self.amendments.is_empty(), |this| {
+                        this.child(section(
+                            "Amendments",
+                            v_flex()
+                                .gap_2()
+                                .children(self.amendments.iter().map(|amendment| {
+                                    let id = amendment.id.clone();
+                                    v_flex()
+                                        .gap_2()
+                                        .p_2()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .rounded_md()
+                                        .child(
+                                            Label::new(amendment.reason.clone())
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Label::new(amendment.old_text.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(amendment.new_text.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Accent),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(
+                                                    Button::new("plan-amend-accept", "Accept")
+                                                        .label_size(LabelSize::Small)
+                                                        .on_click({
+                                                            let id = id.clone();
+                                                            cx.listener(
+                                                                move |this,
+                                                                      _: &ClickEvent,
+                                                                      _,
+                                                                      cx| {
+                                                                    this.accept_amendment(
+                                                                        id.clone(),
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )
+                                                        }),
+                                                )
+                                                .child(
+                                                    Button::new("plan-amend-reject", "Reject")
+                                                        .label_size(LabelSize::Small)
+                                                        .on_click(cx.listener(
+                                                            move |this, _: &ClickEvent, _, cx| {
+                                                                this.reject_amendment(id.clone(), cx);
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                }))
+                                .into_any_element(),
+                        ))
+                    })
                     .when(has_relations, |this| {
                         this.child(section(
                             "Relationships",
@@ -1410,85 +2068,68 @@ impl PlanGraph {
                             })
                             .into_any_element(),
                     ))
-                    .child(section(
-                        "Threads for this plan",
-                        v_flex()
-                            .gap_2()
-                            .when(self.threads.is_empty(), |this| {
-                                this.child(
-                                    Label::new("No threads started from this plan yet.")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                            })
-                            .children(self.threads.iter().map(|thread| {
-                                let session = thread.session_id.clone();
-                                h_flex()
-                                    .id(ElementId::Name(
-                                        format!("plan-thread:{}", thread.session_id).into(),
-                                    ))
-                                    .w_full()
-                                    .gap_3()
-                                    .items_center()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
-                                    .on_click(cx.listener(
-                                        move |this: &mut PlanGraph,
-                                              _: &ClickEvent,
-                                              window,
-                                              cx| {
-                                            this.open_thread(session.clone(), window, cx)
-                                        },
-                                    ))
-                                    .child(Label::new(thread.title.clone()).size(LabelSize::Small))
-                                    .child(
-                                        Label::new(
-                                            thread
-                                                .updated_at
-                                                .format("%Y-%m-%d %H:%M")
-                                                .to_string(),
-                                        )
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                            }))
-                            .into_any_element(),
-                    ))
                     .child(
                         v_flex()
                             .w_full()
-                            .gap_2()
-                            .child(
-                                Label::new("Ask the agent about this plan")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
+                            .gap_3()
                             .child(
                                 h_flex()
                                     .w_full()
-                                    .gap_2()
-                                    .items_center()
+                                    .justify_between()
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().colors().border_variant)
-                                            .bg(cx.theme().colors().editor_background)
-                                            .child(self.composer.clone()),
+                                        Label::new("Threads".to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
                                     )
-                                    .child(Button::new("plan-send", "Send").on_click(cx.listener(
-                                        |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                                            this.send_composer(window, cx)
-                                        },
-                                    ))),
-                            ),
-                    ),
+                                    .child(
+                                        Button::new("plan-new-thread", "New thread")
+                                            .style(ButtonStyle::Outlined)
+                                            .label_size(LabelSize::Small)
+                                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.new_thread_in_chat(window, cx);
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .when(self.threads.is_empty(), |this| {
+                                        this.child(
+                                            Label::new("No threads linked to this plan yet.")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                                    .children(self.threads.iter().map(|thread| {
+                                        let session_id = thread.id.clone();
+                                        h_flex()
+                                            .id(ElementId::Name(format!("plan-thread:{}", thread.id).into()))
+                                            .gap_2()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, window, cx| {
+                                                    this.open_thread_in_chat(session_id.clone(), window, cx);
+                                                },
+                                            ))
+                                            .child(
+                                                Label::new(thread.title.clone())
+                                                    .size(LabelSize::Small),
+                                            )
+                                            .when(thread.driver, |this| {
+                                                this.child(badge("driver", Color::Accent, cx))
+                                            })
+                                            .into_any_element()
+                                    }))
+                                    .into_any_element(),
+                            )
+                            .into_any_element(),
+                    )
             )
             .into_any_element()
     }
@@ -1654,6 +2295,13 @@ pub fn init(cx: &mut App) {
                 PlanGraph::deploy(workspace, window, cx);
             },
         );
+        workspace.register_action(|workspace: &mut Workspace, action: &OpenPlan, window, cx| {
+            let item = PlanGraph::deploy(workspace, window, cx);
+            let plan_id = action.plan_id.clone();
+            item.update(cx, |graph, cx| {
+                graph.navigate_to_plan(plan_id.as_ref(), window, cx);
+            });
+        });
     })
     .detach();
 }
@@ -1742,9 +2390,24 @@ mod tests {
             false,
         );
         let labels: Vec<&str> = open.children.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(labels, vec!["Feature · 1", "Bug · 1"]);
+        assert_eq!(labels, vec!["Fork (zed) · 2"]);
         assert!(open.children.iter().all(|c| c.children.is_empty()));
         assert!(open.children.iter().all(|c| c.expandable));
+
+        let open_project = build_visible_tree(
+            &taxonomy(),
+            &plans,
+            &[],
+            &HashMap::new(),
+            &expanded(&["root", "project:zed"]),
+            false,
+        );
+        let category_labels: Vec<&str> = open_project.children[0]
+            .children
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(category_labels, vec!["Feature · 1", "Bug · 1"]);
     }
 
     #[test]
@@ -1758,37 +2421,47 @@ mod tests {
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root", "cat:feature"]),
+            &expanded(&["root", "project:zed", "project:zed/cat:feature"]),
             false,
         );
-        let feature = find(&root, "cat:feature").expect("feature category");
-        let bug = find(&root, "cat:bug").expect("bug category");
+        let feature = find(&root, "project:zed/cat:feature").expect("feature category");
+        let bug = find(&root, "project:zed/cat:bug").expect("bug category");
         assert_eq!(feature.children.len(), 1);
         assert!(bug.children.is_empty(), "siblings stay collapsed");
-        assert_eq!(feature.children[0].key, "sub:feature/agent-core");
+        assert_eq!(
+            feature.children[0].key,
+            "project:zed/sub:feature/agent-core"
+        );
     }
 
     #[test]
     fn expanding_a_category_collapses_cleanly() {
+        let plans = vec![plan("p1", "Plan one", Some("feature/agent-core"), None)];
         let root_open = build_visible_tree(
             &taxonomy(),
-            &[],
+            &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root", "cat:feature"]),
+            &expanded(&["root", "project:zed", "project:zed/cat:feature"]),
             false,
         );
-        assert_eq!(find(&root_open, "cat:feature").unwrap().children.len(), 1);
+        assert_eq!(
+            find(&root_open, "project:zed/cat:feature")
+                .unwrap()
+                .children
+                .len(),
+            1
+        );
         let root_closed = build_visible_tree(
             &taxonomy(),
-            &[],
+            &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root"]),
+            &expanded(&["root", "project:zed"]),
             false,
         );
         assert!(
-            find(&root_closed, "cat:feature")
+            find(&root_closed, "project:zed/cat:feature")
                 .unwrap()
                 .children
                 .is_empty()
@@ -1810,10 +2483,15 @@ mod tests {
             &plans,
             &parents,
             &HashMap::new(),
-            &expanded(&["root", "cat:feature", "sub:feature/agent-core"]),
+            &expanded(&[
+                "root",
+                "project:zed",
+                "project:zed/cat:feature",
+                "project:zed/sub:feature/agent-core",
+            ]),
             false,
         );
-        let parent = find(&root, "plan:parent").expect("parent plan");
+        let parent = find(&root, "project:zed/plan:parent").expect("parent plan");
         assert!(parent.expandable);
         assert!(parent.children.is_empty(), "slices are behind a toggle");
 
@@ -1824,15 +2502,16 @@ mod tests {
             &HashMap::new(),
             &expanded(&[
                 "root",
-                "cat:feature",
-                "sub:feature/agent-core",
-                "plan:parent",
+                "project:zed",
+                "project:zed/cat:feature",
+                "project:zed/sub:feature/agent-core",
+                "project:zed/plan:parent",
             ]),
             false,
         );
-        let parent = find(&root, "plan:parent").expect("parent plan");
+        let parent = find(&root, "project:zed/plan:parent").expect("parent plan");
         assert_eq!(parent.children.len(), 1);
-        assert_eq!(parent.children[0].key, "slices:parent");
+        assert_eq!(parent.children[0].key, "project:zed/slices:parent");
         assert_eq!(parent.children[0].label, "slices (1)");
     }
 
@@ -1850,19 +2529,65 @@ mod tests {
             &expanded(&["root"]),
             false,
         );
-        assert!(find(&hidden, "history").is_none());
+        assert!(find(&hidden, "project:zed/history").is_none());
 
         let shown = build_visible_tree(
             &taxonomy(),
             &plans,
             &[],
             &HashMap::new(),
-            &expanded(&["root", "history"]),
+            &expanded(&["root", "project:zed", "project:zed/history"]),
             true,
         );
-        let history = find(&shown, "history").expect("history node");
+        let history = find(&shown, "project:zed/history").expect("history node");
         assert_eq!(history.children.len(), 1);
         assert_eq!(history.children[0].plan_id.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn plans_are_grouped_into_project_facets() {
+        let fork = plan("fork-plan", "Fork plan", Some("feature/agent-core"), None);
+        let mut harness = plan(
+            "harness-plan",
+            "Harness plan",
+            Some("process/debugger-loop"),
+            None,
+        );
+        harness.repo = Some("zed-debugger-demo".to_string());
+
+        let root = build_visible_tree(
+            &taxonomy(),
+            &[fork.clone(), harness.clone()],
+            &[],
+            &HashMap::new(),
+            &expanded(&["root"]),
+            false,
+        );
+        let labels: Vec<&str> = root.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Fork (zed) · 1", "Harness (zed-debugger-demo) · 1"]
+        );
+
+        let open = build_visible_tree(
+            &taxonomy(),
+            &[fork, harness],
+            &[],
+            &HashMap::new(),
+            &expanded(&[
+                "root",
+                "project:zed",
+                "project:zed/cat:feature",
+                "project:zed/sub:feature/agent-core",
+            ]),
+            false,
+        );
+        let fork_plan = find(&open, "project:zed/plan:fork-plan").expect("fork plan");
+        assert_eq!(fork_plan.plan_id.as_deref(), Some("fork-plan"));
+        assert!(
+            find(&open, "project:zed-debugger-demo/plan:harness-plan").is_none(),
+            "harness plan lives under its own facet"
+        );
     }
 
     #[test]
@@ -1879,6 +2604,23 @@ mod tests {
             plan_id_from_path("plan-of-action-2026-11-19-x"),
             "plan-of-action-2026-11-19-x"
         );
+    }
+
+    #[test]
+    fn plan_markdown_path_derives_from_a_progress_path() {
+        assert_eq!(
+            plan_markdown_path(
+                "/home/me/plans/in-progress-plans/PLAN_OF_ACTION-2026-11-19-x.progress.json"
+            ),
+            Some(PathBuf::from(
+                "/home/me/plans/in-progress-plans/PLAN_OF_ACTION-2026-11-19-x.md"
+            ))
+        );
+        assert_eq!(
+            plan_markdown_path("/tmp/scratch.json"),
+            Some(PathBuf::from("/tmp/scratch.md"))
+        );
+        assert_eq!(plan_markdown_path("no-suffix"), None);
     }
 
     fn row(id: &str, current: &str, spent: u64) -> FleetPlanRow {
@@ -1905,6 +2647,7 @@ mod tests {
             name: name.to_string(),
             repo: Some("zed".to_string()),
             current_node: Some(current.to_string()),
+            path: None,
             active_node: None,
             holder: None,
             heartbeat: None,
@@ -2103,5 +2846,36 @@ mod tests {
         let plans = store.categorized_plans().unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].id, "PLAN_A");
+    }
+
+    #[test]
+    fn expanding_a_path_reveals_the_plan_under_its_categories() {
+        let plans = vec![plan("p1", "Plan one", Some("feature/agent-core"), None)];
+        let mut expanded = HashSet::new();
+        expand_path_to_plan(&mut expanded, &taxonomy(), &plans, &[], "p1");
+        assert!(expanded.contains("root"));
+        assert!(expanded.contains("project:zed"));
+        assert!(expanded.contains("project:zed/cat:feature"));
+        assert!(expanded.contains("project:zed/sub:feature/agent-core"));
+    }
+
+    #[test]
+    fn expanding_a_slice_reveals_its_parent_slices_group() {
+        let plans = vec![
+            plan("parent", "Parent", Some("feature/agent-core"), None),
+            plan("slice", "Slice", None, None),
+        ];
+        let parents = vec![PlanParentRow {
+            plan_id: "slice".to_string(),
+            parent_id: "parent".to_string(),
+        }];
+        let mut expanded = HashSet::new();
+        expand_path_to_plan(&mut expanded, &taxonomy(), &plans, &parents, "slice");
+        assert!(expanded.contains("root"));
+        assert!(expanded.contains("project:zed"));
+        assert!(expanded.contains("project:zed/cat:feature"));
+        assert!(expanded.contains("project:zed/sub:feature/agent-core"));
+        assert!(expanded.contains("project:zed/plan:parent"));
+        assert!(expanded.contains("project:zed/slices:parent"));
     }
 }

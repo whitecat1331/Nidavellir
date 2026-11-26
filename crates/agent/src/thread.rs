@@ -1452,6 +1452,8 @@ pub struct Thread {
     /// forced plan-state banner, and inherited by subagents so a spawned
     /// acceptor knows which plan it is executing too.
     plan_path: Option<String>,
+    /// Whether this thread is the plan's persistent driver thread (D15).
+    driver: bool,
     /// Whether `graph coordinate`/`read` has run this turn, satisfying the
     /// mutation turnstile (plan 1.33 Phase 6). Reset at the start of each turn.
     graph_consulted_this_turn: bool,
@@ -1626,6 +1628,7 @@ impl Thread {
             planning,
             rea_mode: Self::rea_mode_from_environment(),
             plan_path: None,
+            driver: false,
             graph_consulted_this_turn: false,
             rea_server: None,
             rea_tools: BTreeMap::default(),
@@ -2029,6 +2032,7 @@ impl Thread {
             planning,
             rea_mode,
             plan_path: db_thread.plan_path,
+            driver: db_thread.driver,
             graph_consulted_this_turn: false,
             rea_server: None,
             rea_tools: BTreeMap::default(),
@@ -2140,6 +2144,7 @@ impl Thread {
         crate::note_provider_keys(cx);
         let initial_project_snapshot = self.initial_project_snapshot.clone();
         let mut thread = DbThread {
+            driver: self.driver,
             title: self.title().unwrap_or_default(),
             messages: self.messages.clone(),
             updated_at: self.updated_at,
@@ -2544,6 +2549,20 @@ impl Thread {
             return;
         }
         self.plan_path = plan_path;
+        cx.notify();
+    }
+
+    /// Whether this thread is the plan's persistent driver thread (D15).
+    pub fn is_driver(&self) -> bool {
+        self.driver
+    }
+
+    /// Mark (or unmark) this thread as the plan's driver, persisting the change.
+    pub fn set_driver(&mut self, driver: bool, cx: &mut Context<Self>) {
+        if self.driver == driver {
+            return;
+        }
+        self.driver = driver;
         cx.notify();
     }
 

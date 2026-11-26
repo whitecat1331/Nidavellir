@@ -166,6 +166,7 @@ members = [
     "crates/paths",
     "crates/picker",
     "crates/picker_preview",
+    "crates/plan_flow",
     "crates/plan_graph",
     "crates/plan_store",
     "crates/platform_title_bar",
@@ -443,6 +444,7 @@ paths = { path = "crates/paths" }
 perf = { path = "tooling/perf" }
 picker = { path = "crates/picker" }
 picker_preview = { path = "crates/picker_preview" }
+plan_flow = { path = "crates/plan_flow" }
 plan_graph = { path = "crates/plan_graph" }
 plan_store = { path = "crates/plan_store" }
 platform_title_bar = { path = "crates/platform_title_bar" }

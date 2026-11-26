@@ -216,6 +216,7 @@ pub struct GraphSnapshot {
     pub name: String,
     pub repo: Option<String>,
     pub current_node: Option<String>,
+    pub path: Option<String>,
     pub active_node: Option<String>,
     pub holder: Option<String>,
     pub heartbeat: Option<String>,
@@ -223,6 +224,19 @@ pub struct GraphSnapshot {
     pub spent_tokens: u64,
     pub done_nodes: Vec<String>,
     pub evidence: Vec<EvidenceRow>,
+}
+
+/// A proposed edit to a plan file, emitted by the plan's driver and awaiting an
+/// operator accept/reject (Phase J / D17). `old_text` to `new_text` is the exact
+/// replacement; `status` is `pending` until the operator accepts or rejects it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmendmentRow {
+    pub id: String,
+    pub plan_id: String,
+    pub reason: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub status: String,
 }
 
 pub struct PlanStore {
@@ -268,6 +282,7 @@ impl PlanStore {
                 stage TEXT,
                 status TEXT,
                 current_node TEXT,
+                path TEXT,
                 active_node TEXT,
                 holder TEXT,
                 heartbeat TEXT,
@@ -346,6 +361,17 @@ impl PlanStore {
                 updated_at TEXT NOT NULL
             )
         "})?()?;
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS amendments (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                old_text TEXT NOT NULL,
+                new_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+        "})?()?;
         Ok(())
     }
 
@@ -375,15 +401,18 @@ impl PlanStore {
         )?;
         let columns: HashSet<String> = select()?.into_iter().map(|(_, name, ..)| name).collect();
         if !columns.contains("debugger_scoped") {
-            connection.exec(
-                "ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0",
-            )?()?;
+            connection
+                .exec("ALTER TABLE plans ADD COLUMN debugger_scoped INTEGER NOT NULL DEFAULT 0")?(
+            )?;
         }
         if !columns.contains("summary") {
             connection.exec("ALTER TABLE plans ADD COLUMN summary TEXT")?()?;
         }
         if !columns.contains("detail") {
             connection.exec("ALTER TABLE plans ADD COLUMN detail TEXT")?()?;
+        }
+        if !columns.contains("path") {
+            connection.exec("ALTER TABLE plans ADD COLUMN path TEXT")?()?;
         }
         Ok(())
     }
@@ -868,6 +897,80 @@ impl PlanStore {
         Ok(rows.into_iter().next().unwrap_or(false))
     }
 
+    /// The filesystem path to the plan's `progress.json` (the graph tool's
+    /// `plan_path`). `None` for a plan the graph tool has not yet driven.
+    pub fn plan_path(&self, plan_id: &str) -> Result<Option<String>> {
+        let plan_id = normalize_plan_id(plan_id);
+        let mut select = self
+            .connection
+            .select_bound::<String, Option<String>>(indoc! {"
+                SELECT path FROM plans WHERE id = ?1
+            "})?;
+        let rows = select(plan_id)?;
+        Ok(rows.into_iter().next().flatten())
+    }
+
+    /// Pending/accepted/rejected amendments for a plan (Phase J / D17), oldest
+    /// first so the operator reviews them in the order the driver proposed them.
+    pub fn amendments(&self, plan_id: &str) -> Result<Vec<AmendmentRow>> {
+        let plan_id = normalize_plan_id(plan_id);
+        let mut select = self
+            .connection
+            .select_bound::<String, (String, String, String, String, String, String)>(indoc! {"
+            SELECT id, plan_id, reason, old_text, new_text, status
+            FROM amendments WHERE plan_id = ?1 ORDER BY rowid
+        "})?;
+        let rows = select(plan_id)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, plan_id, reason, old_text, new_text, status)| AmendmentRow {
+                    id,
+                    plan_id,
+                    reason,
+                    old_text,
+                    new_text,
+                    status,
+                },
+            )
+            .collect())
+    }
+
+    pub fn upsert_amendment(&self, amendment: &AmendmentRow) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut upsert = self
+            .connection
+            .exec_bound::<(String, String, String, String, String, String, String)>(indoc! {"
+            INSERT INTO amendments (id, plan_id, reason, old_text, new_text, status, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                reason = excluded.reason,
+                old_text = excluded.old_text,
+                new_text = excluded.new_text,
+                status = excluded.status,
+                created_at = excluded.created_at
+        "})?;
+        upsert((
+            amendment.id.clone(),
+            normalize_plan_id(&amendment.plan_id),
+            amendment.reason.clone(),
+            amendment.old_text.clone(),
+            amendment.new_text.clone(),
+            amendment.status.clone(),
+            now,
+        ))
+    }
+
+    pub fn set_amendment_status(&self, id: &str, status: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut update = self
+            .connection
+            .exec_bound::<(String, String, String)>(indoc! {"
+            UPDATE amendments SET status = ?1, created_at = ?2 WHERE id = ?3
+        "})?;
+        update((status.to_string(), now, id.to_string()))
+    }
+
     // ---- write API (the state-of-record) ----
 
     /// Apply the graph tool's state at save time: plan row + done nodes +
@@ -876,6 +979,7 @@ impl PlanStore {
     pub fn apply_graph_snapshot(&self, snapshot: &GraphSnapshot) -> Result<()> {
         let plan_id = normalize_plan_id(&snapshot.plan_id);
         self.upsert_plan(&plan_id, snapshot)?;
+        self.set_plan_path(&plan_id, snapshot.path.as_deref())?;
         self.replace_plan_nodes(&plan_id, &snapshot.done_nodes)?;
         for evidence in &snapshot.evidence {
             self.upsert_evidence(&plan_id, evidence)?;
@@ -897,6 +1001,19 @@ impl PlanStore {
             UPDATE plans SET debugger_scoped = ?1, updated_at = ?2 WHERE id = ?3
         "})?;
         update((scoped, now, plan_id))
+    }
+
+    /// Set the plan's `progress.json` path. The graph tool calls this as part of
+    /// `apply_graph_snapshot`, so the path rides the same state-of-record write.
+    pub fn set_plan_path(&self, plan_id: &str, path: Option<&str>) -> Result<()> {
+        let plan_id = normalize_plan_id(plan_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut update = self
+            .connection
+            .exec_bound::<(Option<String>, String, String)>(indoc! {"
+            UPDATE plans SET path = ?1, updated_at = ?2 WHERE id = ?3
+        "})?;
+        update((path.map(|value| value.to_string()), now, plan_id))
     }
 
     fn upsert_plan(&self, plan_id: &str, snapshot: &GraphSnapshot) -> Result<()> {
@@ -1178,6 +1295,7 @@ mod tests {
             name: name.to_string(),
             repo: Some("zed".to_string()),
             current_node: Some(current.to_string()),
+            path: None,
             active_node: None,
             holder: None,
             heartbeat: None,
@@ -1293,6 +1411,32 @@ mod tests {
 
         store.set_debugger_scoped("PLAN_A", false).unwrap();
         assert!(!store.debugger_scoped("PLAN_A").unwrap());
+    }
+
+    #[test]
+    fn amendments_round_trip_and_status() {
+        let store = store();
+        store
+            .upsert_amendment(&AmendmentRow {
+                id: "amend-1".to_string(),
+                plan_id: "PLAN_A".to_string(),
+                reason: "add a missing step".to_string(),
+                old_text: "old".to_string(),
+                new_text: "new".to_string(),
+                status: "pending".to_string(),
+            })
+            .unwrap();
+
+        let amendments = store.amendments("PLAN_A").unwrap();
+        assert_eq!(amendments.len(), 1);
+        assert_eq!(amendments[0].reason, "add a missing step");
+        assert_eq!(amendments[0].old_text, "old");
+        assert_eq!(amendments[0].new_text, "new");
+        assert_eq!(amendments[0].status, "pending");
+
+        store.set_amendment_status("amend-1", "accepted").unwrap();
+        let amendments = store.amendments("PLAN_A").unwrap();
+        assert_eq!(amendments[0].status, "accepted");
     }
 
     #[test]

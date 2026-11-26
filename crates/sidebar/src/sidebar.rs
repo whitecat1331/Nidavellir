@@ -29,9 +29,9 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, MouseButton, Pixels, Render,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -39,6 +39,7 @@ use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
 };
 use notifications::status_toast::StatusToast;
+use plan_graph::{OpenPlan, plan_id_from_path};
 use project::{
     AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId, repo_identity_path_if_local,
 };
@@ -6471,6 +6472,27 @@ impl Sidebar {
         let metadata = thread.metadata.clone();
         let thread_workspace = thread.workspace.clone();
 
+        let plan_badge = thread.metadata.plan_path.as_ref().map(|plan_path| {
+            let plan_id: SharedString = plan_id_from_path(plan_path).into();
+            div()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    IconButton::new(("open-plan", ix), IconName::ListTodo)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Open plan"))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                OpenPlan {
+                                    plan_id: plan_id.clone(),
+                                }
+                                .boxed_clone(),
+                                cx,
+                            );
+                        }),
+                )
+                .into_any_element()
+        });
+
         let is_hovered = self.hovered_thread_index == Some(ix);
         let is_selected = is_active;
         let is_draft = thread.draft.is_some();
@@ -6533,6 +6555,7 @@ impl Sidebar {
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
+            .when_some(plan_badge, |this, badge| this.badge(badge))
             .when(thread.diff_stats.lines_added > 0, |this| {
                 this.added(thread.diff_stats.lines_added as usize)
             })

@@ -540,6 +540,7 @@ mod tests {
 
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
+            driver: false,
             title: title.to_string().into(),
             messages: Vec::new(),
             updated_at,
@@ -580,6 +581,7 @@ mod tests {
             folder_paths: PathList::default(),
             workspace_id: None,
             plan_path: None,
+            driver: false,
         }
     }
 
