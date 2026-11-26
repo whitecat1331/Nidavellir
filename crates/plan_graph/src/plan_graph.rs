@@ -1347,17 +1347,6 @@ impl PlanGraph {
         cx.notify();
     }
 
-    fn coordinator_brief() -> String {
-        "You are the coordinator chat for the Plans namespace — the plan-manager for all \
-         plans. Your job is plan management: create new plans, maintain coherence between \
-         plans, and enforce plan integrity (every plan has a summary, a status, and an owner). \
-         Read the graph with the `graph` tool to see the plan set and its dev-flow state, \
-         decide the next node for each plan, and hand the work to a per-plan driver in a \
-         fresh thread. You may implement, but your real job is coordination across the plan \
-         set."
-            .to_string()
-    }
-
     fn driver_brief(plan_id: &str) -> String {
         format!(
             "You are the driver thread for plan `{plan_id}`. Drive its dev-flow to \
@@ -1419,12 +1408,7 @@ impl PlanGraph {
                 None,
                 None,
                 None,
-                Some(agent_ui::AgentInitialContent::ContentBlock {
-                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                        Self::coordinator_brief(),
-                    ))],
-                    auto_submit: true,
-                }),
+                None,
                 workspace_handle,
                 project,
                 Some(thread_store),
@@ -1433,6 +1417,25 @@ impl PlanGraph {
                 cx,
             )
         });
+
+        // The coordinator is the plan-manager for the Plans namespace. Put it in
+        // plan mode so the plan-manager + dev-flow skills load, but never
+        // auto-submit a prompt — it stays idle until the operator drives it.
+        let applied = Cell::new(false);
+        cx.observe(&coordinator_view, move |_this, view, cx| {
+            if applied.get() {
+                return;
+            }
+            let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
+                return;
+            };
+            native_thread.update(cx, |thread, cx| {
+                thread.set_planning(true, cx);
+            });
+            applied.set(true);
+        })
+        .detach();
+
         self.coordinator_view = Some(coordinator_view);
     }
 
@@ -2618,14 +2621,6 @@ mod tests {
             Some(PathBuf::from("/tmp/scratch.md"))
         );
         assert_eq!(plan_markdown_path("no-suffix"), None);
-    }
-
-    #[test]
-    fn coordinator_brief_names_the_plans_namespace_and_plan_management() {
-        let brief = PlanGraph::coordinator_brief();
-        assert!(brief.contains("Plans namespace"), "brief: {brief}");
-        assert!(brief.contains("plan-manager"), "brief: {brief}");
-        assert!(brief.contains("plan management"), "brief: {brief}");
     }
 
     fn row(id: &str, current: &str, spent: u64) -> FleetPlanRow {
