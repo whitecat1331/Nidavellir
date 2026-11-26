@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
+use editor::Editor;
 use fs::Fs;
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
@@ -526,6 +527,24 @@ fn plan_label(plan: &CategorizedPlanRow) -> String {
     short_label(&plan.name)
 }
 
+/// Case-insensitive substring match over the fields the wheel leaf carries:
+/// `name`, `id`, `status`, `current_node`, and `summary`. An empty query
+/// matches everything (current behavior).
+fn plan_matches_query(plan: &CategorizedPlanRow, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    [
+        plan.name.as_str(),
+        plan.id.as_str(),
+        plan.status.as_deref().unwrap_or(""),
+        plan.current_node.as_deref().unwrap_or(""),
+        plan.summary.as_deref().unwrap_or(""),
+    ]
+    .iter()
+    .any(|haystack| haystack.to_lowercase().contains(query))
+}
+
 fn plan_state(plan: &CategorizedPlanRow, fleet: Option<&FleetPlanRow>) -> NodeState {
     if plan.lifecycle() == Lifecycle::History {
         return NodeState::Done;
@@ -923,6 +942,7 @@ pub struct PlanGraph {
     workspace: WeakEntity<Workspace>,
     fs: Arc<dyn Fs>,
     project: Entity<Project>,
+    search_editor: Entity<Editor>,
     categories: Vec<CategoryRow>,
     plans: Vec<CategorizedPlanRow>,
     parents: Vec<PlanParentRow>,
@@ -947,11 +967,24 @@ impl PlanGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search plans…", window, cx);
+            editor
+        });
+        cx.subscribe(&search_editor, |_this: &mut Self, _editor, event, cx| {
+            if let editor::EditorEvent::BufferEdited = event {
+                cx.notify();
+            }
+        })
+        .detach();
+
         let mut graph = Self {
             focus_handle: cx.focus_handle(),
             workspace,
             fs,
             project,
+            search_editor,
             categories: Vec::new(),
             plans: Vec::new(),
             parents: Vec::new(),
@@ -1018,15 +1051,31 @@ impl PlanGraph {
             .collect();
     }
 
-    fn visible_tree(&self) -> VisibleNode {
+    fn search_query(&self, cx: &App) -> String {
+        self.search_editor.read(cx).text(cx).trim().to_lowercase()
+    }
+
+    fn filtered_plans(&self, query: &str) -> Vec<CategorizedPlanRow> {
+        self.plans
+            .iter()
+            .filter(|plan| plan_matches_query(plan, query))
+            .cloned()
+            .collect()
+    }
+
+    fn visible_tree_from(&self, plans: &[CategorizedPlanRow]) -> VisibleNode {
         build_visible_tree(
             &self.categories,
-            &self.plans,
+            plans,
             &self.parents,
             &self.fleet,
             &self.expanded,
             self.history_visible,
         )
+    }
+
+    fn visible_tree(&self) -> VisibleNode {
+        self.visible_tree_from(&self.plans)
     }
 
     fn plan_display(&self, plan_id: &str) -> String {
@@ -1482,6 +1531,7 @@ impl PlanGraph {
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
+            .child(div().w(px(240.0)).child(self.search_editor.clone()))
             .child(Button::new("tree-history", "History").on_click(
                 cx.listener(|this: &mut PlanGraph, _: &ClickEvent, _, cx| this.toggle_history(cx)),
             ))
@@ -1530,13 +1580,28 @@ impl PlanGraph {
         cx.notify();
     }
 
-    fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = self.visible_tree();
+    fn render_tree(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search_query(cx);
+        let filtered = self.filtered_plans(&query);
+        if !query.is_empty() && filtered.is_empty() {
+            return v_flex()
+                .id(ElementId::Name("plan-tree".into()))
+                .flex_1()
+                .p_4()
+                .child(
+                    Label::new(format!("No plans match “{query}”"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+        let root = self.visible_tree_from(&filtered);
         v_flex()
             .id(ElementId::Name("plan-tree".into()))
             .flex_1()
             .overflow_y_scroll()
             .child(self.render_tree_row(&root, 0, cx))
+            .into_any_element()
     }
 
     fn render_tree_row(
@@ -1656,14 +1721,52 @@ impl PlanGraph {
     }
 
     fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search_query(cx);
         let total = self.plans.len();
         let live = self
             .plans
             .iter()
             .filter(|plan| plan.lifecycle() == Lifecycle::Live)
             .count();
-        let mut plans: Vec<&CategorizedPlanRow> = self.plans.iter().collect();
+        let mut plans: Vec<&CategorizedPlanRow> = self
+            .plans
+            .iter()
+            .filter(|plan| plan_matches_query(plan, &query))
+            .collect();
         plans.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let body: AnyElement = if !query.is_empty() && plans.is_empty() {
+            Label::new(format!("No plans match “{query}”"))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            v_flex()
+                .gap_1()
+                .children(plans.into_iter().map(|plan| {
+                    let plan_id = plan.id.clone();
+                    let node = plan.current_node.clone().unwrap_or_else(|| "—".to_string());
+                    h_flex()
+                        .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
+                        .w_full()
+                        .gap_3()
+                        .items_center()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|this| this.bg(cx.theme().colors().element_hover))
+                        .on_click(cx.listener(
+                            move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                                this.open_plan(plan_id.clone(), window, cx);
+                            },
+                        ))
+                        .child(Label::new(plan_label(plan)).size(LabelSize::Small))
+                        .child(Label::new(node).size(LabelSize::XSmall).color(Color::Muted))
+                }))
+                .into_any_element()
+        };
+
         v_flex()
             .id(ElementId::Name("plans-dashboard".into()))
             .size_full()
@@ -1693,27 +1796,7 @@ impl PlanGraph {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
-                    .child(v_flex().gap_1().children(plans.into_iter().map(|plan| {
-                        let plan_id = plan.id.clone();
-                        let node = plan.current_node.clone().unwrap_or_else(|| "—".to_string());
-                        h_flex()
-                            .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
-                            .w_full()
-                            .gap_3()
-                            .items_center()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(cx.theme().colors().element_hover))
-                            .on_click(cx.listener(
-                                move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                                    this.open_plan(plan_id.clone(), window, cx);
-                                },
-                            ))
-                            .child(Label::new(plan_label(plan)).size(LabelSize::Small))
-                            .child(Label::new(node).size(LabelSize::XSmall).color(Color::Muted))
-                    }))),
+                    .child(body),
             )
             .into_any_element()
     }
@@ -2358,6 +2441,34 @@ mod tests {
             return Some(node);
         }
         node.children.iter().find_map(|child| find(child, key))
+    }
+
+    #[test]
+    fn plan_matches_query_covers_name_id_status_node_and_summary() {
+        let plan = plan(
+            "p1",
+            "Search this plan",
+            Some("feature/agent-core"),
+            Some("in progress"),
+        );
+        assert!(plan_matches_query(&plan, "search"), "name");
+        assert!(plan_matches_query(&plan, "p1"), "id");
+        assert!(plan_matches_query(&plan, "progress"), "status");
+        assert!(plan_matches_query(&plan, "implement"), "current node");
+        assert!(plan_matches_query(&plan, "one-line"), "summary");
+        assert!(plan_matches_query(&plan, ""), "empty query matches all");
+    }
+
+    #[test]
+    fn plan_matches_query_is_case_insensitive_and_negative() {
+        let plan = plan(
+            "p1",
+            "Search this plan",
+            Some("feature/agent-core"),
+            Some("in progress"),
+        );
+        assert!(plan_matches_query(&plan, "SEARCH"));
+        assert!(!plan_matches_query(&plan, "does-not-exist"));
     }
 
     #[test]
