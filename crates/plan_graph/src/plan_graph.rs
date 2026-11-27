@@ -270,7 +270,7 @@ fn dev_flow_from_rows(done: &[String], evidence: Vec<EvidenceRow>) -> Vec<DevFlo
         .collect()
 }
 
-/// The glyph + color a dev-flow node renders as.
+/// The colour a dev-flow node renders as.
 pub fn dev_flow_visual(node: &DevFlowNode) -> (&'static str, Color) {
     if node.done && node.complete {
         ("●", Color::Success)
@@ -280,6 +280,21 @@ pub fn dev_flow_visual(node: &DevFlowNode) -> (&'static str, Color) {
         ("⏸", Color::Error)
     } else {
         ("○", Color::Muted)
+    }
+}
+
+/// The colour a plan's current dev-flow step renders as on the in-progress
+/// overview, so the dashboard reads at a glance which stage each plan sits on.
+/// Human gates keep the `dev_flow_visual` convention (they are blocked on the
+/// operator), and `complete` is the only success colour.
+pub fn step_color(node: &str) -> Color {
+    match node.trim().to_ascii_lowercase().as_str() {
+        "plan" | "promote" | "claim" | "fork" => Color::Info,
+        "implement" => Color::Accent,
+        "verify" | "compile" | "accept" => Color::Warning,
+        "merge" | "release" => Color::Error,
+        "complete" => Color::Success,
+        _ => Color::Muted,
     }
 }
 
@@ -544,6 +559,19 @@ fn plan_matches_query(plan: &CategorizedPlanRow, query: &str) -> bool {
     ]
     .iter()
     .any(|haystack| haystack.to_lowercase().contains(query.as_str()))
+}
+
+/// The dashboard's in-progress view: only plans that are actually in flight,
+/// optionally narrowed by the search query, ordered by name. The full plan list
+/// is the tree's job, so a never-started backlog plan is not selected here.
+fn in_progress_plans(plans: &[CategorizedPlanRow], query: &str) -> Vec<CategorizedPlanRow> {
+    let mut selected: Vec<CategorizedPlanRow> = plans
+        .iter()
+        .filter(|plan| plan.is_in_flight() && plan_matches_query(plan, query))
+        .cloned()
+        .collect();
+    selected.sort_by(|a, b| a.name.cmp(&b.name));
+    selected
 }
 
 fn plan_state(plan: &CategorizedPlanRow, fleet: Option<&FleetPlanRow>) -> NodeState {
@@ -1719,48 +1747,27 @@ impl PlanGraph {
 
     fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search_query(cx);
-        let total = self.plans.len();
-        let live = self
-            .plans
-            .iter()
-            .filter(|plan| plan.lifecycle() == Lifecycle::Live)
-            .count();
-        let mut plans: Vec<&CategorizedPlanRow> = self
-            .plans
-            .iter()
-            .filter(|plan| plan_matches_query(plan, &query))
-            .collect();
-        plans.sort_by(|a, b| a.name.cmp(&b.name));
+        let plans = in_progress_plans(&self.plans, &query);
+        let count = plans.len();
 
-        let body: AnyElement = if !query.is_empty() && plans.is_empty() {
-            Label::new(format!("No plans match “{query}”"))
+        let body: AnyElement = if plans.is_empty() {
+            let message = if query.is_empty() {
+                "No plans are in progress right now.".to_string()
+            } else {
+                format!("No in-progress plans match “{query}”")
+            };
+            Label::new(message)
                 .size(LabelSize::Small)
                 .color(Color::Muted)
                 .into_any_element()
         } else {
             v_flex()
-                .gap_1()
-                .children(plans.into_iter().map(|plan| {
-                    let plan_id = plan.id.clone();
-                    let node = plan.current_node.clone().unwrap_or_else(|| "—".to_string());
-                    h_flex()
-                        .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
-                        .w_full()
-                        .gap_3()
-                        .items_center()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(cx.theme().colors().element_hover))
-                        .on_click(cx.listener(
-                            move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
-                                this.open_plan(plan_id.clone(), window, cx);
-                            },
-                        ))
-                        .child(Label::new(plan_label(plan)).size(LabelSize::Small))
-                        .child(Label::new(node).size(LabelSize::XSmall).color(Color::Muted))
-                }))
+                .gap_2()
+                .children(
+                    plans
+                        .into_iter()
+                        .map(|plan| self.render_in_flight_card(&plan, cx)),
+                )
                 .into_any_element()
         };
 
@@ -1778,22 +1785,83 @@ impl PlanGraph {
                         h_flex()
                             .gap_3()
                             .items_center()
-                            .child(Label::new("Plans").size(LabelSize::Large))
+                            .child(Label::new("In progress").size(LabelSize::Large))
                             .child(
-                                Label::new(format!("{live} live of {total}"))
+                                Label::new(format!("{count} in flight"))
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             ),
                     )
                     .child(
                         Label::new(
-                            "Drive the whole plan set from the coordinator chat on the right, \
-                             or open a plan below to drive its implementation.",
+                            "The plans being worked right now. Open one to drive it, \
+                             or use the coordinator chat on the right. Every plan lives \
+                             in the tree on the left.",
                         )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
                     .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn render_in_flight_card(
+        &self,
+        plan: &CategorizedPlanRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let plan_id = plan.id.clone();
+        let step = plan
+            .current_node
+            .as_deref()
+            .map(str::trim)
+            .filter(|node| !node.is_empty());
+        let goal = plan
+            .summary
+            .clone()
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or_else(|| "No goal recorded for this plan.".to_string());
+
+        v_flex()
+            .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
+            .w_full()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().element_background)
+            .cursor_pointer()
+            .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .on_click(
+                cx.listener(move |this: &mut PlanGraph, _: &ClickEvent, window, cx| {
+                    this.open_plan(plan_id.clone(), window, cx);
+                }),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(step_badge(step, cx))
+                    .child(
+                        Label::new(plan_label(plan))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(Label::new(goal).size(LabelSize::Small).line_clamp(2))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .when_some(plan.status_label(), |this, status| {
+                        this.child(meta_chip("status", &status, cx))
+                    })
+                    .child(meta_chip("next", step.unwrap_or("not started"), cx)),
             )
             .into_any_element()
     }
@@ -2284,6 +2352,28 @@ fn badge(label: &str, color: Color, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// The prominent step badge on an in-progress card. Larger than [`badge`] and
+/// colour-coded per dev-flow stage, because the dashboard's job is to show at a
+/// glance which step each in-flight plan sits on.
+fn step_badge(step: Option<&str>, cx: &App) -> AnyElement {
+    let (label, color) = match step {
+        Some(step) => (step.to_string(), step_color(step)),
+        None => ("not started".to_string(), Color::Muted),
+    };
+    h_flex()
+        .gap_2()
+        .items_center()
+        .px_3()
+        .py_1p5()
+        .rounded_full()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .bg(cx.theme().colors().element_background)
+        .child(Label::new("●").size(LabelSize::Small).color(color))
+        .child(Label::new(label).size(LabelSize::Small).color(color))
+        .into_any_element()
+}
+
 fn chip_row(title: &str, chips: &[RelationChip], cx: &mut Context<PlanGraph>) -> AnyElement {
     v_flex()
         .w_full()
@@ -2466,6 +2556,52 @@ mod tests {
         );
         assert!(plan_matches_query(&plan, "SEARCH"));
         assert!(!plan_matches_query(&plan, "does-not-exist"));
+    }
+
+    #[test]
+    fn in_progress_plans_keeps_only_in_flight_plans() {
+        let mut backlog = plan("p2", "Backlog", None, None);
+        backlog.current_node = None;
+        let mut finished = plan("p3", "Finished", None, Some("done — merged"));
+        finished.current_node = Some("merge".to_string());
+
+        let plans = vec![
+            plan("p1", "In flight", None, Some("in progress — 2/5")),
+            backlog,
+            finished,
+        ];
+
+        let ids: Vec<&str> = in_progress_plans(&plans, "")
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["p1"]);
+    }
+
+    #[test]
+    fn in_progress_plans_honours_the_search_query() {
+        let plans = vec![
+            plan("p1", "Search this plan", None, Some("in progress")),
+            plan("p2", "Other work", None, Some("in progress")),
+        ];
+
+        let ids: Vec<&str> = in_progress_plans(&plans, "search")
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["p1"]);
+        assert!(in_progress_plans(&plans, "nothing-matches").is_empty());
+    }
+
+    #[test]
+    fn step_color_colours_every_dev_flow_node() {
+        for node in ROUTE {
+            assert_ne!(step_color(node), Color::Muted, "{node} needs a colour");
+        }
+        assert_ne!(step_color("implement"), step_color("verify"));
+        assert_eq!(step_color("complete"), Color::Success);
+        assert_eq!(step_color(""), Color::Muted);
+        assert_eq!(step_color("bogus"), Color::Muted);
     }
 
     #[test]
