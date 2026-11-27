@@ -147,6 +147,28 @@ impl CategorizedPlanRow {
             self.current_node.as_deref(),
         )
     }
+
+    /// The short, leading word(s) of the prose `Status:` field — `in progress`
+    /// from `in progress — 3/5`.
+    pub fn status_label(&self) -> Option<String> {
+        status_head(self.status.as_deref())
+    }
+
+    /// Whether the plan is actively being worked: it is live, and either its
+    /// status says so or its dev-flow graph has started. A live plan with no
+    /// status head and no `current_node` is backlog, not in progress.
+    pub fn is_in_flight(&self) -> bool {
+        if self.lifecycle() != Lifecycle::Live {
+            return false;
+        }
+        let status_in_progress = status_head(self.status.as_deref())
+            .is_some_and(|head| IN_FLIGHT_HEADS.contains(&head.as_str()));
+        let node_started = self
+            .current_node
+            .as_deref()
+            .is_some_and(|node| !node.trim().is_empty());
+        status_in_progress || node_started
+    }
 }
 
 /// Whether a plan is still live or belongs behind the History toggle (D3).
@@ -165,6 +187,10 @@ const HISTORY_HEADS: &[&str] = &[
     "canceled",
     "superseded",
 ];
+
+/// Status heads that mean "being worked right now" (prose, like
+/// [`HISTORY_HEADS`] — only the leading words are significant).
+const IN_FLIGHT_HEADS: &[&str] = &["in progress", "in-progress", "in flight", "active"];
 
 fn status_head(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
@@ -1751,6 +1777,31 @@ mod tests {
             classify_lifecycle(Some("plan  (promoted from draft)"), None, None),
             Lifecycle::Live
         );
+    }
+
+    #[test]
+    fn in_flight_excludes_backlog_and_history() {
+        let row = |status: Option<&str>, current: Option<&str>| CategorizedPlanRow {
+            id: "plan".to_string(),
+            name: "plan".to_string(),
+            repo: Some("zed".to_string()),
+            stage: None,
+            status: status.map(str::to_string),
+            current_node: current.map(str::to_string),
+            category_id: None,
+            category_source: None,
+            summary: None,
+            detail: None,
+        };
+
+        assert!(row(Some("in progress — 3/5"), None).is_in_flight());
+        assert!(row(None, Some("verify")).is_in_flight());
+        assert!(row(None, Some("merge")).is_in_flight());
+
+        assert!(!row(None, None).is_in_flight());
+        assert!(!row(Some("open"), None).is_in_flight());
+        assert!(!row(Some("in progress — 3/5"), Some("complete")).is_in_flight());
+        assert!(!row(Some("done — merged"), Some("merge")).is_in_flight());
     }
 
     #[test]
