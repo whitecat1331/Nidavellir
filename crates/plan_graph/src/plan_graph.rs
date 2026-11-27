@@ -1774,11 +1774,13 @@ impl PlanGraph {
         v_flex()
             .id(ElementId::Name("plans-dashboard".into()))
             .size_full()
+            .min_w_0()
+            .overflow_x_hidden()
             .overflow_y_scroll()
             .child(
                 v_flex()
                     .w_full()
-                    .max_w(px(980.0))
+                    .min_w_0()
                     .p_8()
                     .gap_6()
                     .child(
@@ -1826,6 +1828,7 @@ impl PlanGraph {
         v_flex()
             .id(ElementId::Name(format!("dashboard-plan:{plan_id}").into()))
             .w_full()
+            .min_w_0()
             .gap_2()
             .px_4()
             .py_3()
@@ -1843,15 +1846,17 @@ impl PlanGraph {
             .child(
                 h_flex()
                     .w_full()
+                    .min_w_0()
                     .gap_3()
                     .items_center()
-                    .justify_between()
-                    .child(step_badge(step, cx))
                     .child(
                         Label::new(plan_label(plan))
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                            .color(Color::Muted)
+                            .flex_1()
+                            .truncate_middle(),
+                    )
+                    .child(step_badge(step, cx)),
             )
             .child(Label::new(goal).size(LabelSize::Small).line_clamp(2))
             .child(
@@ -1894,11 +1899,13 @@ impl PlanGraph {
         v_flex()
             .id(ElementId::Name("plan-page".into()))
             .size_full()
+            .min_w_0()
+            .overflow_x_hidden()
             .overflow_y_scroll()
             .child(
                 v_flex()
                     .w_full()
-                    .max_w(px(980.0))
+                    .min_w_0()
                     .p_8()
                     .gap_6()
                     .child(
@@ -2361,6 +2368,7 @@ fn step_badge(step: Option<&str>, cx: &App) -> AnyElement {
         None => ("not started".to_string(), Color::Muted),
     };
     h_flex()
+        .flex_none()
         .gap_2()
         .items_center()
         .px_3()
