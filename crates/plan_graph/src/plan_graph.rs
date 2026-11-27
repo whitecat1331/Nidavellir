@@ -2571,11 +2571,11 @@ mod tests {
             finished,
         ];
 
-        let ids: Vec<&str> = in_progress_plans(&plans, "")
+        let ids: Vec<String> = in_progress_plans(&plans, "")
             .iter()
-            .map(|plan| plan.id.as_str())
+            .map(|plan| plan.id.clone())
             .collect();
-        assert_eq!(ids, vec!["p1"]);
+        assert_eq!(ids, vec!["p1".to_string()]);
     }
 
     #[test]
@@ -2585,11 +2585,11 @@ mod tests {
             plan("p2", "Other work", None, Some("in progress")),
         ];
 
-        let ids: Vec<&str> = in_progress_plans(&plans, "search")
+        let ids: Vec<String> = in_progress_plans(&plans, "search")
             .iter()
-            .map(|plan| plan.id.as_str())
+            .map(|plan| plan.id.clone())
             .collect();
-        assert_eq!(ids, vec!["p1"]);
+        assert_eq!(ids, vec!["p1".to_string()]);
         assert!(in_progress_plans(&plans, "nothing-matches").is_empty());
     }
 
